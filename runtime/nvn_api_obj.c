@@ -663,7 +663,7 @@ static void sleep_until(uint64_t deadline) {
 
 // NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow *w, NVNsync *s, int *index): blocks here, not in the
 // present, until the image's previous present plus one period has passed (the game often presents with a lock held).
-// Presents return at once, so the image is free as soon as that time is reached.
+// That is the time the next frame goes to the display, so the image is free as soon as that time is reached.
 NVN_API(nvnWindowAcquireTexture) {
     win_t *o = arg_p(c, 0);
     sync_t *s = arg_p(c, 1);
@@ -686,8 +686,10 @@ NVN_API(nvnWindowAcquireTexture) {
     ret_x(c, NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS);
 }
 
-// void nvnQueuePresentTexture(NVNqueue *q, NVNwindow *w, int index): queues the copy and returns at once; the display
-// time comes from the pacer and frees the image for the next acquire
+// void nvnQueuePresentTexture(NVNqueue *q, NVNwindow *w, int index): queues the copy and returns at once. The display
+// time comes from the pacer: the back end's present thread holds the host present until then (back-edge pacing, as the
+// Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later the
+// image is free for the next acquire. Added latency: the slack of the frame (period minus its work), as on the Switch.
 NVN_API(nvnQueuePresentTexture) {
     win_t *o = arg_p(c, 1);
     int idx = (int)arg_x(c, 2);
@@ -697,10 +699,10 @@ NVN_API(nvnQueuePresentTexture) {
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
     o->presents++;
     const tex_t *t = (const tex_t *)o->tex[idx];
-    gfx_backend()->present(t, o->crop);
-    o->ticket[idx] = o->presents;
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
+    gfx_backend()->present(t, o->crop, slot);
+    o->ticket[idx] = o->presents;
     o->avail[idx] = slot + period;
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);

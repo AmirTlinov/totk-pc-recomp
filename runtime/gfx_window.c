@@ -58,6 +58,8 @@ static VmaAllocation g_cap_alloc;
 static uint8_t *g_cap_ptr;
 static VkDeviceSize g_cap_size;
 static int g_cap_w, g_cap_h, g_cap_valid;
+static int g_flip_on;            // vk_present_blit submitted the blit of swapchain image g_flip_idx; vk_present_flip presents it
+static uint32_t g_flip_idx;
 
 // ---- TOTK_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
 // of a host-visible ring. A slot's tag names the frame it holds complete; recording a new frame clears the tag first,
@@ -261,6 +263,21 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+// Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
+// first; the device release drops it.
+static void flip_locked(void) {
+    if (!g_flip_on) return;
+    g_flip_on = 0;
+    if (!g_sc) return;
+    VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
+                           .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
+                           .pImageIndices = &g_flip_idx};
+    vk_queue_lock();
+    VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
+    vk_queue_unlock();
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&g_dirty, 1);
+}
+
 static void free_capture(void) {
     VkCtx *c = vk_ctx();
     if (g_cap_buf && c) vmaDestroyBuffer(c->vma, g_cap_buf, g_cap_alloc);
@@ -272,6 +289,7 @@ static void free_capture(void) {
 
 // Returns 1 with a usable swapchain, 0 when the window has no area (minimised). Called with g_pl held.
 static int create_swapchain(void) {
+    flip_locked();   // the acquired image goes out before its swapchain is replaced
     VkCtx *c = vk_ctx();
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(c->phys, g_surface, &caps) != VK_SUCCESS) return 0;
@@ -479,12 +497,12 @@ int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
     return ok;
 }
 
-void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
-    (void)fmt;
+static void present_image(VkImage src, VkImageLayout layout, int w, int h, const int crop[4], int defer) {
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     gfx_window_start();
     VkCtx *c = vk_ctx();
     EnterCriticalSection(&g_pl);
+    flip_locked();
     if (!g_sc || InterlockedCompareExchange(&g_dirty, 0, 0)) {
         if (!IsIconic(g_hwnd) && !create_swapchain() && !g_sc) goto out;
     }
@@ -569,16 +587,14 @@ void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, in
                         .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
+    vk_queue_unlock();
     if (r == VK_SUCCESS) {
-        VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
-                               .pWaitSemaphores = &g_render_done[idx], .swapchainCount = 1, .pSwapchains = &g_sc,
-                               .pImageIndices = &idx};
-        r = vkQueuePresentKHR(c->gfx_queue, &pi);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&g_dirty, 1);
+        g_flip_on = 1;
+        g_flip_idx = idx;
+        if (!defer) flip_locked();
     } else {
         rt_log("gfx: present submit failed (%d)", (int)r);
     }
-    vk_queue_unlock();
     g_frame++;
     if (cap) {
         vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
@@ -588,6 +604,21 @@ void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, in
         g_cap_valid = 1;
     }
 out:
+    LeaveCriticalSection(&g_pl);
+}
+
+void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
+    (void)fmt;
+    present_image(src, layout, w, h, crop, 0);
+}
+
+void vk_present_blit(VkImage src, VkImageLayout layout, int w, int h, const int crop[4]) {
+    present_image(src, layout, w, h, crop, 1);
+}
+
+void vk_present_flip(void) {
+    EnterCriticalSection(&g_pl);
+    flip_locked();
     LeaveCriticalSection(&g_pl);
 }
 
@@ -609,6 +640,7 @@ void gfx_window_release_vk(void) {
         vk_queue_lock();
         vkDeviceWaitIdle(c->device);
         vk_queue_unlock();
+        g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
         free_capture();
         free_thumbs();
         for (int i = 0; i < FRAMES; i++) {

@@ -5,7 +5,11 @@
 // Present: the game texture is resolved on the calling thread and its blit is handed to a present thread, so
 // nvnQueuePresentTexture returns at once (section 5). Queue order does the rest: the submissions that wrote the texture
 // are already on gfx_queue, and every call that may write or free GPU state the blit reads (submit, finish, pool and
-// texture teardown, texel writes) first waits until the queued present was submitted (vk_present_drain).
+// texture teardown, texel writes) first waits until the queued blit was submitted (vk_present_drain).
+//
+// Back-edge pacing: the present thread submits the blit at once, then holds the host present (vkQueuePresentKHR) until
+// the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
+// replay took. The blit is already on the queue, so the wait blocks no submission.
 #include <windows.h>
 
 #include "flight.h"
@@ -17,15 +21,27 @@
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued; } PresentJob;
 
 static SRWLOCK pl = SRWLOCK_INIT;
 static CONDITION_VARIABLE pcv = CONDITION_VARIABLE_INIT;   // job queued, job taken, job submitted
 static PresentJob job;
 static int pending, busy, present_thread;
 
+// Sleeps on a high-resolution timer to 1 ms before at, then yields until at: the timer alone wakes up to ~0.5 ms late.
+static void wait_until(HANDLE timer, uint64_t at) {
+    uint64_t now = kern_now_ns();
+    if (at > now + 1500000 && timer) {
+        LARGE_INTEGER d = {.QuadPart = -(LONGLONG)((at - now - 1000000) / 100)};
+        if (SetWaitableTimer(timer, &d, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
+    }
+    while (kern_now_ns() < at) SwitchToThread();
+}
+
 static DWORD WINAPI present_main(void *arg) {
     (void)arg;
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    uint64_t last = 0, last_queued = 0;
     AcquireSRWLockExclusive(&pl);
     for (;;) {
         while (!pending) SleepConditionVariableSRW(&pcv, &pl, INFINITE, 0);
@@ -35,12 +51,25 @@ static DWORD WINAPI present_main(void *arg) {
         WakeAllConditionVariable(&pcv);
         ReleaseSRWLockExclusive(&pl);
         if (flight_on) vk_thumbs_frame(j.frame);
-        vk_present_image(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
+        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.w, j.h, j.has_crop ? j.crop : NULL);
         vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         AcquireSRWLockExclusive(&pl);
         busy = 0;
         WakeAllConditionVariable(&pcv);
         ReleaseSRWLockExclusive(&pl);
+        uint64_t t0 = kern_now_ns();
+        wait_until(timer, j.at);
+        uint64_t t1 = kern_now_ns();
+        vk_present_flip();
+        // TOTK_TRACE=present: one line per present: the host present's interval, the interval of the game's present
+        // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
+        if (rt_trace & RT_TRACE_PRESENT)
+            rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target",
+                   (unsigned long long)j.frame, last ? (t1 - last) / 1e6 : 0.0,
+                   last_queued ? (j.queued - last_queued) / 1e6 : 0.0, (t1 - t0) / 1e6,
+                   j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0);
+        last = t1;
+        last_queued = j.queued;
         vk_pipeline_autosave();   // off the render thread, outside the present lock
         AcquireSRWLockExclusive(&pl);
     }
@@ -55,7 +84,7 @@ void vk_present_drain(void) {
     perf_end(PERF_DRAIN, p0);
 }
 
-static void vk_be_present(const tex_t *t, const int crop[4]) {
+static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     static volatile long n_skipped;
     vk_sync_start();
     uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
@@ -69,7 +98,8 @@ static void vk_be_present(const tex_t *t, const int crop[4]) {
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
         return;
     }
-    PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame};
+    PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
+                    .at = at_ns, .queued = kern_now_ns()};
     if (crop) {
         j.has_crop = 1;
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];

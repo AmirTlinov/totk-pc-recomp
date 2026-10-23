@@ -111,8 +111,8 @@ static int null_fence_wait(uint64_t value, uint64_t timeout_ns) {
 
 static uint64_t null_fence_done(void) { return __atomic_load_n(&fence, __ATOMIC_ACQUIRE); }
 
-static void null_present(const tex_t *t, const int crop[4]) {
-    (void)t, (void)crop;
+static void null_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    (void)t, (void)crop, (void)at_ns;
     __atomic_fetch_add(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
 }
 

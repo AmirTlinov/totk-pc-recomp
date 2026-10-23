@@ -78,6 +78,10 @@ int vk_selftest(void);                      // 0 on success
 // the blit). All its writes must be submitted to gfx_queue before the call (queue order does the rest). Starts the
 // window on first use. A minimised window or a lost swapchain skips the frame. Calls serialise on an internal lock.
 void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+// vk_present_image split in two: vk_present_blit submits the blit and leaves the present waiting, vk_present_flip
+// queues it. The next blit or a swapchain rebuild queues a waiting present first.
+void vk_present_blit(VkImage src, VkImageLayout layout, int w, int h, const int crop[4]);
+void vk_present_flip(void);
 // Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
 // rebuild do. Recursive.
 void vk_queue_lock(void);

@@ -128,7 +128,7 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
     uint64_t frames = gfx_stats().frames;
     vk_present_capture(1);
     const int crop[4] = {0, 0, TEX_W, TEX_H};
-    b->present(&t, crop);
+    b->present(&t, crop, 0);
     b->finish();   // the queued present is submitted and, with capture on, read back
     const uint8_t *px;
     int w, h;
