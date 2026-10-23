@@ -16,6 +16,7 @@
 #include "cfg.h"
 #include "flight.h"
 #include "gfx.h"
+#include "input.h"
 #include "vk.h"
 
 #define FRAMES 2
@@ -191,9 +192,15 @@ static void toggle_fullscreen(HWND h) {
 }
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    LRESULT input_res;
+    if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
-        if (w == VK_F11 && !(l & (1 << 30))) toggle_fullscreen(h);   // bit 30: auto-repeat
+        if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
+            input_cursor_suspend(1);
+            toggle_fullscreen(h);
+            input_cursor_suspend(0);
+        }
         break;
     case WM_SIZE:
         if (w != SIZE_MINIMIZED) InterlockedExchange(&g_dirty, 1);

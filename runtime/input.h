@@ -1,6 +1,9 @@
 // Host input sampling (runtime/input_win.c): SDL3 gamepad and the keyboard as one Switch npad.
 #pragma once
 #include <stdint.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 // Bits of libnx HidNpadButton (A=0 B=1 X=2 Y=3 StickL=4 StickR=5 L=6 R=7 ZL=8 ZR=9 Plus=10 Minus=11 Left=12 Up=13 Right=14
 // Down=15) and the stick directions (StickLLeft..Down 16-19, StickRLeft..Down 20-23, derived from the sticks).
@@ -10,6 +13,14 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
 // reports nothing; input_block(0) when it closes: nothing until all buttons and stick directions are released.
 void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 void input_block(int on);
+
+// Mouse camera and cursor (input_win.c, Win32 window thread). The window procedure calls input_window_msg first for raw
+// mouse input, cursor hiding and confinement; it returns 1 with *res set when the message is handled. input_cursor_suspend(1)
+// releases the cursor around an F11 window change, (0) captures it again once the client area has its new size.
+#ifdef _WIN32
+int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
+#endif
+void input_cursor_suspend(int on);
 
 // Rumble: SDL_RumbleGamepad on the open gamepad, low (heavy, left) and high (light, right) motor 0..65535 for ms
 // milliseconds. 1 if a gamepad with rumble took it. Callable from any thread.

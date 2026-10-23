@@ -1,5 +1,7 @@
-// Host input for nn::hid (runtime/ov_input.c): an SDL3 gamepad (no SDL window, no SDL video) and the keyboard, merged
-// into Switch npad button bits and stick axes. Button order follows libnx HidNpadButton (ISC). Keys and their map: docs/controls.md.
+// Host input for nn::hid (runtime/ov_input.c): an SDL3 gamepad (no SDL window, no SDL video), the keyboard and the mouse,
+// merged into Switch npad button bits and stick axes. Button order follows libnx HidNpadButton (ISC). The key bindings are
+// the table in input_map.c; this file translates Win32 virtual keys to its key ids, reads the mouse (raw input, WM_INPUT)
+// and owns the cursor capture. Keys and their map: docs/controls.md.
 // The gamepad also rumbles (input_rumble) and, when it has a gyro and an accelerometer, feeds the six-axis sensor from a
 // thread of its own (input_motion_start). Every SDL call on the gamepad is made under `lock`.
 #include <windows.h>
@@ -12,14 +14,11 @@
 #include "cfg.h"
 #include "host.h"
 #include "input.h"
+#include "input_map.h"
 #include "nvn_api.h"
 #include "vk.h"
 
-enum {
-    B_A = 0, B_B, B_X, B_Y, B_STICK_L, B_STICK_R, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN,
-    B_SL_LEFT = 16, B_SL_UP, B_SL_RIGHT, B_SL_DOWN, B_SR_LEFT, B_SR_UP, B_SR_RIGHT, B_SR_DOWN,
-    STICK_MAX = 32767, STICK_DEAD = 2500, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000
-};
+enum { STICK_MAX = 32767, STICK_DEAD = 2500, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
 
 static SRWLOCK lock = SRWLOCK_INIT;
 static int state;                    // 0 not started, 1 running, -1 disabled or SDL failed
@@ -30,12 +29,6 @@ static SDL_JoystickID sensor_pad;    // the gamepad whose sensors the motion thr
 static int sensor_ok;                // ... and it has both sensors, enabled
 static int motion_thread;            // 0 not started, 1 running, -1 off (TOTK_MOTION=0, no SDL)
 
-typedef struct { int vk; int bit; } KeyBtn;
-static const KeyBtn key_buttons[] = {
-    {VK_LEFT, B_LEFT}, {VK_UP, B_UP}, {VK_RIGHT, B_RIGHT}, {VK_DOWN, B_DOWN}, {'E', B_A}, {VK_LSHIFT, B_B}, {VK_SPACE, B_X},
-    {'F', B_Y}, {'Q', B_ZL}, {'Z', B_ZR}, {VK_TAB, B_L}, {'R', B_R}, {'C', B_STICK_L}, {'V', B_STICK_R},
-    {VK_RETURN, B_PLUS}, {VK_BACK, B_MINUS},
-};
 // Gamepad buttons by position: south is Switch B, east A, west Y, north X (Nintendo layout).
 static const struct { SDL_GamepadButton sdl; int bit; } pad_buttons[] = {
     {SDL_GAMEPAD_BUTTON_SOUTH, B_B}, {SDL_GAMEPAD_BUTTON_EAST, B_A}, {SDL_GAMEPAD_BUTTON_WEST, B_Y},
@@ -172,7 +165,143 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
     if (wrote) fflush(rec);
 }
 
+// Win32 virtual key of a key id (the one place that knows them), 0 for an id without a key.
+static int key_vk(int key) {
+    if (key >= KEY_A && key <= KEY_Z) return 'A' + (key - KEY_A);
+    if (key >= KEY_0 && key <= KEY_9) return '0' + (key - KEY_0);
+    switch (key) {
+    case KEY_SPACE: return VK_SPACE;
+    case KEY_TAB: return VK_TAB;
+    case KEY_LSHIFT: return VK_LSHIFT;
+    case KEY_LCTRL: return VK_LCONTROL;
+    case KEY_UP: return VK_UP;
+    case KEY_DOWN: return VK_DOWN;
+    case KEY_LEFT: return VK_LEFT;
+    case KEY_RIGHT: return VK_RIGHT;
+    case KEY_MOUSE_L: return VK_LBUTTON;
+    case KEY_MOUSE_R: return VK_RBUTTON;
+    case KEY_MOUSE_M: return VK_MBUTTON;
+    }
+    return 0;
+}
+
+// ---- mouse camera: raw motion accumulated by the window thread, one stick sample per presented frame
+static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
+static volatile LONG cur_captured;         // cursor hidden and confined to the client area
+static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
+static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
+static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
+static volatile LONG g_block;              // text entry state, see input_block
+static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off, read once
+
+static float mouse_sens_get(void) {
+    if (mouse_sens >= 0) return mouse_sens;
+    const char *e = cfg_get("TOTK_MOUSE_SENS");
+    char *end;
+    double v = e ? strtod(e, &end) : 1;
+    if (!e || end == e || *end || v != v) v = 1;
+    mouse_sens = (float)(v < 0 ? 0 : v > 10 ? 10 : v);
+    return mouse_sens;
+}
+
+// Hide the cursor and confine it to the client area while the window is focused, not suspended, not behind a text entry
+// and the mouse camera is on; release it otherwise. Safe from any thread.
+static void cursor_update(HWND h) {
+    const char *in = cfg_get("TOTK_INPUT");
+    AcquireSRWLockExclusive(&cur_lock);
+    int want = h && cur_active && !cur_suspend && g_block != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) &&
+               GetForegroundWindow() == h && !IsIconic(h);
+    RECT r;
+    POINT tl = {0, 0};
+    if (want && GetClientRect(h, &r) && ClientToScreen(h, &tl)) {
+        RECT clip = {tl.x, tl.y, tl.x + r.right, tl.y + r.bottom};
+        ClipCursor(&clip);
+        if (!cur_captured) { InterlockedExchange(&mouse_dx, 0); InterlockedExchange(&mouse_dy, 0); }
+        InterlockedExchange(&cur_captured, 1);
+    } else {
+        if (cur_captured) ClipCursor(NULL);
+        InterlockedExchange(&cur_captured, 0);
+    }
+    ReleaseSRWLockExclusive(&cur_lock);
+}
+
+void input_cursor_suspend(int on) {
+    InterlockedExchange(&cur_suspend, on != 0);
+    cursor_update(gfx_window_handle());
+}
+
+// Window procedure hook (gfx_window.c calls it first). Returns 1 with *res set when the message is fully handled.
+int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
+    switch (m) {
+    case WM_CREATE: {
+        RAWINPUTDEVICE rid = {.usUsagePage = 1, .usUsage = 2, .dwFlags = 0, .hwndTarget = h};   // generic mouse
+        if (!RegisterRawInputDevices(&rid, 1, sizeof rid)) rt_log("input: raw mouse registration failed (%lu)", GetLastError());
+        break;
+    }
+    case WM_INPUT: {
+        RAWINPUT ri;
+        UINT sz = sizeof ri;
+        if (cur_captured && GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            InterlockedAdd(&mouse_dx, ri.data.mouse.lLastX);
+            InterlockedAdd(&mouse_dy, ri.data.mouse.lLastY);
+        }
+        break;   // DefWindowProc must see WM_INPUT for cleanup
+    }
+    case WM_SETCURSOR:
+        if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
+        break;
+    case WM_ACTIVATEAPP:
+        InterlockedExchange(&cur_active, w != 0);
+        cursor_update(h);
+        break;
+    case WM_SETFOCUS: case WM_KILLFOCUS: case WM_SIZE: case WM_MOVE:
+        cursor_update(h);
+        break;
+    case WM_ENTERSIZEMOVE:
+        input_cursor_suspend(1);
+        break;
+    case WM_EXITSIZEMOVE:
+        input_cursor_suspend(0);
+        break;
+    case WM_CLOSE:
+        InterlockedExchange(&cur_active, 0);
+        cursor_update(h);
+        break;
+    }
+    return 0;
+}
+
 static int key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+// The mouse camera as a right-stick sample, held for the whole presented frame. Under `lock`.
+static void mouse_camera(int32_t out[2]) {
+    static uint64_t frame = ~0ull;
+    static LARGE_INTEGER t0;
+    static int32_t held[2];
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&f);
+    if (!cur_captured) {
+        InterlockedExchange(&mouse_dx, 0);
+        InterlockedExchange(&mouse_dy, 0);
+        held[0] = held[1] = 0;
+        frame = ~0ull;
+    } else {
+        uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        double age = frame == ~0ull ? 0 : (double)(now.QuadPart - t0.QuadPart) / (double)f.QuadPart;
+        if (fr != frame) {
+            double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
+            input_mouse_stick(InterlockedExchange(&mouse_dx, 0), InterlockedExchange(&mouse_dy, 0), dt, mouse_sens_get(), held);
+            frame = fr;
+            t0 = now;
+        } else if (age > 0.1) {
+            held[0] = held[1] = 0;   // frames stopped: do not hold a deflection
+        }
+    }
+    out[0] = held[0];
+    out[1] = held[1];
+}
 
 static int32_t axis(int16_t v) {
     int32_t a = v < -STICK_MAX ? -STICK_MAX : v;
@@ -213,12 +342,6 @@ static void stick_bits(uint64_t *b, int32_t x, int32_t y, int first) {
     if (y < -STICK_DIR) *b |= 1ull << (first + 3);
 }
 
-// Two keys as one axis; a diagonal is scaled to the unit circle.
-static int32_t key_axis(int neg, int pos, int other) {
-    int d = key_down(pos) - key_down(neg);
-    return d * (other ? 23170 : STICK_MAX);
-}
-
 static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     int64_t a = (int64_t)*x * *x + (int64_t)*y * *y, b = (int64_t)kx * kx + (int64_t)ky * ky;
     if (b > a) { *x = kx; *y = ky; }
@@ -246,12 +369,29 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
         }
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
-            for (size_t i = 0; i < sizeof key_buttons / sizeof *key_buttons; i++)
-                if (key_down(key_buttons[i].vk)) b |= 1ull << key_buttons[i].bit;
-            int lh = key_down('A') || key_down('D'), lv = key_down('W') || key_down('S');
-            int rh = key_down('J') || key_down('L'), rv = key_down('I') || key_down('K');
-            pick(&sl[0], &sl[1], key_axis('A', 'D', lv), key_axis('S', 'W', lh));
-            pick(&sr[0], &sr[1], key_axis('J', 'L', rv), key_axis('K', 'I', rh));
+            uint8_t down[KEY_COUNT] = {0};
+            // Mouse buttons count only while the cursor is captured, and a button already held when the capture began
+            // (the click that refocused the window) is ignored until it is released.
+            static int was_captured;
+            static uint8_t mouse_ignore[KEY_COUNT];
+            int cap = cur_captured != 0;
+            for (int k = 1; k < KEY_COUNT; k++) {
+                int vk = key_vk(k);
+                down[k] = vk && key_down(vk);
+                if (k < KEY_MOUSE_L || k > KEY_MOUSE_M) continue;
+                if (cap && !was_captured) mouse_ignore[k] = down[k];
+                if (!down[k]) mouse_ignore[k] = 0;
+                if (!cap || mouse_ignore[k]) down[k] = 0;
+            }
+            was_captured = cap;
+            b |= input_map_buttons(down);
+            int32_t k[2];
+            input_map_stick(down, 0, k);
+            pick(&sl[0], &sl[1], k[0], k[1]);
+            input_map_stick(down, 1, k);
+            pick(&sr[0], &sr[1], k[0], k[1]);
+            mouse_camera(k);
+            pick(&sr[0], &sr[1], k[0], k[1]);
         }
     }
     script_apply(&b, sl, sr);
@@ -264,9 +404,11 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
 
 // Text entry (swkbd_win.c): while it is open the game reads no input, as behind the keyboard applet; after it closes
 // the game reads none until every button and stick direction is released, so the press that closed it stays there.
-static volatile LONG g_block;   // 0 off, 1 text entry open, 2 closed, waiting for the release
-
-void input_block(int on) { InterlockedExchange(&g_block, on ? 1 : 2); }
+// g_block (above): 0 off, 1 text entry open, 2 closed, waiting for the release. The cursor is released while it is open.
+void input_block(int on) {
+    InterlockedExchange(&g_block, on ? 1 : 2);
+    cursor_update(gfx_window_handle());
+}
 
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
