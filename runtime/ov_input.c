@@ -186,6 +186,28 @@ static void once(volatile long *flag, const char *fmt, uint32_t v) {
     if (!InterlockedExchange(flag, 1)) rt_log(fmt, v);
 }
 
+// TOTK_RUMBLE_STRENGTH (percent, 0..300, default 130; 0 = off) and TOTK_RUMBLE_CURVE (exponent on the amplitude, 0.2..1.5,
+// default 0.6). HD rumble is strong at low amplitude, an ERM motor hardly turns there, so weak values are lifted by the
+// curve (0.1 -> 0.25) and the strength scales the result (saturating at 65535; 0.66 and up reach full drive at 130 %).
+static float rumble_strength = 1.3f, rumble_curve = 0.6f;
+static volatile long rumble_cfg_done;
+static float cfg_float(const char *name, float def, float lo, float hi) {
+    const char *e = cfg_get(name);
+    char *end;
+    double v = e ? strtod(e, &end) : 0;
+    if (!e || end == e || *end || v != v) return def;
+    return (float)(v < lo ? lo : v > hi ? hi : v);
+}
+static void rumble_cfg(void) {
+    if (rumble_cfg_done) return;
+    rumble_strength = cfg_float("TOTK_RUMBLE_STRENGTH", 130, 0, 300) / 100;
+    rumble_curve = cfg_float("TOTK_RUMBLE_CURVE", 0.6f, 0.2f, 1.5f);
+    int trig = input_rumble_triggers_enabled();
+    if (!InterlockedExchange(&rumble_cfg_done, 1))
+        rt_log("hid: rumble strength %.0f%%, curve %.2f, triggers %s", rumble_strength * 100, rumble_curve, trig ? "on" : "off");
+}
+static uint16_t motor(float a) { return rumble_motor(a, rumble_curve, rumble_strength); }
+
 static uint32_t pad_style_index(void) { return ov_handheld() ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY; }
 
 // The SDK's id check (utility functions): players 1-8, other (0x10) and handheld (0x20); the public functions abort
@@ -205,7 +227,8 @@ static void ov_vibration_handles(Cpu *c) {
     if (!out || max <= 0 || __builtin_popcount(style) != 1)
         rt_fatal("nn::hid::GetVibrationDeviceHandles: invalid arguments (count %d, styles %#x)", max, style);
     static volatile long asked;
-    if (env_zero("TOTK_RUMBLE")) { once(&asked, "hid: no vibration devices (TOTK_RUMBLE=%u)", 0); ret_x(c, 0); return; }
+    rumble_cfg();
+    if (env_zero("TOTK_RUMBLE") || rumble_strength == 0) { once(&asked, "hid: no vibration devices (TOTK_RUMBLE=%u)", 0); ret_x(c, 0); return; }
     static const struct { uint8_t bit, n; uint32_t base; } t[] = {
         {0, 2, 0x3}, {1, 2, 0x4}, {2, 2, 0x5}, {3, 1, 0x6}, {4, 1, 0x10007}, {5, 1, 0x8}, {10, 1, 0xd}, {8, 2, 0x4},
         {30, 2, 0x21}, {29, 2, 0x20}};
@@ -269,8 +292,6 @@ static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -
 // Share of a band at f Hz that goes to the light (high-frequency, right) motor: none at 160 Hz and below (the low band's
 // neutral frequency), all at 320 Hz and above (the high band's), log scale between.
 static float light_share(float f) { return f > 160 ? (f < 320 ? log2f(f / 160) : 1) : 0; }
-// An ERM motor hardly turns at low drive: lift weak values ((a + sqrt a) / 2: 0.1 -> 0.21, 0.5 -> 0.6, 1 -> 1).
-static uint16_t motor(float a) { return (uint16_t)((a + sqrtf(a)) * 0.5f * 65535.0f + 0.5f); }
 
 // Switch HD rumble -> SDL_RumbleGamepad. Each side's two bands split by frequency between the heavy (low) and the light
 // (high) motor (light_share) and add up as energy per motor (root of the summed squares); the stronger side drives each
@@ -278,6 +299,7 @@ static uint16_t motor(float a) { return (uint16_t)((a + sqrtf(a)) * 0.5f * 65535
 // the game streams, so the pad stops by itself when the game stops sending (pause, freeze). Under vib_lock.
 static void rumble_update(uint64_t now) {
     float heavy = 0, light = 0;
+    rumble_cfg();
     for (int s = 0; s < 2 && vib_allowed; s++) {
         if (!vib_at[s] || now - vib_at[s] > RUMBLE_STALE_NS) continue;
         const VibrationValue *v = &vib_last[s];

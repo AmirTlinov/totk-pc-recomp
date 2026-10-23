@@ -14,6 +14,10 @@ void input_block(int on);
 // Rumble: SDL_RumbleGamepad on the open gamepad, low (heavy, left) and high (light, right) motor 0..65535 for ms
 // milliseconds. 1 if a gamepad with rumble took it. Callable from any thread.
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms);
+// Motor value for a normalised amplitude: pow(a, curve) * strength, saturated to 0..65535. Pure.
+uint16_t rumble_motor(float a, float curve, float strength);
+// TOTK_RUMBLE_TRIGGERS=1: input_rumble also drives the impulse triggers (Xbox) with the high motor's value.
+int input_rumble_triggers_enabled(void);
 
 // Motion (TOTK_MOTION=0 turns it off). input_motion_start starts the sensor thread once: every 4 ms it reads the
 // gamepad's gyro and accelerometer (when it has them) and feeds motion_global(). Callable from any thread.

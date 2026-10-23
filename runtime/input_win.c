@@ -279,10 +279,26 @@ void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int
     poll_merged(buttons, lx, ly, rx, ry);
 }
 
+uint16_t rumble_motor(float a, float curve, float strength) {
+    if (!(a > 0) || !(strength > 0)) return 0;
+    float v = powf(a > 1 ? 1 : a, curve) * strength * 65535.0f + 0.5f;
+    return v >= 65535.0f ? 65535 : (uint16_t)v;
+}
+
+int input_rumble_triggers_enabled(void) {
+    const char *e = cfg_get("TOTK_RUMBLE_TRIGGERS");
+    return e && !strcmp(e, "1");
+}
+
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     int ok = 0;
+    static int triggers = -1;
+    if (triggers < 0) triggers = input_rumble_triggers_enabled();
     AcquireSRWLockExclusive(&lock);
-    if (state == 1 && pad && pad_rumble) ok = SDL_RumbleGamepad(pad, low, high, ms);
+    if (state == 1 && pad && pad_rumble) {
+        ok = SDL_RumbleGamepad(pad, low, high, ms);
+        if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
+    }
     ReleaseSRWLockExclusive(&lock);
     return ok;
 }
