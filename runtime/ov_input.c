@@ -5,7 +5,7 @@
 // TOTK_OPERATION_MODE=handheld it is the handheld controller (id 0x20, style bit 1) and player 1 is not connected,
 // which is the controller the game reads in that mode. Mouse and keyboard report no input. The controller has two
 // vibration devices (left, right) played on the gamepad's motors (TOTK_RUMBLE=0: none) and a six-axis sensor fed by
-// the gamepad's gyro and accelerometer (TOTK_MOTION=0: none). State layouts follow libnx HID.
+// the gamepad's gyro and accelerometer (TOTK_MOTION=0, live: reads at rest). State layouts follow libnx HID.
 #include <windows.h>
 #include <math.h>
 #include <stdint.h>
@@ -189,8 +189,10 @@ static void once(volatile long *flag, const char *fmt, uint32_t v) {
 // TOTK_RUMBLE_STRENGTH (percent, 0..300, default 130; 0 = off) and TOTK_RUMBLE_CURVE (exponent on the amplitude, 0.2..1.5,
 // default 0.6). HD rumble is strong at low amplitude, an ERM motor hardly turns there, so weak values are lifted by the
 // curve (0.1 -> 0.25) and the strength scales the result (saturating at 65535; 0.66 and up reach full drive at 130 %).
+// Both are live settings (the menu): read again whenever cfg_version changes.
 static float rumble_strength = 1.3f, rumble_curve = 0.6f;
-static volatile long rumble_cfg_done;
+static volatile long rumble_cfg_logged;
+static unsigned rumble_cfg_seen = ~0u;
 static float cfg_float(const char *name, float def, float lo, float hi) {
     const char *e = cfg_get(name);
     char *end;
@@ -199,11 +201,13 @@ static float cfg_float(const char *name, float def, float lo, float hi) {
     return (float)(v < lo ? lo : v > hi ? hi : v);
 }
 static void rumble_cfg(void) {
-    if (rumble_cfg_done) return;
+    unsigned v = cfg_version();
+    if (v == rumble_cfg_seen) return;
+    rumble_cfg_seen = v;
     rumble_strength = cfg_float("TOTK_RUMBLE_STRENGTH", 130, 0, 300) / 100;
     rumble_curve = cfg_float("TOTK_RUMBLE_CURVE", 0.6f, 0.2f, 1.5f);
     int trig = input_rumble_triggers_enabled();
-    if (!InterlockedExchange(&rumble_cfg_done, 1))
+    if (!InterlockedExchange(&rumble_cfg_logged, 1))
         rt_log("hid: rumble strength %.0f%%, curve %.2f, triggers %s", rumble_strength * 100, rumble_curve, trig ? "on" : "off");
 }
 static uint16_t motor(float a) { return rumble_motor(a, rumble_curve, rumble_strength); }
@@ -228,7 +232,8 @@ static void ov_vibration_handles(Cpu *c) {
         rt_fatal("nn::hid::GetVibrationDeviceHandles: invalid arguments (count %d, styles %#x)", max, style);
     static volatile long asked;
     rumble_cfg();
-    if (env_zero("TOTK_RUMBLE") || rumble_strength == 0) { once(&asked, "hid: no vibration devices (TOTK_RUMBLE=%u)", 0); ret_x(c, 0); return; }
+    // strength 0 keeps the devices (silent), so the menu can turn rumble up again
+    if (env_zero("TOTK_RUMBLE")) { once(&asked, "hid: no vibration devices (TOTK_RUMBLE=%u)", 0); ret_x(c, 0); return; }
     static const struct { uint8_t bit, n; uint32_t base; } t[] = {
         {0, 2, 0x3}, {1, 2, 0x4}, {2, 2, 0x5}, {3, 1, 0x6}, {4, 1, 0x10007}, {5, 1, 0x8}, {10, 1, 0xd}, {8, 2, 0x4},
         {30, 2, 0x21}, {29, 2, 0x20}};
@@ -243,14 +248,14 @@ static void ov_vibration_handles(Cpu *c) {
 }
 
 // int GetSixAxisSensorHandles(SixAxisSensorHandle *out, int count, const NpadIdType &id, NpadStyleSet style):
-// utility::GetSixAxisSensorHandle's order (one sensor per style, two for the Joy-Con pair); none with TOTK_MOTION=0.
+// utility::GetSixAxisSensorHandle's order (one sensor per style, two for the Joy-Con pair). Also with TOTK_MOTION=0: the
+// sensor then reads at rest (six_fill), so the menu can turn motion on while the game runs.
 static void ov_six_axis_handles(Cpu *c) {
     uint32_t *out = arg_p(c, 0), style = (uint32_t)arg_x(c, 3);
     int max = (int)arg_x(c, 1);
     uint32_t id = handle_id(c, "GetSixAxisSensorHandles");
     if (!out || max <= 0) rt_fatal("nn::hid::GetSixAxisSensorHandles: invalid arguments (count %d)", max);
     static volatile long asked;
-    if (env_zero("TOTK_MOTION")) { once(&asked, "hid: no six-axis sensor (TOTK_MOTION=%u)", 0); ret_x(c, 0); return; }
     uint32_t base = 0, n = 1;
     if (style & 1) base = 0x20003;
     else if (style & 2) base = 0x20004;
@@ -446,7 +451,8 @@ static void ov_six_stop(Cpu *c) {
 static int six_fill(MotionState *s, int max, const uint32_t *h, const char *fn) {
     if (max <= 0) return 0;
     if (!s) rt_fatal("nn::hid::detail::%s: null output", fn);
-    int n = six_axis_ours(h, fn) && six_running ? motion_read(motion_global(), s, max, kern_now_ns()) : 0;
+    int live = six_axis_ours(h, fn) && six_running && input_motion_enabled();
+    int n = live ? motion_read(motion_global(), s, max, kern_now_ns()) : 0;
     if (!n) {
         static const MotionState rest = {.acc = {0, 0, -1}, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}};
         for (int i = 0; i < max; i++) s[i] = rest;

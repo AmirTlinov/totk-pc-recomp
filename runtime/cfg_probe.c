@@ -55,6 +55,81 @@ int probe_cfg(void) {
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
     CHECK(cfg_get("TOTK_FPS60") == NULL, "missing file leaves no keys");
+
+    // cfg_set / cfg_save: only changed lines move, comments stay, a missing key goes under its section
+    static const char before[] =
+        "\xEF\xBB\xBF# my settings\r\n"
+        "[frame rate]\r\n"
+        "  FPS60 = 1\r\n"
+        "; keep this\r\n"
+        "\r\n"
+        "[input]\r\n"
+        "# Gamepad motion controls (0 = off) and vibration (0 = off).\r\n"
+        "# motion = 1\r\n"
+        "# rumble = 1\r\n"
+        "rumble_curve = 0.6\r\n"
+        "\r\n"
+        "[files]\r\n"
+        "romfs_mods = C:\\mods";
+    static const char after[] =
+        "\xEF\xBB\xBF# my settings\r\n"
+        "[frame rate]\r\n"
+        "  FPS60 = 0\r\n"
+        "; keep this\r\n"
+        "\r\n"
+        "[input]\r\n"
+        "# Gamepad motion controls (0 = off) and vibration (0 = off).\r\n"
+        "# motion = 1\r\n"
+        "motion = 0\r\n"
+        "# rumble = 1\r\n"
+        "rumble_curve = 0.6\r\n"
+        "rumble_strength = 80\r\n"
+        "\r\n"
+        "[files]\r\n"
+        "romfs_mods = C:\\mods\r\n"
+        "\r\n"
+        "[audio]\r\n"
+        "volume = 40\r\n";
+    _putenv_s("TOTK_MOTION", "");
+    _putenv_s("TOTK_VOLUME", "");
+    _putenv_s("TOTK_RUMBLE_STRENGTH", "");
+    CHECK(plat_file_write(path, before, sizeof before - 1), "write the save ini");
+    CHECK(cfg_load(path) == 1, "load the save ini");
+    unsigned v0 = cfg_version();
+    cfg_set("TOTK_FPS60", "0");
+    cfg_set("TOTK_MOTION", "0");
+    cfg_set("TOTK_RUMBLE_STRENGTH", "80");
+    cfg_set("TOTK_VOLUME", "40");
+    CHECK(cfg_version() == v0 + 4, "cfg_set bumps the version");
+    CHECK(EQ(cfg_get("TOTK_FPS60"), "0") && EQ(cfg_get("TOTK_VOLUME"), "40"), "cfg_set values are read back at once");
+    CHECK(cfg_save_to(path) == 1, "cfg_save_to writes");
+    uint64_t got_n = 0;
+    uint8_t *got = plat_file_read(path, &got_n);
+    CHECK(got && got_n == sizeof after - 1 && !memcmp(got, after, got_n),
+          "saved file: changed line replaced, comments kept, missing keys under their sections");
+    if (got && (got_n != sizeof after - 1 || memcmp(got, after, got_n))) fprintf(stderr, "---- saved:\n%s\n----\n", got);
+    free(got);
+    CHECK(cfg_save_to(path) == 1, "a save with nothing changed");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && got_n == sizeof after - 1 && !memcmp(got, after, got_n), "a save with nothing changed keeps the file");
+    free(got);
+    CHECK(cfg_load(path) == 1 && EQ(cfg_get("TOTK_FPS60"), "0") && EQ(cfg_get("TOTK_MOTION"), "0") &&
+          EQ(cfg_get("TOTK_RUMBLE_STRENGTH"), "80") && EQ(cfg_get("TOTK_VOLUME"), "40") &&
+          EQ(cfg_get("TOTK_ROMFS_MODS"), "C:\\mods"), "the saved file reads back");
+    const char *held = cfg_get("TOTK_VOLUME");
+    _putenv_s("TOTK_VOLUME", "70");
+    cfg_set("TOTK_VOLUME", "90");
+    CHECK(cfg_from_env("TOTK_VOLUME") && EQ(cfg_get("TOTK_VOLUME"), "70"), "environment wins over cfg_set");
+    CHECK(EQ(held, "40"), "a pointer cfg_get handed out stays valid after cfg_set");
+    _putenv_s("TOTK_VOLUME", "");
+    CHECK(!cfg_from_env("TOTK_VOLUME") && EQ(cfg_get("TOTK_VOLUME"), "90"), "cfg_set value returns without the variable");
+    plat_file_delete(path);
+    CHECK(cfg_save_to(path) == 1, "cfg_save_to creates a missing file");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && !strcmp((const char *)got, "[audio]\nvolume = 90\n"), "new file: the section and the key");
+    free(got);
+    plat_file_delete(path);
+    cfg_load(path);
     CHECK(rumble_motor(0, 0.6f, 1.3f) == 0 && rumble_motor(0.5f, 0.6f, 0) == 0, "rumble: zero amplitude or strength is silent");
     CHECK(rumble_motor(1, 0.6f, 3) == 65535 && rumble_motor(5, 1, 1) == 65535, "rumble: saturates at 65535");
     CHECK(rumble_motor(0.25f, 1, 1) > 16000 && rumble_motor(0.25f, 1, 1) < 16800, "rumble: curve 1, strength 100% is linear");

@@ -484,10 +484,12 @@ static void probe_feedback(uint32_t pid, uint32_t style) {
     char *keep_m = cfg_get("TOTK_MOTION") ? _strdup(cfg_get("TOTK_MOTION")) : NULL;
     set_env("TOTK_RUMBLE", "0");
     set_env("TOTK_MOTION", "0");
-    uint32_t none[2] = {0xdead, 0xdead};
-    CHECK((int32_t)CALL("hid.GetVibrationDeviceHandles", U(none), 2, U(&pid), style) == 0 &&
-          (int32_t)CALL("hid.GetSixAxisSensorHandles", U(none), 2, U(&pid), style) == 0 && none[0] == 0xdead,
-          "TOTK_RUMBLE=0 / TOTK_MOTION=0 still report handles");
+    uint32_t none[2] = {0xdead, 0xdead}, six_off[2] = {0};
+    CHECK((int32_t)CALL("hid.GetVibrationDeviceHandles", U(none), 2, U(&pid), style) == 0 && none[0] == 0xdead,
+          "TOTK_RUMBLE=0 still reports vibration handles");
+    // TOTK_MOTION is live: the handle stays (the sensor reads at rest while it is 0)
+    CHECK((int32_t)CALL("hid.GetSixAxisSensorHandles", U(six_off), 2, U(&pid), style) == 1 && six_off[0] == sh[0],
+          "TOTK_MOTION=0 drops the six-axis handle %#x", six_off[0]);
     set_env("TOTK_RUMBLE", keep_r);
     set_env("TOTK_MOTION", keep_m);
     free(keep_r);

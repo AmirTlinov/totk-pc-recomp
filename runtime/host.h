@@ -191,9 +191,13 @@ void rt_patches_init(void);                                // after ldr_load: sw
 int rt_patch_set(const char *name);                        // index of a set of generated patches.h, -1 if absent
 int rt_patch_enabled(int set);                             // the set is on (0 for -1)
 void rt_patch_disable(int set);                            // before the guest starts: a set needs another that is off
+void rt_patch_switch(int set, int on);                     // at run time (live settings): each site takes the new code
+                                                           // the next time it runs
 void *rt_patch_page(void);                                 // the page the patched code reads (NULL without the table)
 void frame_step_init(void);                                // after rt_patches_init: the real-time step's first value
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
+int frame_step_cap_ticks(void);                            // with the real-time step: 60 Hz ticks per frame at most
+                                                           // (1 = 60 fps, 2 = 30 fps; TOTK_FPS60, live)
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
 // ---- boot (boot.c T6, main.c T1)

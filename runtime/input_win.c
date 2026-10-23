@@ -192,10 +192,13 @@ static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's appli
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
-static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off, read once
+static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off; live (cfg_version)
+static unsigned mouse_sens_seen;
 
 static float mouse_sens_get(void) {
-    if (mouse_sens >= 0) return mouse_sens;
+    unsigned ver = cfg_version();
+    if (mouse_sens >= 0 && ver == mouse_sens_seen) return mouse_sens;
+    mouse_sens_seen = ver;
     const char *e = cfg_get("TOTK_MOUSE_SENS");
     char *end;
     double v = e ? strtod(e, &end) : 1;
@@ -435,7 +438,8 @@ int input_rumble_triggers_enabled(void) {
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     int ok = 0;
     static int triggers = -1;
-    if (triggers < 0) triggers = input_rumble_triggers_enabled();
+    static unsigned seen;
+    if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
     AcquireSRWLockExclusive(&lock);
     if (state == 1 && pad && pad_rumble) {
         ok = SDL_RumbleGamepad(pad, low, high, ms);
@@ -479,8 +483,21 @@ static int sensors_ready(void) {
     return sensor_ok;
 }
 
+int input_motion_enabled(void) {
+    static int on = -1;
+    static unsigned seen;
+    unsigned v = cfg_version();
+    if (on < 0 || v != seen) {
+        seen = v;
+        const char *e = cfg_get("TOTK_MOTION");
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
+}
+
 // 250 Hz: the gamepads update (reports read, rumble expiry) and the newest gyro and accelerometer sample goes into the
-// fusion. Without a gamepad with sensors nothing is fed and the six-axis sensor reads at rest.
+// fusion. Without a gamepad with sensors, or with motion off (TOTK_MOTION=0, live), nothing is fed and the six-axis
+// sensor reads at rest.
 static DWORD WINAPI motion_main(void *arg) {
     (void)arg;
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -499,7 +516,7 @@ static DWORD WINAPI motion_main(void *arg) {
                    SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
         }
         ReleaseSRWLockExclusive(&lock);
-        if (!have) continue;
+        if (!have || !input_motion_enabled()) continue;
         double acc[3], gyro[3];
         input_motion_axes(a, g, acc, gyro);
         motion_feed(motion_global(), acc, gyro, kern_now_ns());
@@ -511,9 +528,8 @@ void input_motion_start(void) {
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (!motion_thread) {
-        const char *e = cfg_get("TOTK_MOTION");
-        if (e && !strcmp(e, "0")) { motion_thread = -1; rt_log("input: motion off (TOTK_MOTION=0)"); }
-        else if (state != 1) motion_thread = -1;
+        if (!input_motion_enabled()) rt_log("input: motion off (TOTK_MOTION=0); it can be turned on while the game runs");
+        if (state != 1) motion_thread = -1;
         else {
             HANDLE h = CreateThread(NULL, 0, motion_main, NULL, 0, NULL);
             if (!h) rt_fatal("input: motion thread CreateThread failed (error %lu)", GetLastError());
