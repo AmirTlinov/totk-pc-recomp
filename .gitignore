@@ -67,3 +67,6 @@ desktop.ini
 
 # Milestone plans and task splits: working notes for local agents, not published
 /docs/milestones/
+
+# Agent task worktrees (tools/worktree.py)
+/.worktrees/

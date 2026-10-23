@@ -3,13 +3,13 @@
 Read this before you run the game, take a frame dump or measure performance. This page holds the conventions; the
 `--help` of each tool holds its options.
 
-## Work in a private runtime copy
+## Work in a task worktree
 
-Fork, build, hand back and clean up with the `private-build` skill (`.claude/skills/private-build/SKILL.md`).
+Start, build, hand back and clean up a task with the `private-build` skill (`.claude/skills/private-build/SKILL.md`): a git worktree on `task/<tag>` and a build dir `build/v121-<tag>`.
 The pipeline cache, `pipeline-keys.bin`, `shader-cache`, `shader-programs.bin` and `shader-answers.bin` live next to
-each `totk.exe`, so a fork starts cold: seed it by copying `build/v121`'s five before timing anything. A fork seeded
-from an older build stalls on pipeline and shader builds, and its slow frames say nothing about the change. (Until 2026-10-22 every fork wrote into
-`build/v121`'s caches, and forks broke each other's runs.)
+each `totk.exe`, so a task build starts cold: seed it by copying `build/v121`'s five before timing anything. A build seeded
+from an older one stalls on pipeline and shader builds, and its slow frames say nothing about the change. (Until 2026-10-22 every task build wrote into
+`build/v121`'s caches, and task builds broke each other's runs.)
 
 ## Running
 
@@ -66,7 +66,7 @@ reports: alignments, subgroup size, depth formats, `maxPushDescriptors`.
 must pass. CPU-header changes also need `tests\diff\simd.py`, `lift.py` and `func.py` (AGENTS.md).
 `tools\build_game.py` hashes every object against `obj/objects.sha256` before it links and recompiles a mismatch (the
 faulty RAM flipped bits in stored objects once, `build/BOOTCRASH.md`). The line `objects verified: N, recompiled after
-a hash mismatch: M` should show M of 0; a nonzero M means rerun the probes. A fork checks the shared objects against
+a hash mismatch: M` should show M of 0; a nonzero M means rerun the probes. A task build checks the shared objects against
 the main build's manifest, so build `build/v121` first.
 
 ## Bug classes already fixed

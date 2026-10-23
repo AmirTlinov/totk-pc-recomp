@@ -52,6 +52,9 @@ import romfs_index
 from check_content import GENERATED_MARKER
 
 ROOT = Path(__file__).resolve().parent.parent
+# In a git worktree (tools/worktree.py) build/ and generated/ are junctions into the main checkout, and resolve() follows
+# them. MAIN_ROOT is where they land, so resolved paths still print and compare relative to a root.
+MAIN_ROOT = (ROOT / 'build').resolve().parent
 UCRT = Path(r'C:\msys64\ucrt64\bin')
 CLANG = UCRT / 'clang.exe'
 NINJA = UCRT / 'ninja.exe'
@@ -74,22 +77,23 @@ JOB_MEM = 768 << 20
 MEM_BUDGET = 50 * GiB  # total for all compile jobs
 
 
+def below_root(p):
+    """Resolved p relative to ROOT, else to MAIN_ROOT (the same relative path through the worktree's junctions), else
+    absolute."""
+    p = Path(p).resolve()
+    for root in (ROOT, MAIN_ROOT):
+        if p.is_relative_to(root):
+            return p.relative_to(root)
+    return p
+
+
 def ninja_path(p):
     """A path for a build line: relative to the repo root where possible, forward slashes, Ninja-escaped."""
-    p = Path(p)
-    try:
-        p = p.resolve().relative_to(ROOT)
-    except ValueError:
-        p = p.resolve()
-    return p.as_posix().replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
+    return below_root(p).as_posix().replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
 
 
 def flag_path(p):
-    p = Path(p).resolve()
-    try:
-        return p.relative_to(ROOT).as_posix()
-    except ValueError:
-        return p.as_posix()
+    return below_root(p).as_posix()
 
 
 def read_layout(gen):
@@ -244,7 +248,7 @@ def main_objects(gen, main_out, rt_dir, mods):
     main_ninja = main_out / 'build.ninja'
     if not main_ninja.is_file():
         return None, f'{flag_path(main_ninja)} not found'
-    if gen != ROOT / 'generated' / main_out.name:
+    if gen != (ROOT / 'generated' / main_out.name).resolve():
         return None, 'generated C directory is not the main one'
     lines = main_ninja.read_text().splitlines()
     sources = dict(l[6:].split(': cc_gen ') for l in lines if l.startswith('build ') and ': cc_gen ' in l)
@@ -261,14 +265,16 @@ def main_objects(gen, main_out, rt_dir, mods):
             if not theirs.is_file():
                 return None, f'main object {flag_path(theirs)} is missing'
             pairs[o] = theirs
+    # Ninja runs in the main checkout: the main build.ninja is relative to it, and the worktree's runtime/ files carry newer
+    # mtimes that would make every object look stale. Header equality is checked byte for byte below.
     env = dict(os.environ, PATH=str(UCRT) + os.pathsep + os.environ.get('PATH', ''))
     targets = [ninja_path(t) for t in pairs.values()]
     for i in range(0, len(targets), 200):
-        r = subprocess.run([str(NINJA), '-f', str(main_ninja), '-n', '-d', 'explain'] + targets[i:i + 200], cwd=ROOT,
+        r = subprocess.run([str(NINJA), '-f', str(main_ninja), '-n', '-d', 'explain'] + targets[i:i + 200], cwd=MAIN_ROOT,
                            env=env, capture_output=True, text=True)
         if r.returncode or 'no work to do' not in r.stdout:
             return None, f'main generated objects are stale ({flag_path(main_out)} needs a build)'
-    r = subprocess.run([str(NINJA), '-f', str(main_ninja), '-t', 'deps'], cwd=ROOT, env=env, capture_output=True,
+    r = subprocess.run([str(NINJA), '-f', str(main_ninja), '-t', 'deps'], cwd=MAIN_ROOT, env=env, capture_output=True,
                        text=True)
     ours = {flag_path(t) for t in pairs.values()}
     headers, cur = set(), False
@@ -278,9 +284,9 @@ def main_objects(gen, main_out, rt_dir, mods):
                 headers.add(l.strip())
         else:
             cur = l.split(': #deps')[0] in ours
-    main_rt = ROOT / 'runtime'
+    main_rt = MAIN_ROOT / 'runtime'
     for h in sorted(headers):
-        p = Path(h) if Path(h).is_absolute() else ROOT / h
+        p = Path(h) if Path(h).is_absolute() else MAIN_ROOT / h
         try:
             rel = p.resolve().relative_to(main_rt)
         except ValueError:
@@ -558,7 +564,7 @@ def main():
     global RUNTIME
     RUNTIME = (args.runtime or RUNTIME).resolve()
     skip = {s for s in args.skip_runtime.split(',') if s}
-    main_out = ROOT / 'build' / args.version
+    main_out = (ROOT / 'build' / args.version).resolve()
     pairs = None
     if args.full_build:
         why = '--full-build'
@@ -601,7 +607,7 @@ def main():
     for dll in SDL3_DLLS:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to totk.exe
         shutil.copy2(dll, exe.parent / dll.name)
     sections, image = pe_sections(exe)
-    print(f'{exe.relative_to(ROOT) if exe.is_relative_to(ROOT) else exe}: file {mib(exe.stat().st_size)}, '
+    print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
     if image > 3 * GiB // 2:
         print('build_game: warning: image over 1.5 GiB; RIP-relative code reaches only 2 GiB', file=sys.stderr)

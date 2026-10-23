@@ -47,8 +47,8 @@ Setup and verify commands: [docs/toolchain-windows.md](docs/toolchain-windows.md
 - Shader census (`.venv-py314`): `tools\shader_census.py --version v121 [--translate]` extracts every Maxwell shader to `build/v121/shaders/` and runs it through `build\xlate\totk_xlate.exe` and `spirv-val`; failure groups go to `failures.txt`. `tools\xlate_smoke.py` checks the translator alone, without game files.
 - Shader preparation (`.venv-py314`, once per build dir and translator): `tools\prepare_shaders.py build\v121` translates the variants of the MacNativeGames shared shader list (read from `refs/` at run time) into the build's shader cache and builds their stage libraries into the driver cache (`totk.exe --prepare-shaders`, about 5 min, 1.3 GB); play then translates and compiles only variants the list lacks.
 - The plan by stage and the proposed fixes with their evidence: [docs/backlog.md](docs/backlog.md).
-- Running, measuring or frame-dumping the game, save backups, private runtime copies: [docs/agent-playbook.md](docs/agent-playbook.md).
-- Project skills (`.claude/skills/`): `private-build` before changing runtime/ or tools/ code and building totk.exe; `run-game` to run a build into gameplay from a save.
+- Running, measuring or frame-dumping the game, save backups, task worktrees and their builds: [docs/agent-playbook.md](docs/agent-playbook.md).
+- Project skills (`.claude/skills/`): `private-build` before changing runtime/ or tools/ code and building totk.exe (one git worktree per task); `run-game` to run a build into gameplay from a save.
 - hactool: `toolchain/hactool/hactool.exe`. From an MSYS2 shell pass `-k <keys>` explicitly; the shell's `HOME` hides the default key location.
 - Ghidra 12.1.2 with SwitchLoader: `toolchain/ghidra/ghidra_12.1.2_PUBLIC`. Game modules (NSO) open here, headless or GUI.
 - REA (`reverse-engineer-anything` skill + MCP server) analyses our own x86-64 builds. On Windows its Ghidra provider admits PE files only, so NSO analysis goes through Ghidra directly. Register the MCP server once per clone, at local scope:
