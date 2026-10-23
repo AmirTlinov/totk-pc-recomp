@@ -5,6 +5,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "input.h"
 #include "platform/platform.h"
 
 static int fails;
@@ -52,6 +53,11 @@ int probe_cfg(void) {
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
     CHECK(cfg_get("TOTK_FPS60") == NULL, "missing file leaves no keys");
+    CHECK(rumble_motor(0, 0.6f, 1.3f) == 0 && rumble_motor(0.5f, 0.6f, 0) == 0, "rumble: zero amplitude or strength is silent");
+    CHECK(rumble_motor(1, 0.6f, 3) == 65535 && rumble_motor(5, 1, 1) == 65535, "rumble: saturates at 65535");
+    CHECK(rumble_motor(0.25f, 1, 1) > 16000 && rumble_motor(0.25f, 1, 1) < 16800, "rumble: curve 1, strength 100% is linear");
+    CHECK(rumble_motor(0.1f, 0.6f, 1.3f) > rumble_motor(0.1f, 1, 1.3f), "rumble: curve lifts weak values");
+    CHECK(rumble_motor(0.3f, 0.6f, 1.3f) > rumble_motor(0.3f, 0.6f, 1), "rumble: strength scales");
     printf("probe-cfg: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }
