@@ -370,10 +370,20 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
             uint8_t down[KEY_COUNT] = {0};
+            // Mouse buttons count only while the cursor is captured, and a button already held when the capture began
+            // (the click that refocused the window) is ignored until it is released.
+            static int was_captured;
+            static uint8_t mouse_ignore[KEY_COUNT];
+            int cap = cur_captured != 0;
             for (int k = 1; k < KEY_COUNT; k++) {
                 int vk = key_vk(k);
                 down[k] = vk && key_down(vk);
+                if (k < KEY_MOUSE_L || k > KEY_MOUSE_M) continue;
+                if (cap && !was_captured) mouse_ignore[k] = down[k];
+                if (!down[k]) mouse_ignore[k] = 0;
+                if (!cap || mouse_ignore[k]) down[k] = 0;
             }
+            was_captured = cap;
             b |= input_map_buttons(down);
             int32_t k[2];
             input_map_stick(down, 0, k);
