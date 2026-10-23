@@ -1,0 +1,64 @@
+# Monsters save (build/save-backup/user-save-2026-10-21-monsters, slot 3): the fight starts right after loading.
+# Title screen to gameplay as load_save.txt; gameplay starts around frame 1500, enemies are ahead on the right.
+300 A 4
+520 A 4
+700 A 4
+900 A 4
+# Lock on (ZL held) and attack in bursts of three, with a short step toward the target between bursts.
+1540 ZL 1100
+1550 Y 4
+1570 Y 4
+1590 Y 4
+1605 LSTICK 0 32767 15
+1630 Y 4
+1650 Y 4
+1670 Y 4
+1685 LSTICK 0 32767 15
+1710 Y 4
+1730 Y 4
+1750 Y 4
+1765 LSTICK 0 32767 15
+1790 Y 4
+1810 Y 4
+1830 Y 4
+1845 LSTICK 0 32767 15
+1870 Y 4
+1890 Y 4
+1910 Y 4
+1925 LSTICK 0 32767 15
+1950 Y 4
+1970 Y 4
+1990 Y 4
+2005 LSTICK 0 32767 15
+2030 Y 4
+2050 Y 4
+2070 Y 4
+2085 LSTICK 0 32767 15
+2110 Y 4
+2130 Y 4
+2150 Y 4
+2165 LSTICK 0 32767 15
+2190 Y 4
+2210 Y 4
+2230 Y 4
+2245 LSTICK 0 32767 15
+2270 Y 4
+2290 Y 4
+2310 Y 4
+2325 LSTICK 0 32767 15
+2350 Y 4
+2370 Y 4
+2390 Y 4
+2405 LSTICK 0 32767 15
+2430 Y 4
+2450 Y 4
+2470 Y 4
+2485 LSTICK 0 32767 15
+2510 Y 4
+2530 Y 4
+2550 Y 4
+2565 LSTICK 0 32767 15
+2590 Y 4
+2610 Y 4
+2630 Y 4
+2645 LSTICK 0 32767 15

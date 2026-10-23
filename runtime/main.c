@@ -1,0 +1,491 @@
+// totk.exe entry: reserves the guest address space, parses the command line and runs one mode.
+//
+//   totk.exe [--exefs DIR] [--romfs DIR] [--profile DIR] <mode>
+//     --selftest        layout, dispatch table and host-function registry; needs no game files
+//     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
+//     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    task probes (T2-T5)
+//     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes (M4 T1); needs no game files
+//     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    M4 probes
+//                       "not built yet", exit 2, until their task lands
+//     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
+//     --boot            run the game to the first NVN call (T6)
+//     --frames N        run the game (implies --boot's start-up) until the Nth present, then exit 0
+//     --shot PNG        with --frames: save the Nth frame; env TOTK_GPU=null|vulkan selects the back end
+//     (no mode)         run the game
+//
+// Also here: the runtime services the generated code calls besides rt_dispatch and rt_svc (rt_brk, rt_udf,
+// rt_ticks, the function profiler hook), logging, SHA-256, and the crash reporter (a vectored exception handler that
+// names the lifted function, the guest registers and the guest frame-pointer chain).
+#include <windows.h>
+#include <bcrypt.h>
+#include <limits.h>
+#include <psapi.h>
+#include <timeapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "cfg.h"
+#include "host.h"
+
+#define MAX_MODULES 16
+
+// ---- logging, tracing, hashing
+unsigned rt_trace;
+
+void rt_log(const char *fmt, ...) {
+    char buf[2048];
+    int n = snprintf(buf, sizeof buf, "[host] ");
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(buf + n, sizeof buf - n - 1, fmt, ap);
+    va_end(ap);
+    n = k < 0 ? n : n + k < (int)sizeof buf - 1 ? n + k : (int)sizeof buf - 2;
+    buf[n++] = '\n';
+    fwrite(buf, 1, n, stderr);
+}
+
+static void parse_trace(void) {
+    const char *e = cfg_get("TOTK_TRACE");
+    if (!e) return;
+    static const struct { const char *name; unsigned bit; } names[] = {
+        {"svc", RT_TRACE_SVC}, {"host", RT_TRACE_HOSTCALL}, {"ipc", RT_TRACE_IPC}, {"fs", RT_TRACE_FS},
+        {"gfx", RT_TRACE_GFX}, {"perf", RT_TRACE_PERF}, {"sched", RT_TRACE_SCHED}, {"audio", RT_TRACE_AUDIO}, {"all", ~0u}};
+    for (const char *p = e; *p;) {
+        size_t n = strcspn(p, ",");
+        int known = 0;
+        for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
+            if (strlen(names[i].name) == n && !strncmp(p, names[i].name, n)) rt_trace |= names[i].bit, known = 1;
+        if (!known && n) rt_log("TOTK_TRACE: unknown item '%.*s' (svc, host, ipc, fs, gfx, perf, sched, audio, all)", (int)n, p);
+        p += n + (p[n] == ',');
+    }
+}
+
+void rt_sha256(const void *p, size_t n, uint8_t out[32]) {
+    static BCRYPT_ALG_HANDLE alg;
+    BCRYPT_ALG_HANDLE a = __atomic_load_n(&alg, __ATOMIC_ACQUIRE);
+    if (!a) {
+        if (BCryptOpenAlgorithmProvider(&a, BCRYPT_SHA256_ALGORITHM, NULL, 0)) rt_fatal("SHA-256 provider unavailable");
+        BCRYPT_ALG_HANDLE expected = NULL;
+        if (!__atomic_compare_exchange_n(&alg, &expected, a, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            BCryptCloseAlgorithmProvider(a, 0);
+            a = expected;
+        }
+    }
+    BCRYPT_HASH_HANDLE h;
+    if (BCryptCreateHash(a, &h, NULL, 0, NULL, 0, 0)) rt_fatal("SHA-256: BCryptCreateHash failed");
+    const uint8_t *s = p;
+    while (n) {
+        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
+        if (BCryptHashData(h, (PUCHAR)s, k, 0)) rt_fatal("SHA-256: BCryptHashData failed");
+        s += k;
+        n -= k;
+    }
+    if (BCryptFinishHash(h, out, 32, 0)) rt_fatal("SHA-256: BCryptFinishHash failed");
+    BCryptDestroyHash(h);
+}
+
+// ---- configuration
+static RtConfig cfg;
+const RtConfig *rt_config(void) { return &cfg; }
+
+// ---- runtime services the generated code calls (cpu.h)
+volatile int g_fnprof = 0;
+void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)addr, (void)lr, (void)x0; }
+
+void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
+    char at[128], lr[128];
+    rt_fatal("brk #%#x at %s (lr %s)", imm, ldr_describe(pc, at, sizeof at), ldr_describe(c->x[30], lr, sizeof lr));
+}
+
+void rt_udf(Cpu *c, uint64_t pc) {
+    char at[128], lr[128];
+    rt_fatal("undefined instruction at %s (lr %s)", ldr_describe(pc, at, sizeof at),
+             ldr_describe(c->x[30], lr, sizeof lr));
+}
+
+// CNTPCT_EL0: the Switch counter runs at 19.2 MHz.
+uint64_t rt_ticks(void) {
+    static uint64_t freq;
+    LARGE_INTEGER t;
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = (uint64_t)f.QuadPart;
+    }
+    QueryPerformanceCounter(&t);
+    return (uint64_t)((unsigned __int128)(uint64_t)t.QuadPart * 19200000u / freq);
+}
+
+// ---- crash reporter
+typedef struct { uintptr_t host; uint64_t guest; } FnRev;
+static FnRev *fn_rev;
+static uint64_t fn_rev_n;
+
+static int by_host(const void *a, const void *b) {
+    uintptr_t x = ((const FnRev *)a)->host, y = ((const FnRev *)b)->host;
+    return x < y ? -1 : x > y;
+}
+
+// The lifted function that contains a host code address, by the nearest function start below it.
+static uint64_t lifted_function(uintptr_t rip) {
+    if (!fn_rev) {
+        static RtModule mods[MAX_MODULES];
+        int n = rt_linked_modules(mods, MAX_MODULES);
+        uint64_t total = 0;
+        for (int i = 0; i < n; i++) total += mods[i].count;
+        fn_rev = malloc((total ? total : 1) * sizeof *fn_rev);
+        if (!fn_rev) return 0;
+        for (int i = 0; i < n; i++)
+            for (uint64_t k = 0; k < mods[i].count; k++)
+                fn_rev[fn_rev_n++] = (FnRev){(uintptr_t)mods[i].fns[k], mods[i].addrs[k]};
+        qsort(fn_rev, fn_rev_n, sizeof *fn_rev, by_host);
+    }
+    uint64_t lo = 0, hi = fn_rev_n;
+    while (lo < hi) {
+        uint64_t mid = (lo + hi) / 2;
+        if (fn_rev[mid].host <= rip) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo ? fn_rev[lo - 1].guest : 0;
+}
+
+static int readable(uint64_t a, uint64_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+}
+
+static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
+    static volatile LONG busy;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_IN_PAGE_ERROR)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    HMODULE self = GetModuleHandleW(NULL);
+    MODULEINFO mi;
+    if (!GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi) || rip - (uintptr_t)mi.lpBaseOfDll >= mi.SizeOfImage)
+        return EXCEPTION_CONTINUE_SEARCH;   // not our code: leave it to the handler that expects it
+    if (InterlockedExchange(&busy, 1)) ExitProcess(71);
+    char d[160];
+    fprintf(stderr, "FATAL: exception %#lx at host %p (totk.exe+%#llx)", code, (void *)rip,
+            (unsigned long long)(rip - (uintptr_t)mi.lpBaseOfDll));
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        fprintf(stderr, ", %s address %#llx",
+                ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "writing" : ep->ExceptionRecord->ExceptionInformation[0] == 8 ? "executing" : "reading",
+                (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+    fputc('\n', stderr);
+    uint64_t f = lifted_function(rip);
+    if (f) fprintf(stderr, "  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
+    Cpu *c = kern_cpu();
+    if (c) {
+        for (int i = 0; i < 31; i++)
+            fprintf(stderr, "  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
+        fprintf(stderr, "  sp  %016llx\n  pc  %016llx  lr %s\n", (unsigned long long)c->sp, (unsigned long long)c->pc,
+                ldr_describe(c->x[30], d, sizeof d));
+        uint64_t fp = c->x[29];
+        for (int n = 0; n < 32 && fp && !(fp & 7) && readable(fp, 16); n++) {
+            uint64_t next = LD64(fp), lr = LD64(fp + 8);
+            fprintf(stderr, "  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
+            if (next <= fp || next - fp > (64u << 20)) break;
+            fp = next;
+        }
+    } else {
+        fprintf(stderr, "  not on a guest thread\n");
+    }
+    fflush(stderr);
+    ExitProcess(71);
+}
+
+// ---- self-test (milestone M2): layout, dispatch table, host-function registry, without game files
+static int failures;
+#define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
+
+static double now_s(void) {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart / (double)f.QuadPart;
+}
+
+static volatile int host_probe_hits;
+static void host_probe(Cpu *c) { host_probe_hits++; c->x[0] = 42; }
+
+static void check_cpu(void) {
+    __builtin_cpu_init();
+    int ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
+    printf("cpu: x86-64-v3 (AVX2, FMA, BMI2) %s\n", ok ? "present" : "MISSING");
+    CHECK(ok, "the lifted code is built for x86-64-v3");
+}
+
+// Layout: ascending, no overlap, below 2^39, and inside the window mem_init reserved.
+static void check_layout(void) {
+    const RtLayoutEntry *lay = rt_layout;
+    int n = rt_layout_count;
+    printf("layout: %d modules\n", n);
+    for (int i = 0; i < n; i++) {
+        printf("  %-8s base %#llx  size %#10llx  end %#llx\n", lay[i].name, (unsigned long long)lay[i].base,
+               (unsigned long long)lay[i].size, (unsigned long long)(lay[i].base + lay[i].size));
+        CHECK(lay[i].size > 0, "%s has size 0", lay[i].name);
+        CHECK(lay[i].base % 0x10000 == 0, "%s base is not 64 KiB aligned", lay[i].name);
+        CHECK(lay[i].base + lay[i].size <= RT_KERNEL_BASE, "%s reaches into the kernel region", lay[i].name);
+        if (i) {
+            CHECK(lay[i].base > lay[i - 1].base, "%s base is not above %s", lay[i].name, lay[i - 1].name);
+            CHECK(lay[i - 1].base + lay[i - 1].size <= lay[i].base, "%s overlaps %s", lay[i - 1].name, lay[i].name);
+        }
+        MEMORY_BASIC_INFORMATION mbi;
+        int ours = VirtualQuery((void *)(uintptr_t)lay[i].base, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE &&
+                   (uint64_t)(uintptr_t)mbi.AllocationBase <= lay[i].base;
+        CHECK(ours, "%s is not inside the reserved module window", lay[i].name);
+    }
+    const RtGuestLayout *g = mem_layout();
+    printf("guest memory: aslr %#llx+%#llx stack %#llx heap %#llx alias %#llx+%#llx kernel %#llx host functions %#llx\n",
+           (unsigned long long)g->aslr.base, (unsigned long long)g->aslr.size, (unsigned long long)g->stack.base,
+           (unsigned long long)g->heap.base, (unsigned long long)g->alias.base, (unsigned long long)g->alias.size,
+           (unsigned long long)g->kernel.base, (unsigned long long)g->hostfn.base);
+    CHECK(g->alias.base + g->alias.size <= lay[0].base && g->heap.base + g->heap.size <= g->alias.base,
+          "guest regions overlap");
+}
+
+// Every function start dispatches to its own function. The word after a start (unless that is a start too), a
+// misaligned address and the word below the module dispatch to nothing.
+static void check_modules(const RtModule *mods, int n) {
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        const RtModule *m = &mods[i];
+        const RtLayoutEntry *l = NULL;
+        for (int k = 0; k < rt_layout_count; k++)
+            if (!strcmp(rt_layout[k].name, m->name)) l = &rt_layout[k];
+        CHECK(l && l->base == m->base && l->size == m->size, "%s: linked base/size differ from the layout", m->name);
+
+        uint64_t bad = 0, bad_neg = 0;
+        for (uint64_t k = 0; k < m->count; k++) {
+            uint64_t a = m->addrs[k];
+            if (rt_dispatch_lookup(a) != m->fns[k] && bad++ < 5)
+                printf("  FAIL: %s_fn_addrs[%llu] %#llx does not dispatch to its function\n", m->name,
+                       (unsigned long long)k, (unsigned long long)a);
+            int next_is_start = k + 1 < m->count && m->addrs[k + 1] == a + 4;
+            if ((!next_is_start && rt_dispatch_lookup(a + 4)) || rt_dispatch_lookup(a + 2)) bad_neg++;
+        }
+        if (rt_dispatch_lookup(m->base - 4)) bad_neg++;
+        failures += bad > 0;
+        CHECK(!bad_neg, "%s: %llu addresses that are not function starts dispatch to a function", m->name,
+              (unsigned long long)bad_neg);
+        uint64_t lo = m->count ? m->addrs[0] : 0, hi = m->count ? m->addrs[m->count - 1] : 0;
+        printf("  %-8s %8llu functions, first %#llx, last %#llx: %s\n", m->name, (unsigned long long)m->count,
+               (unsigned long long)lo, (unsigned long long)hi, bad || bad_neg ? "FAIL" : "ok");
+        total += m->count;
+    }
+    printf("  total    %8llu functions\n", (unsigned long long)total);
+}
+
+static void bench(const RtModule *mods, int n) {
+    uint64_t total = 0, sink = 0;
+    double t0 = now_s();
+    for (int i = 0; i < n; i++) {
+        for (uint64_t k = 0; k < mods[i].count; k++) sink += (uintptr_t)rt_dispatch_lookup(mods[i].addrs[k]);
+        total += mods[i].count;
+    }
+    double dt = now_s() - t0;
+    __asm__ volatile("" ::"r"(sink));
+    if (total) printf("lookup: %.1f ns per function start (address order)\n", dt * 1e9 / (double)total);
+}
+
+// Memory SVCs without modules: heap, physical memory in the alias region, a stack move, QueryMemory, GetInfo.
+static void check_memory(void) {
+    const RtGuestLayout *g = mem_layout();
+    RtMemoryInfo q;
+    uint64_t heap = 0, v = 0;
+    int before = failures;
+    CHECK(mem_set_heap_size(0x400000, &heap) == 0 && heap == g->heap.base, "SetHeapSize 4 MiB");
+    memset((void *)(uintptr_t)heap, 0xAB, 0x400000);
+    mem_query(heap + 0x1000, &q);
+    CHECK(q.base == heap && q.size == 0x400000 && q.state == 5 && q.perm == 3, "QueryMemory on the heap");
+    CHECK(mem_set_heap_size(0x300000, &heap) != 0, "SetHeapSize accepts a size that is not a 2 MiB multiple");
+
+    uint64_t a = g->alias.base + 0x100000;
+    CHECK(mem_map_physical(a, 0x10000) == 0, "MapPhysicalMemory");
+    ST64(a + 0x8000, 0x1234);
+    CHECK(mem_map_physical(a - 0x4000, 0x20000) == 0 && LD64(a + 0x8000) == 0x1234,
+          "MapPhysicalMemory over a mapped range lost its contents");
+    mem_query(a, &q);
+    CHECK(q.base == a - 0x4000 && q.size == 0x20000 && q.state == 5, "QueryMemory on mapped alias pages");
+    mem_info(7, &v);
+    CHECK(v == 0x400000 + 0x20000, "GetInfo 7 (used memory) %#llx", (unsigned long long)v);
+
+    uint64_t stack = g->stack.base + 0x100000;
+    ST64(a + 8, 0x99);
+    CHECK(mem_map(stack, a, 0x4000) == 0 && LD64(stack + 8) == 0x99, "MapMemory alias -> stack did not copy");
+    ST64(stack + 0x10, 0x5678);
+    mem_query(stack, &q);
+    CHECK(q.base == stack && q.size == 0x4000 && q.state == 0xB, "QueryMemory on a moved stack");
+    mem_query(a, &q);
+    CHECK(q.base == a && q.state == 5 && q.perm == 0, "QueryMemory on a moved stack's source");
+    CHECK(mem_unmap_physical(a, 0x4000) != 0, "UnmapPhysicalMemory under a moved stack");
+    CHECK(mem_unmap(stack, a, 0x4000) == 0 && LD64(a + 0x10) == 0x5678, "UnmapMemory did not copy the stack back");
+
+    CHECK(mem_unmap_physical(a - 0x4000, 0x20000) == 0, "UnmapPhysicalMemory");
+    mem_query(a, &q);
+    CHECK(q.state == 0 && q.base == g->alias.base && q.size == g->alias.size, "QueryMemory on the free alias region");
+    CHECK(mem_map_physical(a, 0x1000) == 0 && LD64(a + 0x10) == 0 && mem_unmap_physical(a, 0x1000) == 0,
+          "remapped physical memory is not zeroed");
+    CHECK(mem_map_physical(a, 0x100000000ull) == 0x10801, "MapPhysicalMemory beyond the pool is not LimitReached");
+    mem_query(RT_HOSTFN_BASE + 0x40, &q);
+    CHECK(q.state == 0x10 && q.base == RT_HOSTFN_BASE, "QueryMemory on the host-function window");
+    mem_query(g->alias.base + g->alias.size + 0x1000, &q);
+    CHECK(q.state == 3 && q.base == g->alias.base + g->alias.size, "QueryMemory on host memory");
+    CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0");
+    printf("memory: heap, physical memory, stack move, QueryMemory, GetInfo: %s\n", failures > before ? "FAIL" : "ok");
+}
+
+static int selftest(void) {
+    static RtModule mods[MAX_MODULES];
+    int n = rt_linked_modules(mods, MAX_MODULES);
+
+    check_cpu();
+    check_layout();
+    uint64_t probe = hostfn_register("<selftest probe>", host_probe);
+
+    double t0 = now_s();
+    hostfn_seal();
+    double dt = now_s() - t0;
+    RtDispatchStats s = rt_dispatch_stats();
+    printf("dispatch: %d modules linked, table covers %#llx-%#llx: %llu slots, %.1f MiB reserved, built in %.0f ms\n",
+           n, (unsigned long long)s.lo, (unsigned long long)s.hi, (unsigned long long)s.slots,
+           (double)s.table_bytes / (1 << 20), dt * 1e3);
+    check_modules(mods, n);
+    CHECK(s.functions > 0, "no functions linked");
+    Cpu *c = _aligned_malloc(sizeof(Cpu), 64);
+    memset(c, 0, sizeof *c);
+    uint64_t r = rt_call(c, probe, 1, (uint64_t)7);
+    CHECK(rt_dispatch_lookup(probe) && r == 42 && host_probe_hits == 1 && c->x[30] == 0,
+          "a registered host function does not dispatch through rt_call");
+    CHECK(!rt_dispatch_lookup(probe + 16), "an unregistered host-function address dispatches");
+    CHECK(rt_dispatch_lookup(RT_RET_HOST), "the rt_call return sentinel is not registered");
+    _aligned_free(c);
+    bench(mods, n);
+
+    void *k1 = mem_kernel_alloc(0x200, 16), *k2 = mem_kernel_alloc(0x2000, 0x1000);
+    CHECK((uintptr_t)k1 - RT_KERNEL_BASE < RT_KERNEL_SIZE && !((uintptr_t)k2 & 0xFFF) && k1 != k2,
+          "kernel-region allocation");
+    mem_kernel_free(k1, 0x200);
+    CHECK(mem_kernel_alloc(0x200, 16) == k1, "a freed kernel-region block is not reused");
+    check_memory();
+
+    PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
+        printf("process: peak working set %.1f MiB\n", (double)pmc.PeakWorkingSetSize / (1 << 20));
+    printf("selftest: %s (%d failures)\n", failures ? "FAILED" : "passed", failures);
+    return failures ? 1 : 0;
+}
+
+static int usage(const char *argv0) {
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
+                    "--probe-cfg | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
+                    "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
+                    "--probe-vkexec | --probe-movie | --prepare-shaders | --boot |--frames N [--shot PNG]]\n", argv0);
+    return 2;
+}
+
+// Paths for a copied folder (tools/package_build.py). Per path: TOTK_EXEFS, TOTK_ROMFS, TOTK_PROFILE_DIR, else the
+// folder next to totk.exe (exefs, romfs, profile) if it exists, else the path baked in at build time. A relative
+// value is relative to totk.exe's folder.
+static char pp_exefs[MAX_PATH * 2], pp_romfs[MAX_PATH * 2], pp_profile[MAX_PATH * 2];
+
+static const char *portable_path(const char *dir, const char *var, const char *sub, const char *must, char *out, size_t cap,
+                                 const char *fallback) {
+    const char *e = cfg_get(var);
+    if (e && *e) {
+        int abs_path = e[0] == '\\' || e[0] == '/' || e[1] == ':';
+        if (abs_path) snprintf(out, cap, "%s", e);
+        else snprintf(out, cap, "%s\\%s", dir, e);
+        return out;
+    }
+    char probe[MAX_PATH * 3];
+    snprintf(out, cap, "%s\\%s", dir, sub);
+    snprintf(probe, sizeof probe, "%s\\%s", out, must);
+    return GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES ? out : fallback;
+}
+
+static void portable_paths(RtConfig *c) {
+    char exe[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
+    char *cut = n && n < sizeof exe ? strrchr(exe, '\\') : NULL;
+    if (!cut) return;
+    *cut = 0;
+    c->exefs = portable_path(exe, "TOTK_EXEFS", "exefs", "main.npdm", pp_exefs, sizeof pp_exefs, c->exefs);
+    c->romfs = portable_path(exe, "TOTK_ROMFS", "romfs", "romfs.bin", pp_romfs, sizeof pp_romfs, c->romfs);
+    c->profile = portable_path(exe, "TOTK_PROFILE_DIR", "profile", ".", pp_profile, sizeof pp_profile, c->profile);
+}
+
+int main(int argc, char **argv) {
+    mem_init();   // first: claim the guest address space before anything else can land there
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    cfg_init();   // before any setting is read
+    AddVectoredExceptionHandler(0, crash_handler);
+    parse_trace();
+    prof_start();
+    // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
+    // costs a full tick. TOTK_TIMER_1MS=0 keeps the default for comparison.
+    const char *tick = cfg_get("TOTK_TIMER_1MS");
+    if (!tick || strcmp(tick, "0")) timeBeginPeriod(1);
+    cfg = (RtConfig){.exefs = rt_default_exefs, .romfs = rt_default_romfs, .profile = rt_default_profile,
+                     .gpu = cfg_get("TOTK_GPU")};
+    portable_paths(&cfg);   // command-line paths below still win
+    if (cfg.gpu && strcmp(cfg.gpu, "null") && strcmp(cfg.gpu, "vulkan")) {
+        fprintf(stderr, "TOTK_GPU must be null or vulkan, not '%s'\n", cfg.gpu);
+        return 2;
+    }
+    const char *mode = NULL;
+    for (int i = 1; i < argc; i++) {
+        const char **path = !strcmp(argv[i], "--exefs") ? &cfg.exefs : !strcmp(argv[i], "--romfs") ? &cfg.romfs
+                          : !strcmp(argv[i], "--profile") ? &cfg.profile : NULL;
+        if (path) {
+            if (++i == argc) return usage(argv[0]);
+            *path = argv[i];
+        } else if (!strcmp(argv[i], "--frames")) {
+            char *end;
+            if (++i == argc) return usage(argv[0]);
+            long n = strtol(argv[i], &end, 10);
+            if (*end || n < 1 || n > INT_MAX) return usage(argv[0]);
+            cfg.frames = (int)n;
+        } else if (!strcmp(argv[i], "--shot")) {
+            if (++i == argc) return usage(argv[0]);
+            cfg.shot = argv[i];
+        } else if (!mode && !strncmp(argv[i], "--", 2)) {
+            mode = argv[i];
+        } else {
+            return usage(argv[0]);
+        }
+    }
+    if (cfg.shot && !cfg.frames) return usage(argv[0]);
+    if (cfg.frames && mode) return usage(argv[0]);
+    if (!mode) {
+        cfg.boot = cfg.frames > 0;   // --frames starts the game like --boot, with its checkpoints
+        rt_boot();
+        return 0;
+    }
+    if (!strcmp(mode, "--selftest")) return selftest();
+    if (!strcmp(mode, "--probe-loader")) return probe_loader();
+    if (!strcmp(mode, "--probe-cfg")) return probe_cfg();
+    if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
+    if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
+    if (!strcmp(mode, "--probe-services")) return probe_services();
+    if (!strcmp(mode, "--probe-fs")) return probe_fs();
+    if (!strcmp(mode, "--probe-gfx-abi")) return probe_gfx_abi();
+    if (!strcmp(mode, "--probe-nvn")) return probe_nvn();
+    if (!strcmp(mode, "--probe-nvn-tex")) return probe_nvn_tex();
+    if (!strcmp(mode, "--probe-window")) return probe_window();
+    if (!strcmp(mode, "--probe-shader")) return probe_shader();
+    if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
+    if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
+    if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
+    if (!strcmp(mode, "--probe-movie")) return probe_movie();
+    if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
+    if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
+    return usage(argv[0]);
+}

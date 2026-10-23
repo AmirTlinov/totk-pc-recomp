@@ -1,0 +1,332 @@
+// Vulkan-internal header of the M4 graphics layer. Owned by T2; shared with T5 and
+// T6 by agreement. Host code only; the guest never sees it.
+#pragma once
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR 1
+#endif
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_win32.h>
+#include <stdint.h>
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnullability-completeness"
+#include "vk_mem_alloc.h"
+#pragma clang diagnostic pop
+#include "nvn_obj.h"   // pool_t, tex_t, view_t, samp_par, NVNcopyRegion (memory and textures block, T5)
+#include "gfx.h"       // GfxShader, GfxShaderRes, GfxShaderAnswers (pipelines block, T6b)
+
+// Required (device choice fails without them): Vulkan 1.3; VK_KHR_swapchain, VK_KHR_push_descriptor,
+// VK_EXT_depth_clip_control, VK_EXT_external_memory_host; features timelineSemaphore, dynamicRendering,
+// synchronization2, shaderStorageImageWriteWithoutFormat, depthClipControl, shaderInt64, samplerAnisotropy,
+// independentBlend, geometryShader, textureCompressionBC.
+// Optional (flag set in VkCtx when enabled): the has_* members.
+typedef struct VkCtx {
+    VkInstance instance;
+    VkPhysicalDevice phys;
+    VkDevice device;
+    VkPhysicalDeviceProperties props;
+    VkPhysicalDeviceMemoryProperties mem_props;
+    uint32_t gfx_family;                    // graphics + compute + presentation on win32
+    uint32_t xfer_family;                   // a transfer-only family when the GPU has one, else gfx_family
+    VkQueue gfx_queue;                      // graphics + present
+    VkQueue xfer_queue;                     // equals gfx_queue when xfer_shared
+    int xfer_shared;                        // 1: no separate queue; serialise with gfx_queue
+    VmaAllocator vma;
+    VkSemaphore timeline;                   // one timeline semaphore; values are issued by T6
+    VkDebugUtilsMessengerEXT messenger;
+    volatile long validation_errors;        // errors seen by the messenger (TOTK_VK_VALIDATION=1)
+    int validation;                         // layer active
+    int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
+        has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
+        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock;
+    // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
+    // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
+    // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
+    // (attachable images get feedback usage, a by-region barrier inside the pass); else (or TOTK_FEEDBACK=restart)
+    // VK_FEEDBACK_RESTART (the pass ends and restarts behind the full barrier).
+    int feedback;                           // VK_FEEDBACK_*
+    uint32_t min_imported_host_alignment;   // VK_EXT_external_memory_host
+    int device_index;                       // index in vkEnumeratePhysicalDevices
+} VkCtx;
+enum { VK_FEEDBACK_OFF, VK_FEEDBACK_RESTART, VK_FEEDBACK_LAYOUT };
+
+// vk_caps.c: fallbacks for GPUs other than the RX 9070, decided at device creation.
+typedef struct {
+    int float64;                       // shaderFloat64 enabled; 0: shaders are translated with softfloat64
+    uint32_t sbuf_align;               // nonzero: storage buffers bind at their address rounded down to this
+    uint32_t sg_size;                  // requiredSubgroupSize on sg_pin_stages (32)
+    VkShaderStageFlags sg_pin_stages;  // 0: no pin, stages run at the device's subgroupSize
+    int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (TOTK_GPL=0: off)
+} VkCaps;
+extern VkCaps vk_caps;
+void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (TOTK_VK_NO_FLOAT64 clears shaderFloat64)
+// Before vkCreateDevice, with the driver's graphics pipeline library feature and properties: sets vk_caps.gpl,
+// 1 = enable the extensions (VK_KHR_pipeline_library, VK_EXT_graphics_pipeline_library) and the feature.
+int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
+                const VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT *p);
+void vk_caps_init(VkCtx *c);                          // after it: pretend limits, fallbacks, the boot report
+
+VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded
+int vk_init(void);                          // idempotent; 1 on success, 0 on failure (reason logged with rt_log)
+void vk_shutdown(void);
+int vk_selftest(void);                      // 0 on success
+
+// ---- window and present (gfx_window.c, T2). Host threads only.
+// vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled
+// to the swapchain extent, into the acquired swapchain image and presents it. src is in layout, which is
+// VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL (its writes made visible to the transfer stage by the caller's barrier) or
+// VK_IMAGE_LAYOUT_GENERAL (vk_texture.c images: the present makes earlier writes visible and orders later writes after
+// the blit). All its writes must be submitted to gfx_queue before the call (queue order does the rest). Starts the
+// window on first use. A minimised window or a lost swapchain skips the frame. Calls serialise on an internal lock.
+void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
+// Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
+// rebuild do. Recursive.
+void vk_queue_lock(void);
+void vk_queue_unlock(void);
+// Copy of the last presented swapchain image, for probes: on, the next presents read the image back into a host buffer
+// and wait for the GPU. *px stays valid until the next present; the format is the swapchain's. Returns 0 with no frame.
+void vk_present_capture(int on);
+int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt);
+
+HWND gfx_window_handle(void);                      // NULL before gfx_window_start
+void gfx_window_resize(int client_w, int client_h);   // programmatic resize; returns after the swapchain is rebuilt
+void gfx_vsync_bind_counter(volatile long *counter);  // host-side stand-in for a bound event: incremented per tick
+unsigned gfx_window_focus_messages(void);          // OE_MSG_FOCUS_STATE_CHANGED pushes made by the window thread
+void gfx_window_release_vk(void);                  // vk_shutdown calls it first: destroys swapchain, surface, present objects
+long vk_validation_errors_total(void);             // validation errors since the first vk_init, across vk_shutdown
+
+// ---- memory and textures (vk_memory.c, vk_texture.c: T5)
+// Guest or host threads; every call needs vk_init(). The first nine have the GfxBackend signatures of gfx.h; T6 builds
+// gfx_vulkan_backend from them.
+int  vk_pool_init(pool_t *p);              // CPU-visible: guest storage imported (VK_EXT_external_memory_host) as one
+                                           // VkBuffer; physical: device-local memory; virtual: a 64 KiB page table
+void vk_pool_fini(pool_t *p);              // drops images cut from the pool; waits for the GPU if it used the pool
+int  vk_pool_map_virtual(pool_t *v, int n, const void *requests);   // nvn_mapping_t[n], checked by the front end
+void vk_texture_register(int id, const tex_t *t, const view_t *v);  // texture descriptor slot (copied)
+void vk_sampler_register(int id, const samp_par *s);                // sampler descriptor slot (copied)
+void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage
+void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
+void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
+void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-watch may miss: textures there re-upload
+
+// GPU address -> backing (section 3.1). avail: bytes from offset that stay contiguous in buffer. alloc/alloc_offset:
+// the device-local memory behind physical and (through the page table) virtual pool addresses, NULL for imported pools.
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceSize offset, avail;
+    VmaAllocation alloc;
+    VkDeviceSize alloc_offset;
+} VkMemSpan;
+int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
+// range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
+// *now is the generation to pass next time.
+int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
+// The same answer from per-epoch write-watch snapshots of 2 MiB regions: no system call once the regions were queried in
+// this epoch (a guest submission). For checks that may see writes made during the epoch one epoch late.
+int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now);
+void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked);   // since the last call
+
+// Upload batch: one command buffer on gfx_queue that texture uploads and texel copies record into. begin/end bracket
+// the recording (recursive lock); vk_staging (between them) returns a mapped host buffer that lives until the batch
+// completes, or, with alloc non-NULL, until the caller's vmaDestroyBuffer after vk_upload_flush(1). The replay calls
+// vk_upload_flush(0) before each submission that may read uploaded images; queue order and the batch's closing
+// barrier make the uploads visible to it. Returns the batch sequence number; wait=1 blocks until it completed.
+// TOTK_FIX_ZERO (default 1): physical pools are zeroed once at creation and GPU-only images with memory of their own
+// are cleared when created; 0 leaves both as the driver hands them out (M4).
+int vk_fix_zero(void);
+VkCommandBuffer vk_upload_begin(void);
+void vk_upload_end(void);
+void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc);
+uint64_t vk_upload_flush(int wait);
+// Deferred destruction: freed once the upload batches recorded so far and the timeline value last noted have completed.
+void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
+void vk_defer_view(VkImageView view);
+void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+void vk_mem_note_submit(uint64_t timeline_value);  // T6: after each submit that signals ctx->timeline with this value
+void vk_mem_collect(void);                         // frees what has completed
+typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
+void vk_mem_stats(VkMemStats *s);
+void vk_mem_shutdown(void);                        // before vk_shutdown: waits idle, frees every T5 object
+
+// Textures. Images are keyed by storage GPU address plus descriptor and stay in VK_IMAGE_LAYOUT_GENERAL. A mirrored
+// texture (CPU-written pool storage, MNG tex_mirrored) is uploaded on first use and again when its storage pages were
+// written; once the GPU wrote it (vk_texture_gpu_written) the image is its content. A returned pointer stays valid
+// until the next call that may drop textures (release, pool fini); copy what outlives that.
+typedef struct {
+    VkImage image;
+    VkFormat format;               // after the fallbacks of tex_vk_format (ASTC -> RGBA8, RGB -> RGBA)
+    VkImageType type;
+    VkImageViewType view_type;     // view of the whole image
+    VkImageAspectFlags aspect;
+    VkImageUsageFlags usage;
+    uint32_t width, height, depth, levels, layers, samples;
+    uint64_t addr;                 // storage GPU address
+    uint8_t alpha_one;             // X format: sample alpha as 1 through the view swizzle
+    uint8_t mirrored, gpu_owned;
+    uint8_t bound;                 // aliases physical-pool memory (physical and virtual pools)
+    uint8_t block_views;           // BC image that renders through uncompressed views of its blocks (BLOCK_TEXEL_VIEW_
+                                   // COMPATIBLE + EXTENDED_USAGE: only those views may use COLOR_ATTACHMENT)
+    uint8_t swz[4];               // NVN texture swizzle selectors (nvnTextureBuilderSetSwizzle); a view swizzle replaces them
+    uint8_t fb_usage;              // created with ATTACHMENT_FEEDBACK_LOOP usage (VK_FEEDBACK_LAYOUT, attachable images)
+    uint8_t fb_learned;            // a draw sampled it while it was a written attachment of the open pass: its passes
+                                   // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin)
+} VkTexImage;
+const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
+// A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c:373-393).
+const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view);
+// The replay looks up many slots per draw: it takes the texture lock once around them (vk_texture_lock) and uses the
+// _locked lookups; vk_texture_slots_gen changes whenever a slot may resolve to another image or view.
+void vk_texture_lock(void);
+void vk_texture_unlock(void);
+const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
+VkSampler vk_sampler_by_id_locked(int id);
+uint32_t vk_texture_slots_gen(void);
+void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
+void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
+int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the descriptor in slot id
+int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
+                          uint64_t img);            // always from the image (GPU copy, waited for); 0 on failure
+int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
+void vk_texture_write_back(uint64_t addr, uint64_t size);   // writes those images back into their storage (waits)
+void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   // vk_pool_fini: drop the images there
+void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
+void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
+void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
+VkSampler vk_sampler_by_id(int id);                 // VK_NULL_HANDLE for an empty slot
+VkSampler vk_sampler_for(const samp_par *s);        // cached by content
+int vk_sampler_params(int id, samp_par *out);       // parameters of a sampler slot; 0 for an empty slot
+
+// 8-bit RGBA PNG with stored deflate blocks (boot.c); stops with rt_fatal when the file cannot be written.
+void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
+
+// ---- submission, synchronisation, completion (vk_sync.c, vk_backend.c: T6a)
+// Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done
+// once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
+void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
+uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
+int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
+uint64_t vk_sync_fence_done(void);         // highest done value
+void vk_sync_finish(void);                 // every submitted value done
+void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
+// The op-stream replay (vk_exec.c: T6c): records the command handles of one submission into cb, which the caller has
+// begun and ends. fence is the value this submission will signal. Returns the number of commands recorded into the
+// command buffer it holds at the end (0: that one stays empty and is not submitted). A weak vk_sync.c version accepts
+// empty streams only.
+int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence);
+// Inside vk_exec_record, outside a render pass: ends the command buffer recorded so far, submits it (after the upload
+// batch) without a signal, and returns a new begun one for the rest of the submission. The submission's timeline value
+// is signalled by its last part, whose signal covers every earlier part in submission order (port-lessons P1).
+VkCommandBuffer vk_sync_split(void);
+// Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
+// Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
+void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
+// gfx_vulkan_backend (vk_backend.c): presents go to a present thread and run after the submissions made before them.
+void rdoc_init(void);                     // runtime/rdoc_win.c: TOTK_RDOC debug capture; before vkCreateInstance
+int rdoc_active(void);
+void rdoc_after_present(uint64_t frame);
+void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
+void vk_program_release(const prog_t *p);  // GfxBackend.program_release: pipelines (T6b); weak no-op in vk_backend.c
+void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
+
+// ---- pipelines (vk_pipeline.c: T6b)
+// Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is
+// Ryujinx's support buffer (a uniform buffer every stage shares); the vertex stage keeps its own bindings, the fragment
+// stage's follow them (its SPIR-V is renumbered). Set 0 is a push-descriptor set unless the pipeline needs more than
+// maxPushDescriptors (32 here) descriptors; VkPipeInfo.bindings says what goes where. No push constants.
+// Everything a graphics pipeline depends on, as the op stream carries it. Fields covered by dynamic state are read by
+// vk_pipeline_set_dynamic only and left out of the pipeline key.
+typedef struct VkPipeState {
+    const GfxShader *vs, *fs;              // gfx_shader_get results; fs NULL: no fragment stage (depth only)
+    int32_t color_fmt[8];                  // NVNformat of colour target i (OP_SET_RT), 0 none
+    int32_t depth_fmt;                     // NVNformat of the depth/stencil target, 0 none
+    uint8_t samples;                       // sample count of the targets; 0 or 1 single-sampled
+    uint8_t prim;                          // NVN_DRAW_PRIMITIVE_* of the draw
+    uint8_t depth_minus_w;                 // nvn_depth_minus_w(): clip-space depth is -w..w
+    uint8_t depth_clamp, raster_discard;   // OP_DEPTH_CLAMP, OP_RASTER_DISCARD
+    uint8_t y_flip;                        // the replay's viewports have negative heights (upper-left origin): the
+                                           // front face is not mirrored
+    uint8_t prim_restart;                  // the draw's indices restart its strip or fan at the all-ones value
+                                           // (OP_PRIM_RESTART, set by op_draw_idx); dynamic state only
+    uint8_t feedback;                      // the fragment shader samples an attachment of the pass in the feedback
+                                           // layout: 1 colour, 2 depth/stencil (VK_PIPELINE_CREATE_*_FEEDBACK_LOOP_BIT_EXT)
+    blend_st blend[8];                    // OP_BIND_STATE kind 0, indexed by blend_st.target
+    color_st color;                        // kinds 1-5
+    chmask_st chmask;
+    ms_st ms;
+    poly_st poly;
+    ds_st ds;
+    uint32_t vattr[16];                    // OP_BIND_VATTR: va_st words; attribute i feeds vertex shader Location i
+    vs_st vstream[16];                     // OP_BIND_VSTREAM
+} VkPipeState;
+void vk_pipe_state_defaults(VkPipeState *s);   // NVN defaults of every state object (shaders and formats left 0)
+enum { VK_PIPE_SUPPORT = GFX_RES_KINDS };      // VkPipeBinding.kind of the support buffer
+#define VK_PIPE_ZERO_BINDING 16                // vertex binding of shader inputs without an attribute: bind a zeroed
+                                               // buffer of at least 16 bytes there (stride 0)
+typedef struct {
+    uint16_t binding;                      // in its set
+    uint8_t stage;                         // GFX_STAGE_* that declared it (support buffer: the first stage)
+    uint8_t kind;                          // GFX_RES_* or VK_PIPE_SUPPORT
+    VkDescriptorType type;
+    uint16_t count;
+    VkShaderStageFlags stages;
+    const GfxShaderRes *res;               // the stage's reflection entry; NULL for the support buffer
+    uint8_t set;                           // descriptor set: 0, or 1 for the fragment stage with independent layouts
+} VkPipeBinding;
+typedef struct {
+    VkPipeline pipeline;                   // VK_NULL_HANDLE when creation failed
+    VkPipelineLayout layout;
+    VkDescriptorSetLayout set_layout;      // set 0
+    int push;                              // 1: write set 0 with vkCmdPushDescriptorSetKHR; 0: allocate and bind a set
+    VkPipelineBindPoint bind_point;
+    uint32_t n_bindings;
+    const VkPipeBinding *bindings;
+    uint32_t vs_inputs;                    // Locations the vertex shader reads
+    // Independent layouts (vk_caps.gpl): set 0 holds the vertex stage's bindings, set 1 the fragment stage's; bindings
+    // are ordered by set. One of the two sets at most is a push set. n_sets 1: everything in set 0 (TOTK_GPL=0, compute).
+    VkDescriptorSetLayout set_layout1;
+    int push1;
+    uint32_t n_sets;
+} VkPipeInfo;
+// Both return the cached pipeline (created on first use; failures are cached and logged once). info: may be NULL.
+// Valid until vk_pipeline_shutdown; thread-safe.
+VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
+// The replay's variant: after vk_pipeline_async_enable a missing pipeline is built by background workers and this
+// returns VK_NULL_HANDLE with *pending 1 until it is ready (the draw is skipped); otherwise as vk_pipeline_graphics.
+// wait_ms > 0 waits up to that long for a pending pipeline first. Pipelines built in a run are recorded to
+// pipeline-keys.bin next to the pipeline cache and prebuilt at the next boot (TOTK_PIPE_PREBUILD=0: not).
+VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
+// rt_boot calls it unless --shot is given; TOTK_PIPE_SYNC=1 makes it a no-op. Probes never call it.
+void vk_pipeline_async_enable(void);
+int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics shaders are translated in the background too
+// Boot prewarm, before the guest runs (rt_boot): loads the shaders pipeline-keys.bin names, translating the ones not
+// cached under the current translator from their stored inputs, and builds every recorded pipeline, on all cores.
+// No-op without vk_pipeline_async_enable, with TOTK_PIPE_PREBUILD=0 or with TOTK_GPU=null.
+void vk_pipeline_prewarm(void);
+VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info);
+// Records every dynamic state that VkPipeState determines, after binding a graphics pipeline: cull mode, front face,
+// topology, depth and stencil tests and ops, depth bias enable, rasterizer discard, vertex input, and, where the GPU
+// has them dynamic, depth clamp, polygon mode, blend enables, equations, write masks and alpha to coverage. The replay
+// sets the rest: vkCmdSetViewportWithCount, vkCmdSetScissorWithCount, depth bias, blend constants, stencil compare and
+// write masks and references; vertex buffers with vkCmdBindVertexBuffers2 (strides NULL when
+// vk_pipeline_vertex_input_dynamic(), else from VkPipeState.vstream).
+void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s);
+int vk_pipeline_vertex_input_dynamic(void);    // 1: vertex input is VK_EXT_vertex_input_dynamic_state
+// Translator answers from the bound state: attr_type from the vertex attribute formats (vs), frag_out_type from the
+// colour target formats (fs). Other fields are left as they are; either pointer may be NULL.
+void vk_pipeline_answers(const VkPipeState *s, GfxShaderAnswers *vs, GfxShaderAnswers *fs);
+int vk_pipeline_tex_type(int nvn_target);      // NVN_TEXTURE_TARGET_* -> GFX_TEX_* (GfxShaderAnswers.tex_type)
+uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i);   // colour write mask of target i the pipeline uses
+VkPrimitiveTopology vk_pipeline_topology(int nvn_prim);   // quads -> triangle list, line loop -> strip: the replay
+                                                          // rewrites those draws; polygon -> fan
+VkFormat vk_vertex_format(int nvn_format, int *type);     // attribute format (supported fallback), GFX_TYPE_* in *type
+PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void);  // after the first vk_pipeline_* call
+// Probe only: 1 selects stage-independent layouts for pipelines looked up from now on, 0 the shared set 0; returns
+// the previous mode. 1 needs vk_caps.gpl (the independent-sets flag comes with the extension).
+int vk_pipeline_set_indep(int on);
+typedef struct { uint64_t graphics, compute, failures, hits, layouts, push_layouts, async_built, pending_skips; } VkPipeStats;
+void vk_pipeline_stats(VkPipeStats *s);
+void vk_pipeline_save(void);               // writes the VkPipelineCache to build/v121/pipeline-cache.bin
+void vk_pipeline_autosave(void);           // vk_pipeline_save at most every 20 s, when pipelines were built since
+void vk_pipeline_shutdown(void);           // waits for background builds, saves, destroys pipelines, layouts and the
+                                           // cache; before vk_shutdown
+int vk_pipeline_selftest(void);            // one graphics and one compute pipeline from census shaders; 0 on success

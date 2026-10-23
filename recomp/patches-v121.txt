@@ -1,0 +1,47 @@
+# Code patches for TotK 1.2.1 main (recomp/patches.py). Ported from MacNativeGames games/totk/runtime/game_patches.c
+# (MIT, Copyright (c) 2026 MacNativeGames contributors) at upstream ebe621d; 1.2.1 sites from its game_version.h
+# (2db612b), each original word checked against the 1.2.1 main. The patch page holds two floats the runtime writes at
+# every present (frame_rate.c): +0 the 30 Hz ratio (seconds * 30), +4 the frame step in seconds.
+
+set fps60    TOTK_FPS60          1
+set realtime TOTK_REALTIME       1
+set cloth    TOTK_CLOTH_REALTIME 1
+set bounce   TOTK_HIGHFPS_FIX    1
+
+# 60 fps: the adaptive present-interval controller (main+0x8f26c8, 1.0.0 0x8f6bec) gets the minimum interval 1.
+site fps60 main 8f273c 6b08015f 7100055f   # clamp: cmp w10, #1 (was cmp w10, w8 = minimum)
+site fps60 main 8f2740 1a89b10a 1a9fa52a   # clamp: csinc w10, w9, wzr, ge (desired = max(desired, 1))
+site fps60 main 8f2764 b9401a8a d503201f   # lower trigger: nop the stored-candidate load
+site fps60 main 8f27f4 6b08015f 7100055f   # raise path: cmp w10, #1
+site fps60 main 8f2804 1a88c1ac 1a9fc5ac   # raise path: csinc w12, w13, wzr, gt (next lower candidate floors at 1)
+site fps60 main 8f2858 b9400288 52800028   # lower path: mov w8, #1 (minimum interval 1)
+site fps60 main 8f2874 2a0a03f5 1a9fa555   # lower path: csinc w21, w10, wzr, ge (result never below 1)
+
+# Real-time step: the VFR step (main+0x7ede6c, 1.0.0 0x7a83e4) and the global ratio after the controller call
+# (main+0x8f2394, 1.0.0 0x8f68b8) read ratio and seconds from the patch page instead of interval * 0.5 and interval / 60.
+site realtime main 7ede7c 1e220020 @page:x9   # scvtf s0, w1 -> adrp x9, page
+site realtime main 7ede80 52a84e08 bd400120   # mov w8, #60.0 -> ldr s0, [x9] (ratio)
+site realtime main 7ede84 1e270101 bd400521   # fmov s1, w8 -> ldr s1, [x9, #4] (seconds)
+site realtime main 7ede88 1e2c1002 d503201f   # fmov s2, #0.5 -> nop
+site realtime main 7ede94 1e211801 d503201f   # fdiv s1, s0, s1 -> nop
+site realtime main 7ede98 1e220800 d503201f   # fmul s0, s0, s2 -> nop
+site realtime main 8f2394 bd425e60 @page:x9   # ldr s0, [x19, #0x25c] -> adrp x9, page
+site realtime main 8f2398 1e2c1001 bd400120   # fmov s1, #0.5 -> ldr s0, [x9] (global ratio)
+site realtime main 8f23a8 5e21d800 d503201f   # scvtf s0, s0 -> nop
+site realtime main 8f23ac 1e210800 d503201f   # fmul s0, s0, s1 -> nop
+
+# Hair and cloth (upstream 290ec9f, 8f8022f): the actor animation update builds a second clock {seconds = factor / 30,
+# ratio = factor} per rendered frame. Three inlined places: at the fmul, seconds = measured seconds * factor; at the
+# store of the factor into the ratio slot, measured ratio * factor. The call of the shared update (main+0x89822c)
+# scales s2 (seconds) and s3 (ratio) by the measured ratio. Upstream's veneer bodies, inlined at the site.
+site cloth main 82192c 1e200900 f81f0fe9 @page:x9 bd400520 1e200900 f84107e9   # fmul s0, s8, s0
+site cloth main 821928 bd0127e8 d10083ff f90003e9 3d8007ff @page:x9 bd40013f 1e3f091f bd0147ff 3dc007ff f94003e9 910083ff   # str s8, [sp, #0x124]
+site cloth main 822a64 1e200900 f81f0fe9 @page:x9 bd400520 1e200900 f84107e9   # fmul s0, s8, s0
+site cloth main 822a40 bd0127e8 d10083ff f90003e9 3d8007ff @page:x9 bd40013f 1e3f091f bd0147ff 3dc007ff f94003e9 910083ff   # str s8, [sp, #0x124]
+site cloth main 83182c 1e210801 f81f0fe9 @page:x9 bd400521 1e210801 f84107e9   # fmul s1, s0, s1
+site cloth main 831830 bd0137e0 d10083ff f90003e9 3d8007ff @page:x9 bd40013f 1e3f081f bd0157ff 3dc007ff f94003e9 910083ff   # str s0, [sp, #0x134]
+site cloth main 8222f0 9401d7cf @page:x8 bd400104 1e240842 1e240863 9401d7cf   # bl 0x89822c
+
+# Trampolines (upstream 27c3b43): the slow-motion check compares time object +0x28 (30 / (ratio * time scale)) with
+# 100; compare +0x28 * +0x38 (30 / time scale) instead, the same value at 30 Hz and independent of the frame rate.
+site bounce main bda798 bd402900 bd402900 bd403901 1e210800   # ldr s0, [x8, #0x28]; ldr s1, [x8, #0x38]; fmul s0, s0, s1

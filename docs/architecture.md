@@ -1,0 +1,103 @@
+# Architecture
+
+How the Switch build of *Tears of the Kingdom* becomes a native Windows x86-64 program. Each choice below cites the research note it rests on: [lasrecomp.md](research/lasrecomp.md), [macnativegames.md](research/macnativegames.md), [prior-art.md](research/prior-art.md).
+
+## Starting points
+
+Two MIT projects cover different halves of the problem:
+
+| | LAS Recomp | MacNativeGames |
+|---|---|---|
+| Game | *Link's Awakening* | *Tears of the Kingdom* 1.0.0–1.4.3 |
+| CPU | ARM64 lifted to C, runs on x86-64 | Original ARM64 code runs directly on Apple silicon |
+| OS boundary | IPC services and SVCs | ~163 `nn::*` SDK functions replaced by symbol, 38 SVCs |
+| Graphics | Own NVN layer on Vulkan, own Maxwell translator | NVN front end + Metal 4 back end, Ryujinx translator |
+| Useful to us | Lifter, NEON-to-C lowering, Windows memory layer, tests | Everything TotK-specific: host behaviour, NVN front end, version tables, patches, shader list |
+
+MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code natively. LAS Recomp's host only covers what *Link's Awakening* calls. The port takes the CPU half from LAS Recomp and the game half from MacNativeGames, and writes the parts neither has: a lifter that scales to TotK, and a Vulkan back end for the NVN front end.
+
+## Pipeline
+
+### 1. Input
+
+- Base 1.0.0 (`0100F2C0115B6000`) and one cumulative update (`0100F2C0115B6800`), NSP/XCI/NSZ, plus the user's `prod.keys`.
+- ExeFS and RomFS extraction: MacNativeGames' Python extractor (Python 3.14 for `compression.zstd`, `.venv-py314`).
+- Update merging: hactool at `1d64a83`, with MacNativeGames' BKTR patches (`toolchain/hactool`).
+- Verification: MacNativeGames' `expected-v*.json` hashes of ExeFS, RomFS and fonts.
+- Primary version: 1.2.1, the update most players have. MacNativeGames supports it with the same build path as the others. 1.0.0, 1.1.2 and 1.2.1 share `sdk`, `subsdk0` and `rtld` byte for byte, so the lifted SDK modules and the host's SDK boundary serve all three; only `main` differs. 1.4.3 replaced all three modules (new SDK 20.5.22, RELR relocations, audio renderer REV15) and is a separate, later target.
+- Windows driver: `tools/extract.py` runs the vendored extractors (`tools/vendor/macnativegames/`) and identifies the update by the SHA-256 of its `main`. hactool has no Darwin `funopen` here, so the base Program NCA is copied out of the NSP before the BKTR merge (about 17 GB of temporary space).
+
+### 2. CPU: lift ARM64 to C
+
+- Modules: `main`, `sdk`, `subsdk0`. `rtld` is dropped and linking is done by the host, as MacNativeGames does.
+- Base: LAS Recomp's hand-written decoder (`lifter.py`) and NEON/FP lowering (`simd_c.py`, `simd.h`), MIT. Output: one C function per guest function, direct calls for `BL`, an address-keyed table for indirect branches.
+- Rewritten for TotK scale (see lasrecomp.md, "Scaling risks"):
+  - generator runs in parallel processes, with bounded memory per worker;
+  - jump tables resolved by our own symbolic pass instead of Unicorn, which keeps GPL code out of the shipped generator;
+  - `LDXP`/`STXP` (128-bit exclusive pairs) supported;
+  - no 64 MB limit on `main`; `subsdk*` loaded;
+  - guest registers kept in C locals where liveness allows, instead of memory.
+- Coverage oracle: MacNativeGames' NSO rewriter lists every site where game code touches the OS (SVCs, TLS reads, counter reads, `x18`, exclusive windows, jump tables): 68,968 sites in 1.4.3 `main`; 1.2.1 counts are in [totk-v121-inventory.md](research/totk-v121-inventory.md). The lifter must handle every one.
+- Memory: guest address equals host address, all below 2^39 (IPC encodes 39-bit addresses). The heap, stacks and the alias region are reserved with `MEM_WRITE_WATCH`, so the graphics back end can ask which pages the CPU wrote since the last upload (`runtime/memory.c`).
+- Indirect branches go through `rt_dispatch` (`runtime/dispatch.c`), which looks the target up in the address table and tail-calls it.
+- Testing: LAS Recomp's differential harness, every lifted instruction class checked against Unicorn (test-only, never linked into the game).
+
+### 3. Host
+
+- Portable C from MacNativeGames: threads and synchronisation, IPC, memory services, fs/RomFS, time, account, applet, audio renderer and effects. The Apple pieces (mach VM, CommonCrypto, AudioToolbox, GameController) are replaced with Win32 and SDL3.
+- SDK boundary at the `nn::*` function level, matching MacNativeGames. Only `audren:u` and `sm:` are real IPC services.
+- Window, input, controllers and audio output: SDL3. Voice: libopus (BSD). Movies: the SDK's `movie::Decoder` is replaced by a host VP9 decoder over libvpx (BSD, static; `runtime/ov_movie.c`), because FFmpeg from MSYS2 is a GPL build.
+- OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`), so a Linux or macOS host adds one file instead of touching the rest. `tools/check_platform.py` keeps Win32 calls out of the other files.
+
+#### Threads and cores
+
+Every guest thread is a host thread. TotK assumes Horizon's scheduler: three application cores, a thread runs only on a core in its affinity mask, and a higher-priority thread takes a core from a lower-priority one. The game keeps per-core data without locks and relies on that, so the host models it (`runtime/kernel.c`):
+
+- Three virtual cores. A guest thread runs guest code only while it holds a core; the others wait in a priority-ordered list.
+- Preemption. When a waiting thread has a better priority than a holder on a core it may use, exactly one holder is flagged. The holder checks the flag at its next SVC and at every indirect call (`rt_dispatch`: two loads when nobody waits), checks again under the kernel lock that a better thread still waits, and only then hands its core over. The indirect-call check comes from SavageWindRecomp's BotW port; checking only at SVCs left a better thread waiting up to 26 ms.
+- Host work gives the core back. Queue submits, presents, GPU waits and shader translation run without a core (`NVN_BLOCKING`, `kern_core_away`), so a thread blocked in the driver does not hold up guest threads.
+- `TOTK_FREE_CORES=1` turns the gate off, for experiments.
+
+Other ports and what they changed about scheduling: [port-lessons.md](research/port-lessons.md), rows S1-S6.
+
+### 4. Graphics
+
+- NVN front end from MacNativeGames (`nvn_api_*.c`, `nvn_obj.h`, texture layout and deswizzle). The game records command buffers through it; nothing reaches the GPU until the game submits.
+- Vulkan 1.3 back end in place of MacNativeGames' Metal one. At `QueueSubmitCommands` the recorded NVN commands are replayed into Vulkan command buffers (`vk_exec*.c`).
+- Memory pools. Apple's unified memory let MacNativeGames use the game's pools zero-copy. On a discrete GPU the back end uploads the pages the CPU wrote (write watch, above) before a replay, and writes GPU-rendered textures back when the CPU reads them (`vk_texture.c`).
+- Driver data. The NVN driver keeps a per-stage constant bank (c0) that shaders read for things like point size, dispatch size and base instance. The back end fills it the way the driver does.
+- Shaders: the Ryujinx translator 1.3.2 with MacNativeGames' patches and ours (`tools/xlate/patches/`), built with .NET 10 NativeAOT as `totk_xlate.exe` and run as a separate process. Its SPIR-V goes to Vulkan directly. Translated shaders are cached on disk.
+- Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it. Shader stages are compiled ahead into libraries; a draw that meets a new state links them at once (fast link), and an optimised pipeline replaces the linked one when a background thread finishes it. Pipeline keys seen in play are saved and built at boot. Without the extension, a missing pipeline is built on a worker and the draw waits or is skipped.
+- Occlusion queries never block the CPU; a result that is not ready counts as visible.
+- ASTC textures are decoded on the CPU when the GPU has no ASTC support (`tex_astc*.c`).
+- Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`TOTK_DUMP`, `vk_dump.c`) and a flight recorder (`TOTK_FLIGHT`). RenderDoc cannot capture, because the driver hides `VK_EXT_external_memory_host` from it.
+
+Maxwell behaviour the back end has to match, and the TotK bugs other ports fixed: [maxwell.md](research/maxwell.md).
+
+Why Vulkan rather than D3D12 or wgpu:
+
+- The translator emits SPIR-V, which Vulkan consumes as is. D3D12 would add a SPIR-V to DXIL step; wgpu would add SPIR-V to WGSL through Naga and drop features the game uses (bindless textures, some atomics).
+- LAS Recomp's Vulkan back end is a working reference on Windows.
+- The same back end runs on Linux.
+
+### 5. Toolchain
+
+- Generated C: MSYS2 UCRT64 Clang + LLD. The generated code uses GNU extensions (`__int128`, `musttail`, vector types) that `cl.exe` cannot compile.
+- Host code: the same Clang, C11.
+- Builds: `tools/build_game.py` writes a Ninja file and runs MSYS2 Ninja. Every object is hashed before linking, because a faulty RAM module once flipped bits in stored objects.
+- Analysis: Ghidra with the Switch loader, Capstone, `llvm-objdump`.
+- Later, for players: build the game code on their machine with a bundled `zig cc`, as LAS Recomp does, so no recompiled code is ever distributed.
+
+## Milestones
+
+| | Goal | Done when | Status |
+|---|---|---|---|
+| M0 | Toolchain and repository | Every tool in the toolchain docs passes its verify command | Done |
+| M1 | Input | The user's dump extracts and matches `expected-v1.0.0.json` and `expected-v1.2.1.json`; sizes and function counts of `main`, `sdk`, `subsdk0` are recorded | Done |
+| M2 | Lifter at scale | All three modules lift to C, compile and link into one exe; differential tests pass | Done |
+| M3 | Host boots | The exe reaches the first NVN call with threads, memory and RomFS working | Done |
+| M4 | Playable | Vulkan back end draws the title screen and the world; input and audio work | Done |
+| M5 | Renderer foundation | Fewer stutters and visual glitches, a render thread with room for 60 fps | In progress |
+| M6 | Release shape | Build-on-player-machine packaging, Linux, 60 fps | |
+
+Open problems, in the order they are worked on: [backlog.md](backlog.md).

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "grep -qiE \"taskkill[^|;&]*/IM[^|;&]*totk|Stop-Process[^|;&]*-Name[^|;&]*totk|pkill[^|;&]*totk|killall[^|;&]*totk\" && echo \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"Killing totk.exe by name stops other agents and benchmark runs. Stop only a totk.exe you started, by PID (taskkill //PID <pid> //F).\\\"}}\" || true"
+          }
+        ]
+      }
+    ]
+  }
+}
