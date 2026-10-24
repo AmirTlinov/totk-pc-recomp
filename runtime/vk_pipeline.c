@@ -533,9 +533,12 @@ typedef struct {
     VkVertexInputBindingDescription2EXT b[17];
 } VtxInput;
 
+// An attribute the game left without a format is a fixed one on Maxwell, a single 32-bit component of 0 (deko3d
+// gpu_3d_vbo.cpp binds unused attributes as IsFixed 1x32 float): it reads (0, 0, 0, 1), as Vulkan expands a
+// one-component format. TOTK's foliage shaders scale wind sway by 1 - colour.w; shapes without a vertex colour
+// (Brightbloom stem and leaves) must not sway, or they bend away from the parts that have one (the bulb).
 static VkFormat zero_format(int type) {
-    return type == GFX_TYPE_UINT ? VK_FORMAT_R32G32B32A32_UINT : type == GFX_TYPE_SINT ? VK_FORMAT_R32G32B32A32_SINT
-                                                                                       : VK_FORMAT_R32G32B32A32_SFLOAT;
+    return type == GFX_TYPE_UINT ? VK_FORMAT_R32_UINT : type == GFX_TYPE_SINT ? VK_FORMAT_R32_SINT : VK_FORMAT_R32_SFLOAT;
 }
 
 // Attributes for the Locations the vertex shader reads; one without a usable NVN attribute reads VK_PIPE_ZERO_BINDING.
