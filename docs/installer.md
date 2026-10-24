@@ -104,6 +104,13 @@ totk.ini.example, VERSION  the default ini; the release string (git describe of 
 - The keys file path is passed to the tools; key values never appear in the UI, logs or files.
 - The window is a front end over the CLI (`python -m installer --base ... --update ... --keys ... --lang ... --dest
   ...`), which prints one JSON progress event per line. Tests and CI use the CLI.
+- Paths may hold any Unicode characters (a Cyrillic user name puts the temp and install folders under it). Every exe
+  the setup runs or builds reads its arguments and paths as UTF-8 through an `activeCodePage` manifest: hactool
+  (`toolchain/hactool/unicode-patches.diff`), totk.exe (`runtime/totk.rc`), ninja (upstream). The Python steps write
+  their files and logs as UTF-8.
+- A game file whose data fails its hash checks or ends early stops the setup with `check.input_damaged`, which names
+  the file and asks to copy it again (`extract.DamagedFile`). A failed merge checks the base Program NCA alone to tell
+  which file is damaged.
 - Unsigned exe: SmartScreen warns on first start.
 
 ## Later
