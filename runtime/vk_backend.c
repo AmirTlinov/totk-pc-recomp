@@ -90,6 +90,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
     perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
     vk_exec_frame_log(t, frame);
+    vk_mem_census(frame);
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);

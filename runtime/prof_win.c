@@ -187,6 +187,16 @@ void perf_end(int kind, uint64_t t0) {
     frame_ns[kind] += d;
 }
 
+static volatile LONG64 other_wait_ns;     // perf_gpu_wait on threads other than the render thread, over the window
+static volatile LONG64 render_wait_ns;    // the same on the render thread
+void (*perf_gpu_stats)(PerfGpu *out);
+
+void perf_gpu_wait(uint64_t t0) {
+    if (!t0 || !perf_on) return;
+    LONG64 d = (LONG64)(kern_now_ns() - t0);
+    InterlockedAdd64(GetCurrentThreadId() == render_tid ? &render_wait_ns : &other_wait_ns, d);
+}
+
 static volatile LONG64 replay_ns;         // perf_replay: summed over the window, any thread
 static volatile LONG64 frame_replay_ns;   // the same since the previous present (frame-time summary)
 
@@ -273,6 +283,35 @@ static void ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     }
 }
 
+// The second line of the 60-frame window: GPU busy time (timestamps), the time threads waited for GPU fences, VRAM and
+// process memory, and which side holds the frame back. pace: the frame waited for pacing (vsync, the frame limiter) at
+// least 15% of the window; gpu: the GPU was busy for 80% of the frame interval or more (without timestamps: threads
+// waited for fences for half the interval or more); cpu otherwise.
+static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share, uint64_t n) {
+    PerfGpu g;
+    memset(&g, 0, sizeof g);
+    if (perf_gpu_stats) perf_gpu_stats(&g);
+    double rw = InterlockedExchange64(&render_wait_ns, 0) / 1e6 / n, ow = InterlockedExchange64(&other_wait_ns, 0) / 1e6 / n;
+    double gpu_ms = g.have_gpu ? g.gpu_ns / 1e6 / n : 0;
+    char gs[96], vs[96];
+    if (g.have_gpu) snprintf(gs, sizeof gs, "gpu avg %.2f ms (%llu parts timed, %llu not)", gpu_ms,
+                             (unsigned long long)g.gpu_parts, (unsigned long long)g.gpu_missed);
+    else snprintf(gs, sizeof gs, "gpu avg n/a");
+    if (g.have_vram) snprintf(vs, sizeof vs, "vram %.0f of %.0f MiB%s", g.vram_used / 1048576.0, g.vram_budget / 1048576.0,
+                              g.vram_exact ? "" : " (own allocations of the heap size)");
+    else snprintf(vs, sizeof vs, "vram n/a");
+    PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};
+    double ws = 0, priv = 0;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm))
+        ws = pm.WorkingSetSize / 1048576.0, priv = pm.PrivateUsage / 1048576.0;
+    const char *bound = pace_share >= 0.15 ? "pace"
+                      : g.have_gpu ? (gpu_ms >= 0.8 * interval_ms ? "gpu" : "cpu")
+                      : (rw + ow >= 0.5 * interval_ms ? "gpu" : "cpu");
+    rt_log("perf: frame %llu: %s; fence wait per frame: render thread %.2f ms, other threads %.2f ms; %s; ram working set "
+           "%.0f MiB, private %.0f MiB; bound: %s",
+           (unsigned long long)frame, gs, rw, ow, vs, ws, priv, bound);
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start;
     static LONG64 win_prev[PERF_CNT_N];
@@ -329,6 +368,7 @@ void perf_present(uint64_t frame) {
                (unsigned long long)shader_keys, (unsigned long long)shader_xlated,
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
                InterlockedExchange64(&replay_ns, 0) / 1e6 / n);
+    if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
     sum = max = n = 0;
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;

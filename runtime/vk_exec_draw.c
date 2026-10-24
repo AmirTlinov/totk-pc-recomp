@@ -571,7 +571,7 @@ static VkDescriptorBufferInfo zero_info(uint64_t max) {
 
 // A buffer descriptor for [addr, addr+size) of guest memory: its backing when aligned, a copy in transient memory when
 // the backing is host memory with an unaligned offset. 0 when neither works.
-static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, VkDescriptorBufferInfo *out) {
+static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, int use, VkDescriptorBufferInfo *out) {
     VkMemSpan sp;
     if (!addr || !vk_mem_resolve(addr, 1, &sp)) return 0;
     uint64_t n = size && size < sp.avail ? size : sp.avail;
@@ -579,12 +579,15 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     if (!n) return 0;
     if (sp.offset % align == 0) {
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
+        vk_mem_count(sp.cls, use, n);
         return 1;
     }
     if (sp.alloc) return 0;
     VkBuffer b;
     VkDeviceSize o;
     memcpy(scratch(ex, n, &b, &o), (const void *)(uintptr_t)addr, n);
+    vk_mem_count(sp.cls, VK_MUSE_CPU_READ, n);
+    vk_mem_count(VK_MCLS_SCRATCH, use, n);
     *out = (VkDescriptorBufferInfo){b, o, n};
     return 1;
 }
@@ -661,11 +664,11 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         uint32_t len, c1;
         if (find_stage(ex->prog, st, &ctl, &code, &len)) {
             memcpy(&c1, ctl + 0x700, 4);
-            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, &bi)) return bi;
+            if (c1 < len && bind_range(ex, (uint64_t)(uintptr_t)code + c1, len - c1, align, max, VK_MUSE_UBO, &bi)) return bi;
         }
     } else if (slot >= 3 && slot - 3 < 18) {
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
-        if (bind_range(ex, b->addr, b->size, align, max, &bi)) return bi;
+        if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, &bi)) return bi;
     }
     return zero_info(max);
 }
@@ -695,7 +698,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         const p_bind_buf *b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
-        if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, &bi)) {
+        if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO, &bi)) {
             if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range);
             return bi;
         }
@@ -1082,6 +1085,7 @@ static void record_fixed(VkExec *ex) {
 static void bind_vertex_buffers(VkExec *ex) {
     VkBuffer vb[17];
     VkDeviceSize vo[17], vsz[17], vstr[17];
+    int vcls[17] = {0};
     int dyn = vk_pipeline_vertex_input_dynamic();
     for (int b = 0; b < 17; b++) {
         vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0;
@@ -1090,13 +1094,15 @@ static void bind_vertex_buffers(VkExec *ex) {
         VkMemSpan sp;
         if (!r->address || !vk_mem_resolve(r->address, 1, &sp)) continue;
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
-        vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n;
+        vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls;
     }
     if (B.vb_valid && !memcmp(B.vb, vb, sizeof vb) && !memcmp(B.vo, vo, sizeof vo) && !memcmp(B.vsz, vsz, sizeof vsz) &&
         (dyn || !memcmp(B.vstr, vstr, sizeof vstr)))
         return;
     vkCmdBindVertexBuffers2(ex->cb, 0, 17, vb, vo, vsz, dyn ? NULL : vstr);
     ex->recorded++;
+    for (int b = 0; b < 17; b++)
+        if (vcls[b]) vk_mem_count(vcls[b], VK_MUSE_VB, vsz[b]);
     memcpy(B.vb, vb, sizeof vb), memcpy(B.vo, vo, sizeof vo), memcpy(B.vsz, vsz, sizeof vsz), memcpy(B.vstr, vstr, sizeof vstr);
     B.vb_valid = 1;
 }
@@ -1247,6 +1253,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) {   // no uint8 index type here: widen (host-readable backing only)
         if (sp.alloc) return warn_once(W_INDEX, "byte indices in device-local memory: draw skipped");
+        vk_mem_count(sp.cls, VK_MUSE_CPU_READ, bytes);
+        vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_IB, 2 * bytes);
         uint16_t *ix = malloc(sizeof *ix * (size_t)d->count);
         if (!ix) rt_fatal("vk: out of memory");
         for (int i = 0; i < d->count; i++) {
@@ -1260,6 +1268,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     } else {
         vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         ex->recorded++;
+        vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
     }
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
@@ -1283,6 +1292,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
     ex->recorded += 2;
+    vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
 }
 
 // ---- dispatch and uniform buffer updates
@@ -1336,6 +1346,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     }
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     ex->recorded++;
+    vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
 }
 
@@ -1351,6 +1362,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     VkBufferCopy cp = {o, sp.offset, u->size};
     vkCmdCopyBuffer(ex->cb, b, sp.buffer, 1, &cp);
     ex->recorded++;
+    vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
     note_written(ex, u->dst, u->size);
 }
 
