@@ -107,7 +107,7 @@ totk.ini.example, VERSION  the default ini; the release string (git describe of 
 - Paths may hold any Unicode characters (a Cyrillic user name puts the temp and install folders under it). Every exe
   the setup runs or builds reads its arguments and paths as UTF-8 through an `activeCodePage` manifest: hactool
   (`toolchain/hactool/unicode-patches.diff`), totk.exe (`runtime/totk.rc`), ninja (upstream). The Python steps write
-  their files and logs as UTF-8.
+  their files and logs as UTF-8, and `build_game.py` quotes paths with spaces on its Ninja command lines.
 - A game file whose data fails its hash checks or ends early stops the setup with `check.input_damaged`, which names
   the file and asks to copy it again (`extract.DamagedFile`). A failed merge checks the base Program NCA alone to tell
   which file is damaged.

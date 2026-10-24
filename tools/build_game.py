@@ -76,7 +76,7 @@ SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll']
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
-LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Wl,--Map=$builddir/totk.map']   # the map feeds tools/prof_report.py
+LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '"-Wl,--Map=$builddir/totk.map"']   # the map feeds tools/prof_report.py
 LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end of M4; libvpx static (movies)
 VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
 # --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
@@ -116,6 +116,17 @@ def ninja_path(p):
 
 def flag_path(p):
     return below_root(p).as_posix()
+
+
+def cmd_arg(s):
+    """s for a Ninja command line: Ninja-escaped, and quoted when it holds a space (a user or folder name), as clang and
+    lld split their Windows command line at unquoted spaces."""
+    s = s.replace('$', '$$')
+    return f'"{s}"' if ' ' in s else s
+
+
+def cmd_path(p):
+    return cmd_arg(flag_path(p))
 
 
 def read_layout(gen):
@@ -208,15 +219,15 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     """build.ninja text, and the object lists per module. With prebuilt the generated objects already exist in
     out/obj and are link inputs without a compile edge. runtime_lib: a prebuilt library replaces the runtime objects
     except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
-    inc = f'-I {flag_path(RUNTIME)} -I {flag_path(gen)}'
-    vma = f'{flag_path(DEPS / "include")} -I {flag_path(DEPS / "include" / "vma")}' if DEPS else flag_path(VMA_INCLUDE)
-    rt_inc = f'{inc} -I {flag_path(out)} -I {vma}'   # romfs_config.h, vk_mem_alloc.h (and the deps headers)
-    libs = [f'-L{flag_path(DEPS / "lib")}'] + LLVM_LINK_LIBS if DEPS else LINK_LIBS
+    inc = f'-I {cmd_path(RUNTIME)} -I {cmd_path(gen)}'
+    vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(VMA_INCLUDE)
+    rt_inc = f'{inc} -I {cmd_path(out)} -I {vma}'   # romfs_config.h, vk_mem_alloc.h (and the deps headers)
+    libs = [f'-L {cmd_path(DEPS / "lib")}'] + LLVM_LINK_LIBS if DEPS else LINK_LIBS
     lines = [
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',
         f'builddir = {ninja_path(out)}',
-        f'cc = {CLANG.as_posix()}',
+        f'cc = {cmd_arg(CLANG.as_posix())}',
         f'genflags = {" ".join(GEN_FLAGS)} {inc}',
         f'rtflags = {" ".join(RT_FLAGS)} {rt_inc}',
         f'ldflags = {" ".join(LINK_FLAGS)}',
@@ -238,7 +249,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         '  description = CC $in',
         '',
         'rule rc',
-        f'  command = {WINDRES.as_posix()} -I {flag_path(RUNTIME)} -O coff $in -o $out',
+        f'  command = {cmd_arg(WINDRES.as_posix())} -I {cmd_path(RUNTIME)} -O coff $in -o $out',
         '  description = RC $in',
         '',
         'rule link',
@@ -274,7 +285,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     exe = out / 'totk.exe'
     if make_lib:
         exe = out / LIB_NAME
-        lines += ['', 'rule ar', f'  command = {AR.as_posix()} rcs $out $in', '  description = AR $out', '', f'build {ninja_path(exe)}: ar ' + ' '.join(ninja_path(o) for o in every),
+        lines += ['', 'rule ar', f'  command = {cmd_arg(AR.as_posix())} rcs $out $in', '  description = AR $out', '', f'build {ninja_path(exe)}: ar ' + ' '.join(ninja_path(o) for o in every),
                   'build objects: phony ' + ' '.join(ninja_path(o) for o in every), f'default {ninja_path(exe)}', '']
         return '\n'.join(lines), objs, exe
     rule = 'link'
@@ -283,7 +294,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         # linker looks into the library, and the real probes would stay out of totk.exe.
         rule = 'link_lib'
         lines += ['', 'rule link_lib',
-                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {flag_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
+                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
                   '  rspfile = $out.rsp', '  rspfile_content = $in_newline', '  description = LINK $out']
     lines += ['', f'build {ninja_path(exe)}: {rule} ' + ' '.join(ninja_path(o) for o in every) +
               (f' | {ninja_path(runtime_lib)}' if runtime_lib else ''),
