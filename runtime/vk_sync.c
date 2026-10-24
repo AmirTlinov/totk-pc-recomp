@@ -46,6 +46,106 @@ static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
 
+// ---- GPU time (TOTK_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
+// ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
+// part's interval to the busy time, counting overlap with the previous part once. Off (one log line) when the queue
+// family has no timestamp bits or the period is 0. Upload batches (vk_memory.c) are not timed.
+#define TS_PAIRS 1024
+static VkQueryPool ts_pool;
+static int ts_state;                       // 0 not set up, 1 on, -1 off
+static double ts_period;                   // ns per tick
+static uint64_t ts_mask;                   // valid bits of a timestamp
+static uint32_t ts_next;                   // submitting thread (sub_lock): next pair
+static volatile uint8_t ts_busy[TS_PAIRS]; // written until the completion thread read the pair
+static int ts_cur = -1;                    // the pair of the part being recorded, -1 untimed
+static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
+static volatile LONG64 ts_busy_ns, ts_parts, ts_missed;
+
+static void ts_setup(VkCtx *c) {
+    ts_state = -1;
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, NULL);
+    VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
+    if (!qp) return;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, qp);
+    uint32_t bits = c->gfx_family < nq ? qp[c->gfx_family].timestampValidBits : 0;
+    free(qp);
+    float period = c->props.limits.timestampPeriod;
+    if (!bits || period <= 0) {
+        rt_log("vk: no GPU timestamps on this queue (valid bits %u, period %.3f ns): the perf line shows no GPU time", bits, period);
+        return;
+    }
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = 2 * TS_PAIRS};
+    VkResult r = vkCreateQueryPool(c->device, &qi, NULL, &ts_pool);
+    if (r != VK_SUCCESS) {
+        rt_log("vk: timestamp query pool failed (%d): the perf line shows no GPU time", (int)r);
+        return;
+    }
+    ts_period = period;
+    ts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    ts_state = 1;
+}
+
+typedef struct { uint32_t pair; } TsRead;
+
+static void ts_read_cb(void *arg) {   // completion thread, in submission order
+    TsRead *t = arg;
+    VkCtx *c = vk_ctx();
+    uint64_t v[2];
+    if (vkGetQueryPoolResults(c->device, ts_pool, 2 * t->pair, 2, sizeof v, v, sizeof v[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        uint64_t s = v[0] & ts_mask, e = v[1] & ts_mask;
+        if (e >= s) {
+            uint64_t from = s > ts_last_end ? s : ts_last_end;
+            if (e > from) InterlockedAdd64(&ts_busy_ns, (LONG64)((double)(e - from) * ts_period));
+            if (e > ts_last_end) ts_last_end = e;
+            InterlockedIncrement64(&ts_parts);
+        } else InterlockedIncrement64(&ts_missed);   // the counter wrapped
+    } else InterlockedIncrement64(&ts_missed);
+    __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
+    free(t);
+}
+
+// At the start of a part's command buffer (sub_lock held).
+static void ts_begin(VkCommandBuffer cb) {
+    ts_cur = -1;
+    if (ts_state != 1) return;
+    uint32_t p = ts_next % TS_PAIRS;
+    if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { InterlockedIncrement64(&ts_missed); return; }
+    ts_next++;
+    ts_busy[p] = 1;
+    vkCmdResetQueryPool(cb, ts_pool, 2 * p, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool, 2 * p);
+    ts_cur = (int)p;
+}
+
+// At the end of the part, before vkEndCommandBuffer; fence: the value whose completion covers the part.
+static void ts_end(VkCommandBuffer cb, uint64_t fence) {
+    if (ts_cur < 0) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)ts_cur + 1);
+    TsRead *t = malloc(sizeof *t);
+    if (!t) rt_fatal("vk: out of memory");
+    t->pair = (uint32_t)ts_cur;
+    vk_completion_add(fence, ts_read_cb, t);
+    ts_cur = -1;
+}
+
+// An empty submission records no command buffer: its pair is never written.
+static void ts_drop(void) {
+    if (ts_cur < 0) return;
+    __atomic_store_n(&ts_busy[ts_cur], 0, __ATOMIC_RELEASE);
+    ts_cur = -1;
+}
+
+static void gpu_stats(PerfGpu *g) {
+    g->have_gpu = ts_state == 1;
+    g->gpu_ns = (uint64_t)InterlockedExchange64(&ts_busy_ns, 0);
+    g->gpu_parts = (uint64_t)InterlockedExchange64(&ts_parts, 0);
+    g->gpu_missed = (uint64_t)InterlockedExchange64(&ts_missed, 0);
+    g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);
+}
+
 // Without the replay (T6c) only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
 WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
     (void)cb, (void)fence;
@@ -105,6 +205,8 @@ void vk_sync_start(void) {
                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                       .queueFamilyIndex = c->gfx_family};
         if (vkCreateCommandPool(c->device, &pi, NULL, &cmd_pool) != VK_SUCCESS) rt_fatal("vk: submission command pool");
+        if (!ts_state) ts_setup(c);
+        perf_gpu_stats = gpu_stats;
         uint64_t now = 0;
         vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
         if (issued > now) {   // a new device after vk_shutdown: values keep increasing for the front end
@@ -151,6 +253,7 @@ static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    ts_end(cb, cur_fence);
     vkEndCommandBuffer(cb);
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
     VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
@@ -164,6 +267,7 @@ VkCommandBuffer vk_sync_split(void) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(s->cb, &bi);
+    ts_begin(s->cb);
     return s->cb;
 }
 
@@ -178,8 +282,11 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     uint64_t t0 = perf_begin();
     vkBeginCommandBuffer(s->cb, &bi);
+    ts_begin(s->cb);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
+    if (recorded) ts_end(s->cb, fence);
+    else ts_drop();
     vkEndCommandBuffer(s->cb);
     perf_replay(t0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
@@ -227,6 +334,7 @@ int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns) {
     uint64_t p0 = perf_begin();
     int ok = fence_wait_impl(value, timeout_ns);
     perf_end(PERF_FENCE, p0);
+    perf_gpu_wait(p0);
     return ok;
 }
 
@@ -279,6 +387,12 @@ void vk_sync_shutdown(void) {
         AcquireSRWLockExclusive(&sub_lock);
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
+        perf_gpu_stats = NULL;
+        if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);
+        ts_pool = VK_NULL_HANDLE;
+        ts_state = 0;
+        ts_last_end = 0;
+        memset((void *)ts_busy, 0, sizeof ts_busy);
         cmd_pool = VK_NULL_HANDLE;
         free(slots);
         slots = NULL;
