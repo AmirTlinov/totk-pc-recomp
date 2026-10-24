@@ -189,6 +189,7 @@ static int key_vk(int key) {
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
+static volatile LONG cur_released;         // Esc, or activation by a click on the title bar or border: until a client click
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
@@ -209,7 +210,7 @@ static float mouse_sens_get(void) {
 static void cursor_update(HWND h) {
     const char *in = cfg_get("TOTK_INPUT");
     AcquireSRWLockExclusive(&cur_lock);
-    int want = h && cur_active && !cur_suspend && g_block != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) &&
+    int want = h && cur_active && !cur_released && !cur_suspend && g_block != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) &&
                GetForegroundWindow() == h && !IsIconic(h);
     RECT r;
     POINT tl = {0, 0};
@@ -224,6 +225,8 @@ static void cursor_update(HWND h) {
     }
     ReleaseSRWLockExclusive(&cur_lock);
 }
+
+int input_cursor_released(void) { return cur_released != 0; }
 
 void input_cursor_suspend(int on) {
     InterlockedExchange(&cur_suspend, on != 0);
@@ -251,7 +254,17 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_SETCURSOR:
         if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
         break;
+    case WM_KEYDOWN:   // Esc is unbound in the game layout, so it only releases the cursor
+        if (w == VK_ESCAPE) { InterlockedExchange(&cur_released, 1); cursor_update(h); }
+        break;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
+        if (cur_released) { InterlockedExchange(&cur_released, 0); cursor_update(h); }
+        break;
+    case WM_MOUSEACTIVATE:   // sent before WM_ACTIVATEAPP: a title bar or border click must not capture
+        if (LOWORD(l) != HTCLIENT) InterlockedExchange(&cur_released, 1);
+        break;
     case WM_ACTIVATEAPP:
+        if (!w) InterlockedExchange(&cur_released, 0);   // Alt+Tab back in captures again
         InterlockedExchange(&cur_active, w != 0);
         cursor_update(h);
         break;

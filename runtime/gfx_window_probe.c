@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include "gfx.h"
+#include "input.h"
 #include "vk.h"
 
 #define SRC_W 640
@@ -146,6 +147,26 @@ int probe_window(void) {
         return fail("focus");
     }
     printf("probe-window: focus off/on pushed 2 messages (15)\n");
+
+    // Cursor release: Esc releases, a client click recaptures, a title bar activation releases. The probe window may not be
+    // the foreground window, so this checks the release flag, not the clip state.
+    HWND hw = gfx_window_handle();
+    SendMessageW(hw, WM_KEYDOWN, VK_ESCAPE, 0);
+    int esc = input_cursor_released();
+    SendMessageW(hw, WM_LBUTTONDOWN, MK_LBUTTON, 0);
+    int click = input_cursor_released();
+    SendMessageW(hw, WM_MOUSEACTIVATE, (WPARAM)hw, MAKELPARAM(HTCLIENT, WM_LBUTTONDOWN));
+    int client = input_cursor_released();
+    SendMessageW(hw, WM_MOUSEACTIVATE, (WPARAM)hw, MAKELPARAM(HTCAPTION, WM_LBUTTONDOWN));
+    int caption = input_cursor_released();
+    SendMessageW(hw, WM_ACTIVATEAPP, FALSE, 0);
+    SendMessageW(hw, WM_ACTIVATEAPP, TRUE, 0);
+    int back = input_cursor_released();
+    if (!esc || click || client || !caption || back) {
+        printf("probe-window: released esc=%d click=%d client=%d caption=%d reactivated=%d\n", esc, click, client, caption, back);
+        return fail("cursor release");
+    }
+    printf("probe-window: cursor released by Esc and title bar activation, recaptured by a click\n");
 
     // Resize: the client area changes, the swapchain follows, presenting still reads back exact.
     gfx_window_resize(1280, 720);
