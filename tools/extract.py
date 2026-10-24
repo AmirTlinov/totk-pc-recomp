@@ -41,6 +41,22 @@ LONG_HEX = re.compile(r'[0-9A-Fa-f]{32,}')
 # say nothing about the data. The IVFC levels and the image hash decide.
 UNSIGNED = re.compile(r'\s*(?:Fixed-Key Signature|NPDM Signature) \(FAIL\)')
 HACTOOL_ERROR = re.compile(r'\(FAIL\)|\(INVALID\)|Failed to|Error:')
+# hactool lines of a hash check that failed: a RomFS level, a section's superblock or its hash table.
+HACTOOL_HASH_FAIL = re.compile(r'^\s*(?:Level \d|Superblock Hash|Hash Table) \(FAIL\)', re.M)
+# Errors of the vendored extractors (tools/vendor/macnativegames) that mean a game file's data does not match its own
+# hashes or ends early: the file is damaged or was not copied completely. DAMAGE finds them in a script's log.
+DAMAGE_TEXT = re.compile(r'hash mismatch|hash-table mismatch|FS header hash|IVFC level \d+ block \d+ failed|Truncated|'
+                         r'out of bounds|Section bounds')
+DAMAGE = re.compile(rf'^\w*Error: (.*(?:{DAMAGE_TEXT.pattern}).*)$', re.M)
+
+
+class DamagedFile(ValueError):
+    """A game file whose data fails its hash checks or ends early. path: that file; detail: the check that failed."""
+
+    def __init__(self, path, detail):
+        self.path, self.detail = Path(path), detail
+        super().__init__(f'{self.path} is damaged or incomplete ({detail}). Copy that file again from its source '
+                         f'(or dump it again) and retry.')
 
 
 def say(message):
@@ -75,10 +91,18 @@ RUN_SCRIPT = ('import os, runpy, sys; p = sys.argv[1]; sys.path.insert(0, os.pat
               "runpy.run_path(p, run_name='__main__')")
 
 
-def run_logged(command, log):
+def run_logged(command, log, source=None):
+    """Run a vendored script with its output in log. source: the game file it reads; a failed hash check or a short
+    read of that file raises DamagedFile."""
     args = [str(c) for c in command]
-    with log.open('w') as out:
-        code = subprocess.run([args[0], '-c', RUN_SCRIPT, *args[1:]], stdout=out, stderr=subprocess.STDOUT).returncode
+    env = dict(os.environ, PYTHONIOENCODING='utf-8')   # its messages may name non-ASCII paths
+    with log.open('wb') as out:
+        code = subprocess.run([args[0], '-c', RUN_SCRIPT, *args[1:]], stdout=out, stderr=subprocess.STDOUT,
+                              env=env).returncode
+    if code and source:
+        damage = DAMAGE.search(log.read_text(encoding='utf-8', errors='replace'))
+        if damage:
+            raise DamagedFile(source, damage.group(1).strip())
     require(code == 0, f'{Path(command[1]).name} failed; see {shown(log)}')
 
 
@@ -98,7 +122,7 @@ def extract_exefs(game, keys, out, logs, *, update):
         shutil.rmtree(exefs)
     out.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, VENDOR / 'extract_exefs.py', game, '--keys', keys, '--output', exefs]
-    run_logged(command + (['--update'] if update else []), logs / f'extract_exefs-{out.name}.log')
+    run_logged(command + (['--update'] if update else []), logs / f'extract_exefs-{out.name}.log', source=game)
     return exefs
 
 
@@ -131,12 +155,13 @@ def check_romfs(romfs, expected):
     say(f'  RomFS {expected["display_version"]}: {report["romfs_size"]:,} bytes, {len(report["files"]):,} files, hash matches')
 
 
-def extract_base_romfs(out, keys, logs):
+def extract_base_romfs(out, keys, logs, base=None):
     romfs = out / 'romfs'
     if romfs.exists():
         shutil.rmtree(romfs)
     run_logged([sys.executable, VENDOR / 'extract_romfs.py', '--keys', keys,
-                '--manifest', out / 'extraction-manifest.json', '--output', romfs], logs / 'extract_romfs-v0.log')
+                '--manifest', out / 'extraction-manifest.json', '--output', romfs], logs / 'extract_romfs-v0.log',
+               source=base)
 
 
 def program_ncas(base, update, keys_path):
@@ -166,7 +191,31 @@ def merge_space(base, update, keys_path):
 
 
 MERGE_PHASES = {'copy': '  copying the base and update Program NCAs', 'merge': '  merging with hactool',
+                'diagnose': '  a hash check failed: checking the base Program NCA alone',
                 'index': '  hashing and indexing the merged image'}
+
+
+def run_hactool(command, environment):
+    """(exit code, stdout and stderr with long hex strings removed). hactool prints UTF-8 (its manifest)."""
+    completed = subprocess.run(command, env=environment, capture_output=True, encoding='utf-8', errors='replace')
+    return completed.returncode, LONG_HEX.sub('<hex removed>', completed.stdout + completed.stderr)
+
+
+def damaged_merge_input(hactool, hactool_keys, environment, base, update, base_nca, log_path):
+    """The DamagedFile for a merge whose hash checks failed. The merged RomFS mixes data of both files, so hactool
+    verifies the base Program NCA alone: if it fails, the base game file is damaged, else the update file is. The
+    output is appended to log_path."""
+    code, log = run_hactool([str(hactool), '-y', '--disablekeywarns', '--suppresskeys', '-k', str(hactool_keys),
+                             str(base_nca)], environment)
+    with log_path.open('a', encoding='utf-8') as f:
+        f.write(f'\n---- base Program NCA alone (exit code {code}) ----\n{log}')
+    checked = '\n'.join(line for line in log.splitlines() if not UNSIGNED.match(line))
+    if HACTOOL_HASH_FAIL.search(checked):
+        return DamagedFile(base, f'its game data fails the hash check; see {shown(log_path)}')
+    if all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)):
+        return DamagedFile(update, f'its game data fails the hash check; see {shown(log_path)}')
+    return ValueError(f'the game data fails the hash check: the base game file {base} or the update file {update} is '
+                      f'damaged or incomplete. Copy them again from their source and retry; see {shown(log_path)}')
 
 
 def merge_update_romfs(base, update, keys_path, hactool, output, logs, phase=lambda name: say(MERGE_PHASES[name])):
@@ -195,19 +244,23 @@ def merge_update_romfs(base, update, keys_path, hactool, output, logs, phase=lam
         phase('copy')
         base_nca, update_nca = tmp / 'base.nca', tmp / 'update.nca'
         for (source, record, _), target in zip(inputs, (base_nca, update_nca)):
-            copy_range(source, record_offset(record), record['size'], target)
+            try:
+                copy_range(source, record_offset(record), record['size'], target)
+            except ValueError as e:   # the file ends inside its Program NCA
+                raise DamagedFile(source, str(e)) from None
         result = tmp / 'result'
         result.mkdir()
         phase('merge')
         command = [str(hactool), '-x', '-y', '--disablekeywarns', '--suppresskeys', '-k', str(hactool_keys),
                    f'--basenca={base_nca}', f'--section{sections[0]}={result / "romfs.bin"}', str(update_nca)]
         environment = dict(os.environ, MNG_TITLE_KEYS=str(title_keys))
-        completed = subprocess.run(command, env=environment, capture_output=True, text=True, errors='replace')
-        log = LONG_HEX.sub('<hex removed>', completed.stdout + completed.stderr)
-        log_path.write_text(log)
+        code, log = run_hactool(command, environment)
+        log_path.write_text(log, encoding='utf-8')
         checked = '\n'.join(line for line in log.splitlines() if not UNSIGNED.match(line))
-        require(completed.returncode == 0 and not HACTOOL_ERROR.search(checked),
-                f'hactool merge failed; see {shown(log_path)}')
+        if HACTOOL_HASH_FAIL.search(checked):
+            phase('diagnose')
+            raise damaged_merge_input(hactool, hactool_keys, environment, base, update, base_nca, log_path)
+        require(code == 0 and not HACTOOL_ERROR.search(checked), f'hactool merge failed; see {shown(log_path)}')
         require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)), 'hactool did not verify all six IVFC levels')
         image = result / 'romfs.bin'
         phase('index')
@@ -253,7 +306,7 @@ def main():
     report_npdm(base_out / 'exefs', v0)
     if not romfs_verified(base_out / 'romfs', v0):
         say('  extracting RomFS (17 GB)')
-        extract_base_romfs(base_out, keys, logs)
+        extract_base_romfs(base_out, keys, logs, base)
     check_romfs(base_out / 'romfs', v0)
 
     for update in updates:

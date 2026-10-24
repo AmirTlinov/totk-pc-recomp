@@ -76,7 +76,7 @@ SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll']
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
-LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Wl,--Map=$builddir/totk.map']   # the map feeds tools/prof_report.py
+LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '"-Wl,--Map=$builddir/totk.map"']   # the map feeds tools/prof_report.py
 LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end of M4; libvpx static (movies)
 VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
 # --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
@@ -86,6 +86,7 @@ DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 INSTALL_SIDE = {'romfs.c'}   # runtime sources that include romfs_config.h: compiled per install, not in the library
 LIB_NAME = 'libtotkrt.a'
 AR = UCRT / 'llvm-ar.exe'
+WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
@@ -117,6 +118,17 @@ def flag_path(p):
     return below_root(p).as_posix()
 
 
+def cmd_arg(s):
+    """s for a Ninja command line: Ninja-escaped, and quoted when it holds a space (a user or folder name), as clang and
+    lld split their Windows command line at unquoted spaces."""
+    s = s.replace('$', '$$')
+    return f'"{s}"' if ' ' in s else s
+
+
+def cmd_path(p):
+    return cmd_arg(flag_path(p))
+
+
 def read_layout(gen):
     """[(name, base, size)] from layout.json (same format as recomp/layout.py read(), without its NSO dependency)."""
     data = json.loads((gen / 'layout.json').read_text())
@@ -146,10 +158,10 @@ def chunk_files(gen, mod):
 
 def write_if_changed(path, text):
     """Keep the mtime of an unchanged file so Ninja does not rebuild from it."""
-    if path.exists() and path.read_text() == text:
+    if path.exists() and path.read_text(encoding='utf-8', errors='replace') == text:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, newline='\n')
+    path.write_text(text, encoding='utf-8', newline='\n')   # Ninja and clang read UTF-8; paths may be non-ASCII
 
 
 def c_string(s):
@@ -160,9 +172,9 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 
 def runtime_sources(skip=()):
-    """Every runtime/*.c and runtime/platform/*.c except the names in skip, so a task adds a file without editing this
-    script."""
-    pats = ('*.c', '*.cpp', 'platform/*.c')
+    """Every runtime/*.c, runtime/platform/*.c and runtime/*.rc except the names in skip, so a task adds a file without
+    editing this script."""
+    pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip)
 
 
@@ -207,15 +219,15 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     """build.ninja text, and the object lists per module. With prebuilt the generated objects already exist in
     out/obj and are link inputs without a compile edge. runtime_lib: a prebuilt library replaces the runtime objects
     except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
-    inc = f'-I {flag_path(RUNTIME)} -I {flag_path(gen)}'
-    vma = f'{flag_path(DEPS / "include")} -I {flag_path(DEPS / "include" / "vma")}' if DEPS else flag_path(VMA_INCLUDE)
-    rt_inc = f'{inc} -I {flag_path(out)} -I {vma}'   # romfs_config.h, vk_mem_alloc.h (and the deps headers)
-    libs = [f'-L{flag_path(DEPS / "lib")}'] + LLVM_LINK_LIBS if DEPS else LINK_LIBS
+    inc = f'-I {cmd_path(RUNTIME)} -I {cmd_path(gen)}'
+    vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(VMA_INCLUDE)
+    rt_inc = f'{inc} -I {cmd_path(out)} -I {vma}'   # romfs_config.h, vk_mem_alloc.h (and the deps headers)
+    libs = [f'-L {cmd_path(DEPS / "lib")}'] + LLVM_LINK_LIBS if DEPS else LINK_LIBS
     lines = [
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',
         f'builddir = {ninja_path(out)}',
-        f'cc = {CLANG.as_posix()}',
+        f'cc = {cmd_arg(CLANG.as_posix())}',
         f'genflags = {" ".join(GEN_FLAGS)} {inc}',
         f'rtflags = {" ".join(RT_FLAGS)} {rt_inc}',
         f'ldflags = {" ".join(LINK_FLAGS)}',
@@ -235,6 +247,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         '  deps = gcc',
         '  depfile = $out.d',
         '  description = CC $in',
+        '',
+        'rule rc',
+        f'  command = {cmd_arg(WINDRES.as_posix())} -I {cmd_path(RUNTIME)} -O coff $in -o $out',
+        '  description = RC $in',
         '',
         'rule link',
         '  command = $cc $ldflags @$out.rsp $libs -o $out',
@@ -262,14 +278,14 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources += [out / 'modules.c']
     for src in sources:
         o = runtime_object(out, src)
-        lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
+        lines.append(f'build {ninja_path(o)}: {"rc" if src.suffix == ".rc" else "cc_rt"} {ninja_path(src)}')
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]
     exe = out / 'totk.exe'
     if make_lib:
         exe = out / LIB_NAME
-        lines += ['', 'rule ar', f'  command = {AR.as_posix()} rcs $out $in', '  description = AR $out', '', f'build {ninja_path(exe)}: ar ' + ' '.join(ninja_path(o) for o in every),
+        lines += ['', 'rule ar', f'  command = {cmd_arg(AR.as_posix())} rcs $out $in', '  description = AR $out', '', f'build {ninja_path(exe)}: ar ' + ' '.join(ninja_path(o) for o in every),
                   'build objects: phony ' + ' '.join(ninja_path(o) for o in every), f'default {ninja_path(exe)}', '']
         return '\n'.join(lines), objs, exe
     rule = 'link'
@@ -278,7 +294,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         # linker looks into the library, and the real probes would stay out of totk.exe.
         rule = 'link_lib'
         lines += ['', 'rule link_lib',
-                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {flag_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
+                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {cmd_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
                   '  rspfile = $out.rsp', '  rspfile_content = $in_newline', '  description = LINK $out']
     lines += ['', f'build {ninja_path(exe)}: {rule} ' + ' '.join(ninja_path(o) for o in every) +
               (f' | {ninja_path(runtime_lib)}' if runtime_lib else ''),
@@ -295,7 +311,7 @@ def main_objects(gen, main_out, rt_dir, mods):
         return None, f'{flag_path(main_ninja)} not found'
     if gen != (ROOT / 'generated' / main_out.name).resolve():
         return None, 'generated C directory is not the main one'
-    lines = main_ninja.read_text().splitlines()
+    lines = main_ninja.read_text(encoding='utf-8').splitlines()
     sources = dict(l[6:].split(': cc_gen ') for l in lines if l.startswith('build ') and ': cc_gen ' in l)
     flags = next((l for l in lines if l.startswith('genflags = ')), '')
     if not flags.startswith('genflags = ' + ' '.join(GEN_FLAGS) + ' -I '):
@@ -383,7 +399,7 @@ def read_manifest(path):
     """{object path below obj/: (sha256, size, mtime_ns)}; empty when the file is missing."""
     man = {}
     if path.is_file():
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding='utf-8').splitlines():
             sha, size, mtime, rel = line.split(' ', 3)
             man[rel] = (sha, int(size), int(mtime))
     return man
@@ -588,7 +604,7 @@ def main():
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
         expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
-    global CLANG, AR, NINJA, TOOLCHAIN_BIN, DEPS
+    global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
         NINJA = args.ninja.resolve()
     elif not NINJA.is_file() and (ROOT / 'bin' / 'ninja.exe').is_file():
@@ -598,6 +614,7 @@ def main():
         TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
         CLANG = TOOLCHAIN_BIN / 'clang.exe'
         AR = TOOLCHAIN_BIN / 'llvm-ar.exe'
+        WINDRES = TOOLCHAIN_BIN / 'llvm-windres.exe'
         DEPS = (args.deps or DEFAULT_DEPS).resolve()
         dlls = sorted((DEPS / 'bin').glob('*.dll'))
     for tool in (CLANG, NINJA):

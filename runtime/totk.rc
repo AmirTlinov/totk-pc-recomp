@@ -1,0 +1,3 @@
+/* The application manifest of totk.exe (totk.manifest). tools/build_game.py compiles it with the runtime objects, so it
+   is also a member of libtotkrt.a, which the release links with --whole-archive. */
+1 24 "totk.manifest"
