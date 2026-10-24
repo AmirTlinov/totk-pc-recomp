@@ -321,6 +321,8 @@ class Check(Step):
         if dest_dev == temp_dev:
             dest_need += temp_need
             temp_need = 0
+        ctx.reporter.emit('space', dest=str(ctx.dest), need=dest_need, free=dest_free, temp=str(ctx.temp),
+                          temp_need=temp_need, temp_free=temp_free, same_disk=dest_dev == temp_dev)
         for path, need, free in ((ctx.dest, dest_need, dest_free), (ctx.temp, temp_need, temp_free)):
             if need > free:
                 raise InstallError('check.disk_space', path=str(path), need_gb=round(need / 1e9, 1),

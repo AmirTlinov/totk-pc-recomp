@@ -5,6 +5,8 @@ Every event has "type" and "t" (seconds since the start). Types:
     start     release, mode (install, resume, update), dest, log, steps (the step ids in order)
     step      step, state: started | done (seconds) | skipped (reason: current, not_needed)
     progress  step, phase, and done/total/unit (bytes, chunks, objects, shaders) when the amount is known
+    space     dest, need, free (bytes on the install disk; with the temp folder on the same disk need includes it),
+              temp, temp_need, temp_free, same_disk
     warning   id, params
     error     id, params, step (absent outside a step)
     end       result: ok | failed | cancelled, seconds
