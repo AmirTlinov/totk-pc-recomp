@@ -11,9 +11,14 @@
 #include "nvn_api.h"
 #include "nvn_tex.h"
 
-// The CPU is about to read what the GPU wrote into pool storage: a back end that renders into host-side copies (the
-// Vulkan back end's images) defines the strong version and writes them back.
-__attribute__((weak)) void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) { (void)p, (void)off, (void)size; }
+// The CPU is about to read what the GPU wrote into pool storage: the back end writes its host-side copies (the Vulkan
+// back end's images) back first. TotK invalidates its 260x260 R16 grass maps and 1x1 pick targets this way. A
+// CPU-invisible pool has no storage to read.
+void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
+    if (!p->mem || nvn_gpu_only((uintptr_t)p->mem) || off >= p->size || !size) return;
+    if (size > p->size - off) size = p->size - off;
+    gfx_backend()->guest_read((uintptr_t)p->mem + off, size);
+}
 
 // ---------- debug labels, markers, groups, checkpoints: meaningful only to NVN debugging tools
 // void nvn<Object>SetDebugLabel(NVN<object> *o, const char *label)

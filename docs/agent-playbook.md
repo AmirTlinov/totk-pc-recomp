@@ -80,6 +80,11 @@ Check these classes before you re-investigate a symptom that looks like one of t
   writes them back first. Other CPU reads of GPU output are not covered yet. A write-back skips a texture whose
   storage the CPU rewrote after the GPU render (`vk_texture.c` `write_back`); writing it anyway put stale grass maps
   into the far terrain for a second (texture flicker on a hit).
+- The CPU reads GPU-rendered textures in CPU-cached pools: `nvnMemoryPoolInvalidateMappedRange` writes them back
+  (`nvn_ext.c` `nvn_pool_invalidate`; TotK invalidates its 260x260 R16 grass maps and 1x1 targets), and once the CPU
+  waits for a fence, targets up to 64 KiB rendered before it go back too (`vk_texture.c`
+  `vk_texture_write_back_small`): the 128x128 cut map is read with no invalidate. Without it a cut left the grass
+  standing, with no blades and no insects.
 - A one-shot draw (a target not rendered in the previous frame) waits for its shader and pipeline instead of being
   skipped: `vk_exec_draw.c` `prepare_draw`. Skipping left the cloud and fog volumes empty for the session.
 - Storage buffers bound by Ryujinx first-use order instead of the NVN c0 slot: `vk_exec_draw.c` `ssbo_slot`. It showed

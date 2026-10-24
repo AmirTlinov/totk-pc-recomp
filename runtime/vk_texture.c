@@ -51,6 +51,7 @@ typedef struct Tex {
     uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
+    uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint8_t listed;               // in owned[]
 } Tex;
 
@@ -719,6 +720,11 @@ const VkTexImage *vk_texture_get(const tex_t *t) {
     return e ? &e->pub : NULL;
 }
 
+// Small render targets the CPU reads without NVN's invalidate (vk_texture_write_back_small); small_pending: one may be
+// dirty.
+enum { WB_SMALL = 64 << 10 };
+static int small_pending;
+
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
     vk_exec_frame_written(t);
@@ -731,6 +737,8 @@ void vk_texture_gpu_written(const tex_t *t) {
             e->gpu_dirty = 1;
             storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
             e->gpu_seq = ++gpu_writes;
+            e->gpu_fence = vk_exec_recording_fence();
+            if (e->t.L.size <= WB_SMALL) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
             own_add(e);
         }
     }
@@ -1151,6 +1159,48 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
     Tex **hit = malloc(sizeof *hit * (size_t)(nowned + 1));
     if (!hit) rt_fatal("vk: out of memory for a texture write-back");
     int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
+    for (int i = 0; i < n; i++) {
+        uint32_t now;
+        if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
+        else hit[k++] = hit[i];
+    }
+    for (int i = 1; i < k; i++)
+        for (int j = i; j > 0 && hit[j - 1]->gpu_seq > hit[j]->gpu_seq; j--) {
+            Tex *x = hit[j];
+            hit[j] = hit[j - 1], hit[j - 1] = x;
+        }
+    for (int i = 0; i < k; i++) write_back(hit[i]);
+    for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
+    for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
+    free(hit);
+    unlock();
+}
+
+// TotK's grass system renders a 128x128 RGBA8 map of cut and trampled grass into a CPU-cached pool every frame and its
+// CPU code reads the pool bytes without nvnMemoryPoolInvalidateMappedRange (cut reactions: blades, insects, the cut
+// itself; build/v121-bloom NOTES.md). On the Switch the bytes are there once the frame's fence has passed. So when the
+// CPU waits for a fence, mirrored targets up to WB_SMALL bytes rendered by work up to that fence go back to their
+// storage, unless the CPU rewrote it since. Larger targets still go back on an invalidate, memcpy or ReadTexels.
+int vk_texture_small_dirty(void) { return __atomic_load_n(&small_pending, __ATOMIC_ACQUIRE); }
+
+void vk_texture_write_back_small(uint64_t fence) {
+    lock();
+    __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
+    AcquireSRWLockShared(&owned_lock);
+    int n = 0, later = 0;
+    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && owned[i]->t.L.size <= WB_SMALL;
+    Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
+    if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
+    n = 0;
+    for (int i = 0; i < nowned; i++) {
+        Tex *e = owned[i];
+        if (!e->gpu_dirty || e->t.L.size > WB_SMALL) continue;
+        if (e->gpu_fence > fence) later = 1;
+        else hit[n++] = e;
+    }
+    ReleaseSRWLockShared(&owned_lock);
+    if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
+    int k = 0;
     for (int i = 0; i < n; i++) {
         uint32_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;

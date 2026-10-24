@@ -186,6 +186,8 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 VkSampler vk_sampler_by_id_locked(int id);
 uint32_t vk_texture_slots_gen(void);
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
+int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
+void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
 int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the descriptor in slot id
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,

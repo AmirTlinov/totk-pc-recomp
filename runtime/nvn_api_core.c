@@ -429,12 +429,13 @@ NVN_API(nvnSyncWait) {
     uint64_t timeout = arg_x(c, 1);
     if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     const GfxBackend *b = gfx_backend();
-    if (b->fence_done() >= s->fence) { ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     int ok;
     {
         NVN_BLOCKING();
         ok = b->fence_wait(s->fence, timeout);
     }
+    if (ok) b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
 // void nvnEventBuilderSetDefaults(NVNeventBuilder *b)
@@ -516,8 +517,11 @@ NVN_API(nvnQueueGetError) {
 NVN_API(nvnQueueFlush) { (void)c; }
 // void nvnQueueFinish(NVNqueue *q)
 NVN_API(nvnQueueFinish) {
-    NVN_BLOCKING();
-    gfx_backend()->finish();
+    {
+        NVN_BLOCKING();
+        gfx_backend()->finish();
+    }
+    gfx_backend()->cpu_synced(gfx_backend()->fence_done());
 }
 // ---------- Submit latency guard for TotK 1.2.1's per-object uniform double buffer
 // NVN starts the GPU when QueueSubmitCommands returns, within microseconds; here the replay into Vulkan takes 15-30 ms

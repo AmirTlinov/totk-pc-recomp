@@ -136,6 +136,7 @@ typedef struct {
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
+uint64_t vk_exec_recording_fence(void);                        // fence of the submission this thread records, else 0
 void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 
 // TOTK_DUMP=<frame> (vk_dump.c): between presents frame-1 and frame, every pass's targets and every dispatch's storage
