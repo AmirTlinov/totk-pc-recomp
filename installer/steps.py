@@ -131,6 +131,13 @@ def free_bytes(path):
     return shutil.disk_usage(p).free, os.stat(p).st_dev
 
 
+def raise_if_damaged(error, name, path):
+    """InstallError check.input_damaged when a reader's ValueError says the file's data fails its hashes or ends early
+    (extract.DAMAGE_TEXT)."""
+    if extract.DAMAGE_TEXT.search(str(error)):
+        raise InstallError('check.input_damaged', input=name, path=str(path), detail=str(error)) from None
+
+
 def expected_update():
     return extract.load_expected()[UPDATE_VERSION]
 
@@ -264,15 +271,16 @@ class Check(Step):
         for name, is_update in (('base', False), ('update', True)):
             path = Path(getattr(o, name))
             with path.open('rb') as f:
-                total += self.open_input(f, path.stat().st_size, keys, name, is_update)
+                total += self.open_input(f, path, keys, name, is_update)
         del keys
         return total
 
     @staticmethod
-    def open_input(f, size, keys, name, is_update):
+    def open_input(f, path, keys, name, is_update):
         try:
-            kind, entries = container_entries(f, size)
-        except ValueError:
+            kind, entries = container_entries(f, path.stat().st_size)
+        except ValueError as e:
+            raise_if_damaged(e, name, path)
             raise InstallError('check.not_game_file', input=name) from None
         if is_update and kind != 'nsp':
             raise InstallError('check.update_not_nsp')
@@ -281,12 +289,14 @@ class Check(Step):
         except ValueError as e:
             if 'Personalized' in str(e):
                 raise InstallError('check.ticket_personalized', input=name) from None
+            raise_if_damaged(e, name, path)
             raise InstallError('check.file_unreadable', input=name, detail=str(e)) from None
         try:
             records = nca_inventory(f, entries, keys)
         except ValueError as e:
             if 'NCA3' in str(e):
                 raise InstallError('check.keys_wrong', input=name) from None
+            raise_if_damaged(e, name, path)
             raise InstallError('check.file_unreadable', input=name, detail=str(e)) from None
         try:
             record, header = program_nca(records, update=is_update)
@@ -339,6 +349,8 @@ class Check(Step):
             remove(out)
             try:
                 extract.extract_exefs(Path(getattr(o, name)), Path(o.keys), out, logs, update=is_update)
+            except extract.DamagedFile as e:
+                raise InstallError('check.input_damaged', input=name, path=str(e.path), detail=e.detail) from None
             except ValueError:
                 raise InstallError('check.exefs_failed', input=name, log=str(logs / f'extract_exefs-{name}.log')) \
                     from None
@@ -401,6 +413,8 @@ class Extract(Step):
             remove(ctx.temp / 'check' / 'update')
             try:
                 extract.extract_exefs(update, keys, ctx.temp / 'check' / 'update', ctx.temp / 'logs', update=True)
+            except extract.DamagedFile as e:
+                raise InstallError('check.input_damaged', input='update', path=str(e.path), detail=e.detail) from None
             except ValueError:
                 raise InstallError('check.exefs_failed', input='update',
                                    log=str(ctx.temp / 'logs' / 'extract_exefs-update.log')) from None
@@ -441,6 +455,9 @@ class Extract(Step):
         watch.start()
         try:
             extract.merge_update_romfs(base, update, keys, ctx.layout.hactool, romfs, logs, phase=phase)
+        except extract.DamagedFile as e:
+            raise InstallError('check.input_damaged', input='base' if e.path == base else 'update', path=str(e.path),
+                               detail=e.detail) from None
         except ValueError as e:
             raise InstallError('extract.romfs_merge_failed', detail=str(e), log=str(logs / 'merge_romfs-'
                                                                                      f'{dest.name}.log')) from None
