@@ -148,7 +148,7 @@ const RtGuestLayout *mem_layout(void) { return &L; }
 
 // Adapted from LAS Recomp runtime/platform/windows.c:40-63 @ da35b83 (MIT, Copyright (c) 2026 Peiikai): GetWriteWatch
 // with the reset flag. A range inside one watched reservation (stack and heap block, or alias region) only.
-uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+static uint64_t written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, DWORD flags) {
     if (!max || !size) return 0;
     const RtGuestLayout *g = &L;
     int low_block = addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size;
@@ -157,9 +157,16 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
     ULONG_PTR n = (ULONG_PTR)max;
     DWORD gran;
     _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
-    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran))
-        return UINT64_MAX;
+    if (GetWriteWatch(flags, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran)) return UINT64_MAX;
     return n;
+}
+
+uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+    return written_pages(addr, size, pages, max, WRITE_WATCH_FLAG_RESET);
+}
+
+uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+    return written_pages(addr, size, pages, max, 0);
 }
 
 static uint64_t image_bytes(void) {

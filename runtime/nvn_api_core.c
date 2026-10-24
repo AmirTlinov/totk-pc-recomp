@@ -303,9 +303,14 @@ void nvn_flush_stats(uint64_t out[2][3][2]) {
             for (int j = 0; j < 2; j++) out[i][k][j] = __atomic_exchange_n(&flush_stat[i][k][j], 0, __ATOMIC_RELAXED);
 }
 
-// void nvnMemoryPoolFlushMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size): storage is coherent
+// void nvnMemoryPoolFlushMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size): storage is coherent; a
+// back end with device-side copies hears of it (nvn_pool_flushed)
 NVN_API(nvnMemoryPoolFlushMappedRange) {
-    if (rt_trace & RT_TRACE_PERF) flush_note(0, arg_p(c, 0), arg_x(c, 2));
+    const pool_t *p = arg_p(c, 0);
+    int64_t off = (int64_t)arg_x(c, 1);
+    uint64_t size = arg_x(c, 2);
+    if (rt_trace & RT_TRACE_PERF) flush_note(0, p, size);
+    if (p && off >= 0 && (uint64_t)off < p->size) nvn_pool_flushed(p, (uint64_t)off, size < p->size - (uint64_t)off ? size : p->size - (uint64_t)off);
 }
 // NVNmemoryPoolFlags nvnMemoryPoolGetFlags(const NVNmemoryPool *p)
 NVN_API(nvnMemoryPoolGetFlags) { ret_x(c, ((const pool_t *)arg_p(c, 0))->flags); }

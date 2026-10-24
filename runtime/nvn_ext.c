@@ -20,6 +20,8 @@ void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size) {
     gfx_backend()->guest_read((uintptr_t)p->mem + off, size);
 }
 
+__attribute__((weak)) void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) { (void)p, (void)off, (void)size; }
+
 // ---------- debug labels, markers, groups, checkpoints: meaningful only to NVN debugging tools
 // void nvn<Object>SetDebugLabel(NVN<object> *o, const char *label)
 NVN_API(nvnDeviceSetDebugLabel) { (void)c; }

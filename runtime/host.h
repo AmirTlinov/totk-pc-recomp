@@ -128,6 +128,9 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
                                                            // past max stays reported next time). The range must lie
                                                            // inside the stack/heap block or the alias region
                                                            // (write watch); otherwise returns UINT64_MAX
+uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
+                                                           // the same without the reset: the bits stay for the next
+                                                           // mem_written_pages (verify checks only)
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
 
 // ---- modules (loader.c, T1)

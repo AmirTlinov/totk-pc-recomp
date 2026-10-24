@@ -888,6 +888,8 @@ int vk_texture_slot_swz(int id, uint8_t swz[4]) {
     return ok;
 }
 
+uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC_RELAXED); }
+
 void vk_texture_new_submit(void) {
     lock();
     if (!++submit_epoch) submit_epoch = 1;
