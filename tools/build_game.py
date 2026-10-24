@@ -187,9 +187,9 @@ def runtime_object(out, src):
     return out / 'obj' / 'runtime' / rel.with_suffix('.o')
 
 
-def module_glue(layout, linked, hashes, paths):
+def module_glue(layout, linked, hashes, paths, version):
     """C for build/<version>/modules.c: the layout table, the linked modules' function tables (dispatch.h), the
-    expected ExeFS hashes and the default game paths (host.h)."""
+    expected ExeFS hashes, the game version and the default game paths (host.h)."""
     out = [f'// Module glue written by tools/build_game.py; do not edit. {GENERATED_MARKER}',
            '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
     for name, base, size in layout:
@@ -213,7 +213,7 @@ def module_glue(layout, linked, hashes, paths):
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
-    out.append('')
+    out += [f'const int rt_game_version = {int(DISPLAY_VERSIONS[version].replace(".", "")) if version in DISPLAY_VERSIONS else 0};', '']
     return '\n'.join(out)
 
 
@@ -645,7 +645,7 @@ def main():
     missing = [n for n in names if n not in hashes]
     if missing:
         sys.exit(f'{expected}: no exefs_sha256 for {missing}')
-    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths))
+    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version))
     if (paths['romfs'] / 'index.json').is_file():
         count, size, dt = romfs_index.write(paths['romfs'], out)
         print(f'romfs index: {count} files, {mib(size)}, {dt:.1f} s')

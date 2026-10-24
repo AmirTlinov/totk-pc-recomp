@@ -4,8 +4,10 @@
 // The boot driver: the guest main thread runs the game's own nn::init::Start
 // with three host callbacks, the second of which runs DT_INIT of main, subsdk0 and sdk; Start then calls nnMain.
 // --boot checks two checkpoints on the way and ends at the first nvnBootstrapLoader call:
-//   SetFocusHandlingMode   called from main+0xe7a954 in nnMain, every module's constructor flag reads 2
-//   nvnBootstrapLoader     called from main+0xe7eb2c in the graphics bring-up; logs the run statistics, exits 0
+//   SetFocusHandlingMode   called from main+0xe7a954 (1.4.3: +0xbdb48c) in nnMain, every module's constructor flag
+//                          reads 2
+//   nvnBootstrapLoader     called from main+0xe7eb2c (1.4.3: +0xbe0360) in the graphics bring-up; logs the run
+//                          statistics, exits 0
 // With --frames N the run continues past that call; rt_frame_presented ends it at the Nth present.
 #include <windows.h>
 #include <stdio.h>
@@ -18,13 +20,17 @@
 #include "vk.h"
 
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
-#define CHECKPOINT_RET 0xe7a954ull       // main: return address of nnMain's SetFocusHandlingMode call (section 0.4)
-#define NVN_RET 0xe7eb2cull              // main: return address of the first nvnBootstrapLoader call
+// main: return addresses of nnMain's SetFocusHandlingMode call (section 0.4; 1.4.3: MNG scripts/verify_boot.py:9) and
+// of the first nvnBootstrapLoader call, per game version.
+#define CHECKPOINT_RET (RT_V143 ? 0xbdb48cull : 0xe7a954ull)
+#define NVN_RET (RT_V143 ? 0xbe0360ull : 0xe7eb2cull)
 #define CTOR_DONE 2                      // a module's constructor flag after its DT_INIT ran the init_array
 
-// The init_array sizes of 1.2.1 (section 0.1); MacNativeGames' boot check expects the same.
-static const struct { const char *name; uint64_t entries; } expected_inits[] = {
-    {"main", 10673}, {"subsdk0", 45}, {"sdk", 116}};
+// The init_array sizes (1.2.1: section 0.1; 1.4.3: DT_INIT_ARRAYSZ); MacNativeGames' boot check expects the same.
+typedef struct { const char *name; uint64_t entries; } InitCount;
+static const InitCount inits_121[] = {{"main", 10673}, {"subsdk0", 45}, {"sdk", 116}};
+static const InitCount inits_143[] = {{"main", 10717}, {"subsdk0", 45}, {"sdk", 83}};
+#define expected_inits (RT_V143 ? inits_143 : inits_121)
 
 static volatile LONG inits_done, checkpoint_seen;
 
@@ -63,7 +69,7 @@ static void cb_loader_ready(Cpu *c) {
 // afterwards (MacNativeGames loader.c:458-462).
 static void cb_module_inits(Cpu *c) {
     if (InterlockedCompareExchange(&inits_done, 0, 0)) rt_fatal("boot: module constructors requested twice");
-    for (unsigned k = 0; k < sizeof expected_inits / sizeof *expected_inits; k++) {
+    for (unsigned k = 0; k < sizeof inits_121 / sizeof *inits_121; k++) {
         const RtLoaded *m = module_named(expected_inits[k].name);
         uint64_t entries = m->init_array_size / 8;
         if (!m->init) rt_fatal("boot: %s has no DT_INIT", m->name);
@@ -73,7 +79,7 @@ static void cb_module_inits(Cpu *c) {
         printf("boot: DT_INIT %s state=%u (%llu)\n", m->name, state, (unsigned long long)entries);
         if (state != CTOR_DONE) rt_fatal("boot: %s DT_INIT left its constructor flag at %u, not 2", m->name, state);
         if (entries != expected_inits[k].entries)
-            rt_fatal("boot: %s has %llu init_array entries, 1.2.1 has %llu", m->name, (unsigned long long)entries,
+            rt_fatal("boot: %s has %llu init_array entries, this game version has %llu", m->name, (unsigned long long)entries,
                      (unsigned long long)expected_inits[k].entries);
     }
     InterlockedExchange(&inits_done, 1);

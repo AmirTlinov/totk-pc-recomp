@@ -19,7 +19,7 @@ uint64_t hostfn_register_observer(const char *name, GuestFn fn, uint64_t origina
 
 enum { DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
        DT_INIT = 12, DT_FINI = 13, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_FINI_ARRAY = 26, DT_INIT_ARRAYSZ = 27,
-       DT_FINI_ARRAYSZ = 28 };
+       DT_FINI_ARRAYSZ = 28, DT_RELRSZ = 0x23, DT_RELR = 0x24, DT_GNU_HASH = 0x6ffffef5 };
 enum { R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027 };
 enum { K_RELATIVE, K_ABS64, K_GLOB_DAT, K_JUMP_SLOT, K_COUNT };
 enum { STB_WEAK = 2, STT_FUNC = 2 };
@@ -39,6 +39,8 @@ typedef struct {
     uint32_t nsyms;
     const Elf64Rela *rela, *jmprel;
     uint64_t nrela, njmprel;
+    const uint64_t *relr;               // DT_RELR (1.4.3): packed RELATIVE relocations
+    uint64_t nrelr, relr_count;
     uint32_t *hash, hash_mask;          // defined symbols by name
     Res *res_plain, *res_jump;          // per symbol; JUMP_SLOT may bind an observer
     uint32_t *funcs, nfuncs;            // defined functions sorted by value (ldr_describe)
@@ -219,12 +221,15 @@ static void parse_dynamic(Mod *m) {
     uint64_t mod0 = base + rd32(base + 4);
     if (memcmp((const void *)(uintptr_t)mod0, "MOD0", 4)) rt_fatal("loader: %s has no MOD0 header", m->pub.name);
     uint64_t dyn = mod0 + (int64_t)(int32_t)rd32(mod0 + 4);
-    uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0, hash = 0;
+    uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0, hash = 0, gnu_hash = 0, relr = 0, relrsz = 0;
     for (const uint64_t *d = (const uint64_t *)(uintptr_t)dyn; d[0] != DT_NULL; d += 2) {
         switch (d[0]) {
         case DT_SYMTAB: m->syms = (const Elf64Sym *)(uintptr_t)(base + d[1]); break;
         case DT_STRTAB: m->strtab = (const char *)(uintptr_t)(base + d[1]); break;
         case DT_HASH: hash = base + d[1]; break;
+        case DT_GNU_HASH: gnu_hash = base + d[1]; break;
+        case DT_RELR: relr = base + d[1]; break;
+        case DT_RELRSZ: relrsz = d[1]; break;
         case DT_RELA: rela = base + d[1]; break;
         case DT_RELASZ: relasz = d[1]; break;
         case DT_JMPREL: jmprel = base + d[1]; break;
@@ -234,8 +239,26 @@ static void parse_dynamic(Mod *m) {
         case DT_INIT_ARRAYSZ: m->pub.init_array_size = d[1]; break;
         }
     }
-    if (!m->syms || !m->strtab || !hash) rt_fatal("loader: %s lacks DT_SYMTAB, DT_STRTAB or DT_HASH", m->pub.name);
-    m->nsyms = rd32(hash + 4);   // nchain
+    if (!m->syms || !m->strtab || (!hash && !gnu_hash))
+        rt_fatal("loader: %s lacks DT_SYMTAB, DT_STRTAB or a symbol hash", m->pub.name);
+    if (hash) {
+        m->nsyms = rd32(hash + 4);   // nchain
+    } else {
+        // DT_GNU_HASH only (1.4.3 sdk, subsdk0): one past the last symbol the highest bucket's chain reaches.
+        uint32_t nbuckets = rd32(gnu_hash), symoffset = rd32(gnu_hash + 4), bloom = rd32(gnu_hash + 8);
+        uint64_t buckets = gnu_hash + 16 + 8ull * bloom, chains = buckets + 4ull * nbuckets;
+        uint32_t last = 0;
+        for (uint32_t i = 0; i < nbuckets; i++)
+            if (rd32(buckets + 4ull * i) > last) last = rd32(buckets + 4ull * i);
+        if (last < symoffset) {
+            m->nsyms = symoffset;
+        } else {
+            while (!(rd32(chains + 4ull * (last - symoffset)) & 1)) last++;
+            m->nsyms = last + 1;
+        }
+    }
+    m->relr = (const uint64_t *)(uintptr_t)relr;
+    m->nrelr = relrsz / 8;
     m->rela = (const Elf64Rela *)(uintptr_t)rela;
     m->nrela = relasz / sizeof(Elf64Rela);
     m->jmprel = (const Elf64Rela *)(uintptr_t)jmprel;
@@ -363,6 +386,33 @@ static void relocate_table(Mod *m, const Elf64Rela *r, uint64_t n) {
     }
 }
 
+// DT_RELR: an even entry is an offset to relocate (the next bitmap starts after it); an odd entry is a bitmap of the
+// 63 words that follow. Each relocated word holds its addend, as R_AARCH64_RELATIVE with an implicit addend.
+static void relocate_relr(Mod *m) {
+    uint64_t base = m->pub.base, where = 0;
+    for (uint64_t i = 0; i < m->nrelr; i++) {
+        uint64_t e = m->relr[i];
+        for (int k = -1; k < 63; k++) {
+            uint64_t off;
+            if (k < 0) {
+                if (e & 1) continue;
+                off = e;
+                where = e + 8;
+            } else {
+                if (!(e & 1) || !((e >> (k + 1)) & 1)) continue;
+                off = where + 8ull * k;
+            }
+            if (off < m->pub.data_off || off > m->pub.size - 8)
+                rt_fatal("loader: %s RELR entry %llu writes +%#llx, outside the data segment", m->pub.name,
+                         (unsigned long long)i, (unsigned long long)off);
+            ST64(base + off, base + LD64(base + off));
+            m->kinds[K_RELATIVE]++;
+            m->relr_count++;
+        }
+        if (e & 1) where += 63 * 8;
+    }
+}
+
 // Import table statistics: every undefined named symbol, bound by guest definition (overrides aside).
 static void count_imports(Mod *m) {
     for (uint32_t i = 1; i < m->nsyms; i++) {
@@ -416,6 +466,7 @@ void ldr_load(const char *exefs_dir) {
     for (int i = 0; i < nmods; i++) {
         relocate_table(&mods[i], mods[i].rela, mods[i].nrela);
         relocate_table(&mods[i], mods[i].jmprel, mods[i].njmprel);
+        relocate_relr(&mods[i]);
         count_imports(&mods[i]);
         mods[i].pub.ctor_flag = decode_ctor_flag(&mods[i]);
     }
@@ -425,7 +476,7 @@ void ldr_load(const char *exefs_dir) {
         const Mod *m = &mods[i];
         rt_log("loaded %-8s at %#llx size %#llx: %llu relocations, %u imports", m->pub.name,
                (unsigned long long)m->pub.base, (unsigned long long)m->pub.size,
-               (unsigned long long)(m->nrela + m->njmprel), m->imports);
+               (unsigned long long)(m->nrela + m->njmprel + m->relr_count), m->imports);
     }
 }
 
@@ -515,16 +566,23 @@ uint64_t ldr_plt_stub(const char *module, const char *name) {
 }
 
 // ---- --probe-loader
-// Expected values, measured on the 1.2.1 modules.
-static const struct {
+// Expected values, measured on the 1.2.1 and 1.4.3 modules (1.4.3 relocation totals match MNG v1.4.3-port.md:20).
+typedef struct {
     const char *name;
     uint64_t kinds[K_COUNT], total, sym_import, sym_own;
     uint32_t imports, to[MOD_COUNT], weak, init_off, init_array;
-} expect[] = {
+} Expect;
+static const Expect expect_121[] = {
     {"main", {508816, 1415, 32, 641}, 510904, 2088, 0, 675, {0, 16, 647}, 12, 0x30, 10673},
     {"subsdk0", {1623, 12820, 1030, 3924}, 19397, 6576, 11198, 667, {9, 0, 654}, 4, 0x30, 45},
     {"sdk", {10917, 13976, 1207, 8932}, 35032, 16, 24099, 13, {8, 0, 0}, 5, 0x30, 116},
 };
+static const Expect expect_143[] = {
+    {"main", {499078, 1393, 28, 650}, 501149, 0, 0, 0, {0, 0, 0}, 0, 0x10b4f10, 10717},
+    {"subsdk0", {3424, 10927, 905, 3817}, 19073, 0, 0, 0, {0, 0, 0}, 0, 0x20, 45},
+    {"sdk", {15013, 10135, 1079, 7832}, 34059, 0, 0, 0, {0, 0, 0}, 0, 0x400, 83},
+};
+#define expect (RT_V143 ? expect_143 : expect_121)
 
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
@@ -614,7 +672,7 @@ int probe_loader(void) {
     const RtConfig *cfg = rt_config();
     hostfn_add_override(PROBE_SYMBOL, probe_override);
     ldr_load(cfg->exefs);
-    if (nmods != (int)(sizeof expect / sizeof *expect)) {
+    if (nmods != (int)(sizeof expect_121 / sizeof *expect_121)) {
         printf("probe-loader: FAILED (%d modules, expected 3)\n", nmods);
         return 1;
     }
