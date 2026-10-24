@@ -53,6 +53,8 @@ ANS_REC = 4 + 32 + 32 + 147 + 1
 
 
 BUNDLED_LIST = ROOT / 'tools' / 'data' / 'shader_list.tsv'   # the installer archive carries a copy (no git, no refs/)
+if not BUNDLED_LIST.is_file():
+    BUNDLED_LIST = ROOT / 'data' / 'shader_list.tsv'          # release folder layout (tools/make_release.py)
 
 
 def read_list(path):

@@ -47,7 +47,9 @@ def list_files(staged: bool) -> list[Path]:
     return [Path(p) for p in out.decode("utf-8").split("\0") if p]
 
 
-def problems_for(path: Path) -> list[str]:
+def problems_for(path: Path, allow_large: bool = False) -> list[str]:
+    """allow_large: files over MAX_BYTES (toolchain binaries in a release folder) are checked for the generated marker
+    only, not refused."""
     found = []
     if path.suffix.lower() in BLOCKED_SUFFIXES:
         found.append(f"blocked file type {path.suffix}")
@@ -56,6 +58,10 @@ def problems_for(path: Path) -> list[str]:
     if not path.is_file():
         return found
     size = path.stat().st_size
+    if size > MAX_BYTES and allow_large:
+        if GENERATED_MARKER.encode() in path.read_bytes():
+            found.append("generated from game code")
+        return found
     if size > MAX_BYTES:
         found.append(f"{size // 1024} KiB, over the {MAX_BYTES // 1024} KiB limit")
         return found
