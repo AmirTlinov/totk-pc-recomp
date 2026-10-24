@@ -580,6 +580,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     if (sp.offset % align == 0) {
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
         vk_mem_count(sp.cls, use, n);
+        VK_MEM_BOUND(sp);
         return 1;
     }
     if (sp.alloc) return 0;
@@ -1086,6 +1087,7 @@ static void bind_vertex_buffers(VkExec *ex) {
     VkBuffer vb[17];
     VkDeviceSize vo[17], vsz[17], vstr[17];
     int vcls[17] = {0};
+    void *vpool[17] = {0};
     int dyn = vk_pipeline_vertex_input_dynamic();
     for (int b = 0; b < 17; b++) {
         vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0;
@@ -1094,7 +1096,7 @@ static void bind_vertex_buffers(VkExec *ex) {
         VkMemSpan sp;
         if (!r->address || !vk_mem_resolve(r->address, 1, &sp)) continue;
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
-        vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls;
+        vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls, vpool[b] = sp.pool;
     }
     if (B.vb_valid && !memcmp(B.vb, vb, sizeof vb) && !memcmp(B.vo, vo, sizeof vo) && !memcmp(B.vsz, vsz, sizeof vsz) &&
         (dyn || !memcmp(B.vstr, vstr, sizeof vstr)))
@@ -1103,6 +1105,9 @@ static void bind_vertex_buffers(VkExec *ex) {
     ex->recorded++;
     for (int b = 0; b < 17; b++)
         if (vcls[b]) vk_mem_count(vcls[b], VK_MUSE_VB, vsz[b]);
+    if (rt_trace & RT_TRACE_PERF)
+        for (int b = 0; b < 17; b++)
+            if (vpool[b]) vk_mem_bound_note(vpool[b]);
     memcpy(B.vb, vb, sizeof vb), memcpy(B.vo, vo, sizeof vo), memcpy(B.vsz, vsz, sizeof vsz), memcpy(B.vstr, vstr, sizeof vstr);
     B.vb_valid = 1;
 }
@@ -1269,6 +1274,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
         vkCmdBindIndexBuffer(ex->cb, sp.buffer, sp.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         ex->recorded++;
         vk_mem_count(sp.cls, VK_MUSE_IB, bytes);
+        VK_MEM_BOUND(sp);
     }
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
@@ -1293,6 +1299,8 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
     ex->recorded += 2;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDrawIndexedIndirectCommand));
+    VK_MEM_BOUND(ip);
+    VK_MEM_BOUND(ib);
 }
 
 // ---- dispatch and uniform buffer updates
@@ -1347,6 +1355,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
+    VK_MEM_BOUND(ip);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
 }
 

@@ -275,6 +275,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_sync_start();
     VkCtx *c = vk_ctx();
     AcquireSRWLockExclusive(&sub_lock);
+    vk_mem_dirty_submit();   // TOTK_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
     CmdSlot *s = take_slot(c, fence);
