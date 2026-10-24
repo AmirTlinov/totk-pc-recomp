@@ -20,7 +20,26 @@ Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into
 | Plus | Start | Tab | menu, inventory |
 | Minus | Back | M | map |
 
-Esc is unbound in the game; it releases the mouse cursor (see Mouse camera). Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are one table, `input_bindings` in `runtime/input_map.c` (platform-neutral key ids; `runtime/input_win.c` translates Win32 virtual keys), so a remapping page can edit it later.
+Esc is unbound in the game; it releases the mouse cursor (see Mouse camera). Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are two tables in `runtime/input_map.c`, `input_bindings` (platform-neutral key ids) and `input_pad_bindings` (gamepad inputs by position); `runtime/input_win.c` translates Win32 virtual keys and SDL buttons, so a remapping page can edit both later.
+
+## Remapping
+
+`totk.ini` rebinds the buttons, one line per Switch button: `bind_<button> = <entry>, <entry>, ...`. The button is `A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LCLICK RCLICK`. An entry is `pad:<name>` or `key:<name>`:
+
+- pad names: `south east west north l r zl zr start back lstick rstick dpad_left dpad_up dpad_right dpad_down` (`zl`, `zr` are the triggers)
+- key names: `a` to `z`, `0` to `9`, `space tab lshift lctrl up down left right mouse_l mouse_r mouse_m`
+- `none` leaves the button unbound.
+
+A line replaces every default of that button, pad and keyboard, so list the keys you still want. Buttons without a line keep the table above. Names are case-insensitive. An invalid entry logs one `input: bind ...` line and is skipped; a line without a valid entry changes nothing. The sticks and the mouse camera are not remappable. The `TOTK_BIND_<button>` environment variables work like any other setting. Bindings are read once at start.
+
+A pad that reports its face buttons swapped (A/B and X/Y, as some GuliKit models do) is fixed with:
+
+```
+bind_A = pad:south, key:E
+bind_B = pad:east, key:lshift
+bind_X = pad:west, key:space
+bind_Y = pad:north, key:mouse_l
+```
 
 ## Mouse camera
 
