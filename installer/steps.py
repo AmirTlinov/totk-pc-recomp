@@ -1,0 +1,625 @@
+"""The six setup steps of docs/installer.md: check, extract, lift, compile, prepare, cleanup.
+
+Extraction runs in this process through tools/extract.py (the package's sibling tools/, which ships with it); lift,
+compile and prepare run the bundled Python on recomp/gen.py, tools/build_game.py, tools/make_romfs_patches.py and
+tools/prepare_shaders.py, whose output goes to <temp>/logs/<step>-<tool>.log and is read for progress. No Win32 call
+here: the host check is a small C program built with the bundled clang (hostcheck.c).
+
+Install folder: exefs/, romfs/ (romfs.bin, index.json), profile/, totk.exe and its DLLs, romfs-index.bin,
+romfs-patches/, totk_xlate.exe, the shader state of totk.exe --prepare-shaders, totk.ini, totk-install.json.
+Temp folder (<temp>/<dest name>-<hash>): check/ (ExeFS of both inputs, the host check), gen/ (C), build/ (objects),
+logs/ (kept by the cleanup).
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+from . import ini
+from .layout import EXE
+from .runner import InstallError, Step
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
+import extract  # noqa: E402
+from extract_exefs import (common_tickets, container_entries, load_keys, nca_ctr_key, nca_inventory,  # noqa: E402
+                           program_nca)
+
+GiB = 1 << 30
+DEST_EXTRA = 4 * GiB      # beside the RomFS: shader and pipeline caches (about 2 GB), exefs, totk.exe, seed files
+TEMP_NEED = 3 * GiB       # generated C (about 0.9 GB) and objects
+UPDATE_VERSION = '1.2.1'
+HOSTCHECK = Path(__file__).resolve().parent / 'hostcheck.c'
+STAMP = '.install-key'
+
+
+# ---- helpers
+
+def file_sha256(path, progress=None):
+    """SHA-256 hex of a file; progress(done, total) after each block."""
+    h = hashlib.sha256()
+    total = path.stat().st_size
+    done = 0
+    with open(path, 'rb', buffering=0) as f:
+        buf = bytearray(8 << 20)
+        view = memoryview(buf)
+        while n := f.readinto(buf):
+            h.update(view[:n])
+            done += n
+            if progress:
+                progress(done, total)
+    return h.hexdigest()
+
+
+def fingerprint(*parts):
+    """SHA-256 over strings and the contents of files and directory trees (a missing path counts as missing)."""
+    h = hashlib.sha256()
+    for p in parts:
+        if isinstance(p, Path):
+            if p.is_dir():
+                for f in sorted(p.rglob('*')):
+                    if f.is_file() and '__pycache__' not in f.parts:
+                        h.update(f.relative_to(p).as_posix().encode() + b'\0' + bytes.fromhex(file_sha256(f)))
+            elif p.is_file():
+                h.update(p.name.encode() + b'\0' + bytes.fromhex(file_sha256(p)))
+            else:
+                h.update(b'missing\0' + p.name.encode())
+        else:
+            h.update(str(p).encode())
+        h.update(b'\1')
+    return h.hexdigest()
+
+
+def remove(path):
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def replace_file(src, dst):
+    """Copy src over dst through a temporary name, so a cancelled copy never leaves half a file under dst's name."""
+    tmp = dst.with_name(dst.name + '.tmp')
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def kill_tree(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
+    else:
+        proc.kill()
+
+
+def run_tool(ctx, step, script, args, parse=None, cwd=None):
+    """Run a tool script with the bundled Python. Its output goes to <temp>/logs/<step>-<script>.log and, line by line,
+    to parse(line). Returns (exit code, log path)."""
+    logs = ctx.temp / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f'{step}-{Path(script).stem}.log'
+    command = [str(ctx.layout.python), '-c', extract.RUN_SCRIPT, str(script), *map(str, args)]
+    ctx.reporter.log('run ' + ' '.join(command[3:]))
+    env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+    with open(log, 'w', encoding='utf-8', newline='\n') as out:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd or ctx.layout.root,
+                                env=env, text=True, encoding='utf-8', errors='replace', bufsize=1)
+        try:
+            for line in proc.stdout:
+                out.write(line)
+                if parse:
+                    parse(line.rstrip())
+            code = proc.wait()
+        except BaseException:
+            kill_tree(proc)
+            raise
+    ctx.reporter.log(f'{Path(script).name}: exit code {code}; output in {log}')
+    return code, log
+
+
+def free_bytes(path):
+    """Free bytes on the disk of path (its nearest existing parent) and that parent's device."""
+    p = Path(path)
+    while not p.exists():
+        p = p.parent
+    return shutil.disk_usage(p).free, os.stat(p).st_dev
+
+
+def expected_update():
+    return extract.load_expected()[UPDATE_VERSION]
+
+
+def shader_list_text(layout):
+    if layout.shader_list:
+        return layout.shader_list.read_text(encoding='utf-8')
+    refs = layout.root / 'refs' / 'MacNativeGames'
+    r = subprocess.run(['git', '-C', str(refs), 'show', 'origin/HEAD:games/totk/assets/shader_list.tsv'],
+                       capture_output=True, encoding='utf-8')
+    if r.returncode:
+        raise InstallError('prepare.shader_list_missing')
+    return r.stdout
+
+
+class Watch(threading.Thread):
+    """Polls a measure() of bytes written while a long call runs and reports it as progress."""
+
+    def __init__(self, reporter, step):
+        super().__init__(daemon=True)
+        self.reporter, self.step = reporter, step
+        self.phase, self.measure, self.total = None, None, None
+        self.stopped = threading.Event()
+
+    def set(self, phase, measure=None, total=None):
+        self.phase, self.measure, self.total = phase, measure, total
+        self.reporter.progress(self.step, phase, 0 if total else None, total, 'bytes' if total else None, force=True)
+
+    def run(self):
+        while not self.stopped.wait(1.0):
+            phase, measure, total = self.phase, self.measure, self.total
+            if phase and measure:
+                try:
+                    done = min(measure(), total)
+                except OSError:
+                    continue
+                self.reporter.progress(self.step, phase, done, total, 'bytes')
+
+    def stop(self):
+        self.stopped.set()
+
+
+def size_of(paths):
+    return sum(p.stat().st_size for p in paths if p.is_file())
+
+
+# ---- 1. check
+
+class Check(Step):
+    id = 'check'
+    always = True
+
+    def run(self, ctx):
+        layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
+        missing = layout.missing()
+        if missing:
+            raise InstallError('check.release_incomplete', paths=missing[:5])
+        if dest.exists() and not dest.is_dir():
+            raise InstallError('check.dest_not_folder', path=str(dest))
+        if ctx.mode == 'install' and dest.is_dir() and any(dest.iterdir()):
+            raise InstallError('check.dest_not_empty', path=str(dest))
+        lang = ctx.options.lang or ctx.state.get('lang')
+        if not lang:
+            raise InstallError('check.lang_missing')
+        if lang not in ini.LANGUAGES:
+            raise InstallError('check.lang_unknown', lang=lang, known=', '.join(ini.LANGUAGES))
+        if lang in ini.NEED_SHARED_FONTS:
+            rep.warning('warn.lang_needs_fonts', lang=lang)
+        ctx.lang = lang
+        ctx.temp.mkdir(parents=True, exist_ok=True)
+
+        rep.progress('check', 'host', force=True)
+        self.host(ctx)
+        rep.progress('check', 'verify', force=True)
+        ctx.verify_kept('check')
+        ncas = 0
+        if ctx.will_run('extract'):
+            rep.progress('check', 'inputs', force=True)
+            ncas = self.inputs(ctx)
+        self.space(ctx, ncas)
+        if ctx.will_run('extract'):
+            rep.progress('check', 'versions', force=True)
+            self.versions(ctx)
+        return {}
+
+    def host(self, ctx):
+        layout, work = ctx.layout, ctx.temp / 'check'
+        work.mkdir(parents=True, exist_ok=True)
+        exe = work / ('hostcheck' + EXE)
+        command = [str(layout.clang), '-O1', str(HOSTCHECK), '-I', str(layout.deps / 'include'), '-o', str(exe)]
+        if os.name != 'nt':
+            command.append('-ldl')
+        r = subprocess.run(command, capture_output=True, text=True, errors='replace')
+        if r.returncode:
+            ctx.reporter.log(r.stdout + r.stderr)
+            raise InstallError('check.toolchain_broken', detail=(r.stderr or r.stdout).strip()[-400:])
+        r = subprocess.run([str(exe)], capture_output=True, text=True, errors='replace')
+        try:
+            host = json.loads(r.stdout)
+        except ValueError:
+            raise InstallError('check.host_probe_failed', code=r.returncode) from None
+        ctx.reporter.log(f'host: {r.stdout.strip()}')
+        if not host['x86_64_v3']:
+            raise InstallError('check.cpu_no_avx2')
+        if not host['loader']:
+            raise InstallError('check.vulkan_missing')
+        devices = host['devices']
+        if not devices:
+            raise InstallError('check.vulkan_no_device')
+        if not any(tuple(d['api'][:2]) >= (1, 3) for d in devices):
+            raise InstallError('check.vulkan_too_old',
+                               devices=', '.join(f'{d["name"]} ({d["api"][0]}.{d["api"][1]})' for d in devices))
+        ctx.host = host
+
+    def inputs(self, ctx):
+        """Open both files with the keys as the extraction will. Returns the bytes of both Program NCAs."""
+        o = ctx.options
+        for name in ('base', 'update', 'keys'):
+            path = getattr(o, name)
+            if not path:
+                raise InstallError('check.inputs_needed')
+            if not Path(path).is_file():
+                raise InstallError('check.input_missing', input=name, path=str(path))
+        try:
+            keys = load_keys(Path(o.keys))
+        except (ValueError, OSError, UnicodeDecodeError):
+            raise InstallError('check.keys_unreadable') from None
+        if 'header_key' not in keys:
+            raise InstallError('check.keys_no_header_key')
+        total = 0
+        for name, is_update in (('base', False), ('update', True)):
+            path = Path(getattr(o, name))
+            with path.open('rb') as f:
+                total += self.open_input(f, path.stat().st_size, keys, name, is_update)
+        del keys
+        return total
+
+    @staticmethod
+    def open_input(f, size, keys, name, is_update):
+        try:
+            kind, entries = container_entries(f, size)
+        except ValueError:
+            raise InstallError('check.not_game_file', input=name) from None
+        if is_update and kind != 'nsp':
+            raise InstallError('check.update_not_nsp')
+        try:
+            tickets = common_tickets(f, entries)
+        except ValueError as e:
+            if 'Personalized' in str(e):
+                raise InstallError('check.ticket_personalized', input=name) from None
+            raise InstallError('check.file_unreadable', input=name, detail=str(e)) from None
+        try:
+            records = nca_inventory(f, entries, keys)
+        except ValueError as e:
+            if 'NCA3' in str(e):
+                raise InstallError('check.keys_wrong', input=name) from None
+            raise InstallError('check.file_unreadable', input=name, detail=str(e)) from None
+        try:
+            record, header = program_nca(records, update=is_update)
+        except ValueError as e:
+            if is_update and 'BKTR' in str(e):
+                raise InstallError('check.update_is_base') from None
+            raise InstallError('check.update_not_totk' if is_update else 'check.base_not_totk', detail=str(e)) from None
+        try:
+            nca_ctr_key(header, keys, tickets)
+        except ValueError as e:
+            if 'ticket' in str(e):
+                raise InstallError('check.ticket_missing', input=name) from None
+            raise InstallError('check.keys_too_old', input=name,
+                               generation=max(header[0x206], header[0x220])) from None
+        return record['size']
+
+    def space(self, ctx, ncas):
+        dest_need = temp_need = 0
+        if ctx.will_run('extract'):
+            dest_need += expected_update()['romfs']['size'] + ncas
+            romfs = ctx.dest / 'romfs' / 'romfs.bin'
+            if romfs.is_file():   # a resumed extraction replaces it
+                dest_need -= romfs.stat().st_size
+        if ctx.will_run('prepare') or ctx.will_run('extract'):
+            dest_need += DEST_EXTRA
+        if ctx.will_run('lift') or ctx.will_run('compile'):
+            temp_need += TEMP_NEED
+        dest_free, dest_dev = free_bytes(ctx.dest)
+        temp_free, temp_dev = free_bytes(ctx.temp)
+        ctx.reporter.log(f'space: install folder needs {dest_need / GiB:.1f} GiB of {dest_free / GiB:.1f} free, '
+                         f'temp folder {temp_need / GiB:.1f} GiB of {temp_free / GiB:.1f}')
+        if dest_dev == temp_dev:
+            dest_need += temp_need
+            temp_need = 0
+        for path, need, free in ((ctx.dest, dest_need, dest_free), (ctx.temp, temp_need, temp_free)):
+            if need > free:
+                raise InstallError('check.disk_space', path=str(path), need_gb=round(need / 1e9, 1),
+                                   free_gb=round(free / 1e9, 1))
+
+    def versions(self, ctx):
+        """Extract both ExeFS into the temp folder (verifying every block) and identify the versions by hash."""
+        o, work = ctx.options, ctx.temp / 'check'
+        logs = ctx.temp / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        versions = extract.load_expected()
+        for name, is_update in (('base', False), ('update', True)):
+            out = work / name
+            remove(out)
+            try:
+                extract.extract_exefs(Path(getattr(o, name)), Path(o.keys), out, logs, update=is_update)
+            except ValueError:
+                raise InstallError('check.exefs_failed', input=name, log=str(logs / f'extract_exefs-{name}.log')) \
+                    from None
+        problems = extract.exefs_problems(work / 'base' / 'exefs', versions['1.0.0'])
+        if problems:
+            raise InstallError('check.base_wrong_version', modules=', '.join(problems))
+        try:
+            found = extract.identify_update(work / 'update' / 'exefs', versions)['display_version']
+        except ValueError:
+            found = 'unknown'
+        if found != UPDATE_VERSION:
+            raise InstallError('check.update_wrong_version', found=found, wanted=UPDATE_VERSION)
+
+
+# ---- 2. extract
+
+class Extract(Step):
+    id = 'extract'
+
+    def key(self, ctx):
+        # The output is whatever matches the expected hashes, whichever files and tools produced it.
+        return fingerprint('extract-1', ctx.layout.expected)
+
+    def current(self, ctx, record):
+        expected = expected_update()
+        romfs = ctx.dest / 'romfs'
+        if extract.exefs_problems(ctx.dest / 'exefs', expected) or not extract.romfs_verified(romfs, expected):
+            return False
+        st = (romfs / 'romfs.bin').stat()
+        return st.st_size == record.get('romfs_size') and st.st_mtime_ns == record.get('romfs_mtime_ns')
+
+    def verify(self, ctx, record):
+        image = ctx.dest / 'romfs' / 'romfs.bin'
+        rep = ctx.reporter
+        digest = file_sha256(image, lambda d, t: rep.progress('check', 'verify_romfs', d, t, 'bytes'))
+        return digest == expected_update()['romfs']['sha256']
+
+    def run(self, ctx):
+        o, dest, rep = ctx.options, ctx.dest, ctx.reporter
+        expected = expected_update()
+        base, update, keys = Path(o.base), Path(o.update), Path(o.keys)
+        inputs = {}
+        for name, path in (('base', base), ('update', update)):
+            known = ctx.state['inputs'].get(name, {})
+            st = path.stat()
+            if known.get('size') == st.st_size and known.get('mtime_ns') == st.st_mtime_ns and known.get('sha256'):
+                inputs[name] = known
+                continue
+            digest = file_sha256(path, lambda d, t, n=name: rep.progress('extract', 'hash_' + n, d, t, 'bytes'))
+            inputs[name] = {'name': path.name, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns, 'sha256': digest}
+        ctx.state['inputs'] = inputs
+        ctx.save()
+
+        dest.mkdir(parents=True, exist_ok=True)
+        for stale in dest.glob('update-merge-*'):   # a killed merge leaves its NCA copies (and key copies) behind
+            remove(stale)
+        rep.progress('extract', 'exefs', force=True)
+        staged = ctx.temp / 'check' / 'update' / 'exefs'
+        if not staged.is_dir():
+            remove(ctx.temp / 'check' / 'update')
+            try:
+                extract.extract_exefs(update, keys, ctx.temp / 'check' / 'update', ctx.temp / 'logs', update=True)
+            except ValueError:
+                raise InstallError('check.exefs_failed', input='update',
+                                   log=str(ctx.temp / 'logs' / 'extract_exefs-update.log')) from None
+        remove(dest / 'exefs')
+        shutil.move(staged, dest / 'exefs')
+        problems = extract.exefs_problems(dest / 'exefs', expected)
+        if problems:
+            raise InstallError('extract.exefs_mismatch', modules=', '.join(problems))
+        if extract.sha256(dest / 'exefs' / 'main.npdm') != expected['exefs_sha256']['main.npdm']:
+            rep.warning('warn.npdm_differs')
+
+        romfs = dest / 'romfs'
+        if not extract.romfs_verified(romfs, expected):
+            self.merge(ctx, base, update, keys, romfs, expected)
+        report = json.loads((romfs / 'index.json').read_text())
+        if report['romfs_size'] != expected['romfs']['size'] or report['romfs_sha256'] != expected['romfs']['sha256']:
+            raise InstallError('extract.romfs_mismatch', size=report['romfs_size'], sha256=report['romfs_sha256'][:16])
+        (dest / 'profile').mkdir(exist_ok=True)
+        st = (romfs / 'romfs.bin').stat()
+        return {'romfs_size': st.st_size, 'romfs_mtime_ns': st.st_mtime_ns}
+
+    def merge(self, ctx, base, update, keys, romfs, expected):
+        dest, logs = ctx.dest, ctx.temp / 'logs'
+        ncas = extract.merge_space(base, update, keys)
+        watch = Watch(ctx.reporter, 'extract')
+
+        def phase(name):
+            if name == 'copy':
+                watch.set('copy', lambda: size_of(dest.glob('update-merge-*/*.nca')), ncas)
+            elif name == 'merge':
+                watch.set('merge', lambda: size_of(dest.glob('update-merge-*/result/romfs.bin')),
+                          expected['romfs']['size'])
+            else:
+                watch.set(name)
+
+        watch.start()
+        try:
+            extract.merge_update_romfs(base, update, keys, ctx.layout.hactool, romfs, logs, phase=phase)
+        except ValueError as e:
+            raise InstallError('extract.romfs_merge_failed', detail=str(e), log=str(logs / 'merge_romfs-'
+                                                                                     f'{dest.name}.log')) from None
+        finally:
+            watch.stop()
+
+
+# ---- 3. lift
+
+EMITTED = re.compile(r'^emitted (\d+)/(\d+) chunks')
+DISCOVERED = re.compile(r'^(\w+): \d+ functions \(.*discovery')
+
+
+class Lift(Step):
+    id = 'lift'
+    transient = True
+
+    def key(self, ctx):
+        return fingerprint('lift-1', ctx.keys['extract'], ctx.layout.recomp, ctx.layout.patches)
+
+    def current(self, ctx, record):
+        gen = ctx.temp / 'gen'
+        stamp = gen / STAMP
+        return (gen / 'layout.json').is_file() and stamp.is_file() and stamp.read_text().strip() == ctx.keys['lift']
+
+    def run(self, ctx):
+        layout, rep, gen = ctx.layout, ctx.reporter, ctx.temp / 'gen'
+        remove(gen)
+        rep.progress('lift', 'discover', force=True)
+
+        def parse(line):
+            m = EMITTED.match(line)
+            if m:
+                rep.progress('lift', 'emit', int(m.group(1)), int(m.group(2)), 'chunks')
+
+        code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py',
+                             ['--exefs', ctx.dest / 'exefs', '--out', gen, '--patches', layout.patches], parse)
+        if code:
+            raise InstallError('lift.failed', code=code, log=str(log))
+        (gen / STAMP).write_text(ctx.keys['lift'] + '\n')
+        return {}
+
+
+# ---- 4. compile
+
+NINJA_LINE = re.compile(r'^\[(\d+)/(\d+)\] ')
+
+
+class Compile(Step):
+    id = 'compile'
+
+    def key(self, ctx):
+        layout = ctx.layout
+        clang = subprocess.run([str(layout.clang), '--version'], capture_output=True, text=True).stdout
+        tools = [layout.tools / n for n in ('build_game.py', 'romfs_index.py', 'check_content.py')]
+        return fingerprint('compile-1', ctx.keys['lift'], layout.runtime, layout.runtime_lib, layout.deps, *tools,
+                           clang, *[d.name for d in layout.dlls])
+
+    def current(self, ctx, record):
+        exe = ctx.dest / ('totk' + EXE)
+        if not exe.is_file() or not (ctx.dest / 'romfs-index.bin').is_file():
+            return False
+        if not all((ctx.dest / d.name).is_file() for d in ctx.layout.dlls):
+            return False
+        return file_sha256(exe) == record.get('exe_sha256')
+
+    def run(self, ctx):
+        layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
+        build = ctx.temp / 'build'
+        phase = ['compile']
+
+        def parse(line):
+            m = NINJA_LINE.match(line)
+            if m:
+                rep.progress('compile', phase[0], int(m.group(1)), int(m.group(2)), 'objects')
+            elif line.startswith('compile: '):
+                phase[0] = 'link'
+                rep.progress('compile', 'link', force=True)
+
+        rep.progress('compile', 'compile', force=True)
+        code, log = run_tool(ctx, 'compile', layout.tools / 'build_game.py', [
+            '--gen', ctx.temp / 'gen', '--out', build, '--toolchain', layout.llvm, '--deps', layout.deps,
+            '--runtime', layout.runtime, '--runtime-lib', layout.runtime_lib, '--ninja', layout.ninja,
+            '--expected', layout.expected, '--exefs', dest / 'exefs', '--romfs', dest / 'romfs',
+            '--profile', dest / 'profile'], parse)
+        exe = build / ('totk' + EXE)
+        if code or not exe.is_file():
+            raise InstallError('compile.failed', code=code, log=str(log))
+        try:
+            replace_file(exe, dest / exe.name)
+        except PermissionError:
+            raise InstallError('compile.exe_in_use', path=str(dest / exe.name)) from None
+        replace_file(build / 'romfs-index.bin', dest / 'romfs-index.bin')
+        for dll in layout.dlls:
+            replace_file(dll, dest / dll.name)
+        return {'exe_sha256': file_sha256(dest / exe.name)}
+
+
+# ---- 5. prepare
+
+TRANSLATED = re.compile(r'gfx_shader: prepare: (\d+) of (\d+) pairs')
+
+
+class Prepare(Step):
+    id = 'prepare'
+
+    def key(self, ctx):
+        layout = ctx.layout
+        xlate_id = layout.xlate.with_suffix('.id')
+        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py')]
+        return fingerprint('prepare-1', ctx.keys['compile'], layout.xlate, xlate_id, shader_list_text(layout), *tools)
+
+    def current(self, ctx, record):
+        dest = ctx.dest
+        xlate = dest / ctx.layout.xlate.name
+        return ((dest / 'shader-prepared.bin').is_file() and (dest / 'romfs-patches' / 'manifest.tsv').is_file()
+                and xlate.is_file() and file_sha256(xlate) == record.get('xlate_sha256'))
+
+    def run(self, ctx):
+        layout, rep, dest = ctx.layout, ctx.reporter, ctx.dest
+        xlate = dest / layout.xlate.name
+        if xlate.is_file() and file_sha256(xlate) != file_sha256(layout.xlate):
+            # Another translator: its cache keys differ, so the old translations would only take space.
+            for name in ('shader-cache', 'shader-prepared.bin'):
+                remove(dest / name)
+        replace_file(layout.xlate, xlate)
+        xlate_id = layout.xlate.with_suffix('.id')
+        if xlate_id.is_file():
+            replace_file(xlate_id, xlate.with_suffix('.id'))
+        else:
+            remove(xlate.with_suffix('.id'))
+
+        rep.progress('prepare', 'romfs_patches', force=True)
+        remove(dest / 'romfs-patches')
+        code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
+                             ['--romfs', dest / 'romfs', '--out', dest / 'romfs-patches'])
+        if code:
+            raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
+
+        shader_list = layout.shader_list
+        if not shader_list:
+            shader_list = ctx.temp / 'shader_list.tsv'
+            shader_list.write_text(shader_list_text(layout), encoding='utf-8', newline='\n')
+
+        def parse(line):
+            m = TRANSLATED.search(line)
+            if m:
+                rep.progress('prepare', 'translate', int(m.group(1)), int(m.group(2)), 'shaders')
+            elif 'listed variants' in line:
+                rep.progress('prepare', 'translate', force=True)
+            elif 'gfx_shader: prepare:' in line and 'translated' in line and 'programs' in line:
+                rep.progress('prepare', 'libraries', force=True)
+
+        rep.progress('prepare', 'seed', force=True)
+        code, log = run_tool(ctx, 'prepare', layout.tools / 'prepare_shaders.py',
+                             [dest, '--romfs', dest / 'romfs', '--exefs', dest / 'exefs', '--list', shader_list], parse)
+        if code or not (dest / 'shader-prepared.bin').is_file():
+            raise InstallError('prepare.shaders_failed', code=code, log=str(log))
+        return {'xlate_sha256': file_sha256(xlate)}
+
+
+# ---- 6. clean up
+
+class Cleanup(Step):
+    id = 'cleanup'
+    always = True
+
+    def run(self, ctx):
+        rep, dest = ctx.reporter, ctx.dest
+        rep.progress('cleanup', 'ini', force=True)
+        try:
+            ini.write(dest, ctx.lang, ctx.layout.ini_example)
+        except OSError as e:
+            raise InstallError('cleanup.ini_failed', detail=str(e)) from None
+        ctx.state['lang'] = ctx.lang
+        (dest / 'profile').mkdir(exist_ok=True)
+        rep.progress('cleanup', 'temp', force=True)
+        for stale in dest.glob('update-merge-*'):
+            remove(stale)
+        for name in ('gen', 'build', 'check', 'shader_list.tsv'):
+            remove(ctx.temp / name)
+        return {}
+
+
+def all_steps():
+    return [Check(), Extract(), Lift(), Compile(), Prepare(), Cleanup()]

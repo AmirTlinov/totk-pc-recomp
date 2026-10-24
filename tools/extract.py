@@ -9,7 +9,9 @@ Steps, each skipped when its verified output already exists:
 Steps 1 and 3 run for every file in `input.updates`. Each update's version is identified by the SHA-256 of its `main`,
 not by its file name. Output: build/extracted/v0/{exefs,romfs} and build/extracted/v<version>/{exefs,romfs}.
 
-Runs under .venv-py314. Key values are read by the tools from the keys file and never printed.
+--base, --update, --keys and --work name the files and the output directory instead of the config (the installer
+imports the functions instead). Runs under .venv-py314. Key values are read by the tools from the keys file and never
+printed.
 """
 import argparse
 import hashlib
@@ -45,6 +47,11 @@ def say(message):
     print(message, flush=True)
 
 
+def shown(path):
+    """path relative to the repository when it is below it (log lines), else as given."""
+    return path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+
+
 def sha256(path):
     with path.open('rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
@@ -72,7 +79,7 @@ def run_logged(command, log):
     args = [str(c) for c in command]
     with log.open('w') as out:
         code = subprocess.run([args[0], '-c', RUN_SCRIPT, *args[1:]], stdout=out, stderr=subprocess.STDOUT).returncode
-    require(code == 0, f'{Path(command[1]).name} failed; see {log.relative_to(ROOT)}')
+    require(code == 0, f'{Path(command[1]).name} failed; see {shown(log)}')
 
 
 def exefs_problems(exefs, expected):
@@ -132,13 +139,9 @@ def extract_base_romfs(out, keys, logs):
                 '--manifest', out / 'extraction-manifest.json', '--output', romfs], logs / 'extract_romfs-v0.log')
 
 
-def merge_update_romfs(base, update, keys_path, hactool, output, logs):
-    """extract_update_romfs.merge() without its Darwin-only bounded view of the base: the base Program NCA is copied out.
-
-    Needs room for both Program NCAs (about 17 GB together) and the merged image (about 17 GB).
-    """
-    if output.exists():
-        shutil.rmtree(output)
+def program_ncas(base, update, keys_path):
+    """(tickets, [(source, record, header)] of the base and the update Program NCA). Raises ValueError for a file
+    that is no TotK base game or update, or keys that cannot open it."""
     keys = load_keys(keys_path)
     tickets = {}
     inputs = []
@@ -153,6 +156,28 @@ def merge_update_romfs(base, update, keys_path, hactool, output, logs):
             rights = header[0x230:0x240]
             require(rights == bytes(16) or rights in tickets, 'Missing common ticket')
             inputs.append((source, record, header))
+    return tickets, inputs
+
+
+def merge_space(base, update, keys_path):
+    """Bytes merge_update_romfs needs free next to its output, beyond the merged image itself: the two Program NCAs."""
+    _, inputs = program_ncas(base, update, keys_path)
+    return inputs[0][1]['size'] + inputs[1][1]['size']
+
+
+MERGE_PHASES = {'copy': '  copying the base and update Program NCAs', 'merge': '  merging with hactool',
+                'index': '  hashing and indexing the merged image'}
+
+
+def merge_update_romfs(base, update, keys_path, hactool, output, logs, phase=lambda name: say(MERGE_PHASES[name])):
+    """extract_update_romfs.merge() without its Darwin-only bounded view of the base: the base Program NCA is copied out.
+
+    Needs room for both Program NCAs (about 17 GB together) and the merged image (about 17 GB). phase(name) is called
+    as each part of MERGE_PHASES starts.
+    """
+    if output.exists():
+        shutil.rmtree(output)
+    tickets, inputs = program_ncas(base, update, keys_path)
     sections = [i for i in range(4) if inputs[1][2][0x400 + i * 512 + 4] == 4]
     require(len(sections) == 1, 'Expected one BKTR section')
     need = inputs[0][1]['size'] + inputs[1][1]['size'] + 18 * (1 << 30)
@@ -167,13 +192,13 @@ def merge_update_romfs(base, update, keys_path, hactool, output, logs):
                 f.write(f'{rights.hex()} = {key.hex()}\n')
         hactool_keys = tmp / 'hactool.keys'
         hactool_prod_keys(keys_path, hactool_keys)
-        say('  copying the base and update Program NCAs')
+        phase('copy')
         base_nca, update_nca = tmp / 'base.nca', tmp / 'update.nca'
         for (source, record, _), target in zip(inputs, (base_nca, update_nca)):
             copy_range(source, record_offset(record), record['size'], target)
         result = tmp / 'result'
         result.mkdir()
-        say('  merging with hactool')
+        phase('merge')
         command = [str(hactool), '-x', '-y', '--disablekeywarns', '--suppresskeys', '-k', str(hactool_keys),
                    f'--basenca={base_nca}', f'--section{sections[0]}={result / "romfs.bin"}', str(update_nca)]
         environment = dict(os.environ, MNG_TITLE_KEYS=str(title_keys))
@@ -182,10 +207,10 @@ def merge_update_romfs(base, update, keys_path, hactool, output, logs):
         log_path.write_text(log)
         checked = '\n'.join(line for line in log.splitlines() if not UNSIGNED.match(line))
         require(completed.returncode == 0 and not HACTOOL_ERROR.search(checked),
-                f'hactool merge failed; see {log_path.relative_to(ROOT)}')
+                f'hactool merge failed; see {shown(log_path)}')
         require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)), 'hactool did not verify all six IVFC levels')
         image = result / 'romfs.bin'
-        say('  hashing and indexing the merged image')
+        phase('index')
         files = index_romfs(image)
         report = dict(status='pass', romfs_size=image.stat().st_size, romfs_sha256=sha256(image), files=files,
                       integrity='BKTR merge; all six IVFC levels verified')
@@ -197,12 +222,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', type=Path, default=ROOT / 'config.local.toml')
     parser.add_argument('--hactool', type=Path, default=ROOT / 'toolchain' / 'hactool' / 'hactool.exe')
+    parser.add_argument('--base', type=Path, help='base game (default: input.base of the config)')
+    parser.add_argument('--update', type=Path, action='append',
+                        help='an update NSP, repeatable (default: input.updates of the config)')
+    parser.add_argument('--keys', type=Path, help='prod.keys (default: input.keys of the config)')
+    parser.add_argument('--work', type=Path, help='output directory with extracted/ and logs/ (default: work.dir of '
+                                                  'the config, else build)')
     args = parser.parse_args()
 
-    config = tomllib.loads(args.config.read_text(encoding='utf-8'))
-    base, keys = Path(config['input']['base']), Path(config['input']['keys'])
-    updates = config['input'].get('updates', [])
-    work = ROOT / config.get('work', {}).get('dir', 'build')
+    config = {}
+    if not (args.base and args.keys and args.update and args.work):
+        config = tomllib.loads(args.config.read_text(encoding='utf-8'))
+    given = config.get('input', {})
+    base, keys = args.base or Path(given['base']), args.keys or Path(given['keys'])
+    updates = args.update or given.get('updates', [])
+    work = args.work or ROOT / config.get('work', {}).get('dir', 'build')
     extracted, logs = work / 'extracted', work / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
     versions = load_expected()

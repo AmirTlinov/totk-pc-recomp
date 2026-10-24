@@ -39,7 +39,8 @@ of its processes (Windows job object accounting: committed private bytes).
 --toolchain DIR builds with an llvm-mingw tree (DIR/bin/clang.exe) instead of MSYS2 UCRT64 clang. Ninja still comes
 from MSYS2. The libraries and headers MSYS2 supplies (Vulkan, SDL3, Opus, libvpx, VMA) then come from --deps DIR
 (default toolchain/deps-mingw: include/, lib/ with the import libraries and libvpx.a, bin/ with the DLLs), and the C++
-runtime is libc++ from llvm-mingw. Such a build never reuses another build's generated objects.
+runtime is libc++ from llvm-mingw. Such a build never reuses another build's generated objects. --ninja PATH names
+another Ninja (the installer's bundled one).
 
 Split build. --make-runtime-lib compiles only runtime/ into <out>/libtotkrt.a (what CI prebuilds). --runtime-lib PATH
 then compiles only the generated C and the install-time files (modules.c and INSTALL_SIDE, which bake the player's
@@ -543,6 +544,7 @@ def mib(n):
 
 
 def main():
+    global CLANG, AR, TOOLCHAIN_BIN, DEPS, NINJA
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--version', default='v121', help='game version (default v121)')
     ap.add_argument('--gen', type=Path, help='generated C directory (default generated/<version>)')
@@ -571,6 +573,7 @@ def main():
                                                     f'({", ".join(sorted(INSTALL_SIDE))} and modules.c still compile)')
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
+    ap.add_argument('--ninja', type=Path, help=f'ninja.exe to run (default {NINJA})')
     args = ap.parse_args()
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
@@ -585,7 +588,7 @@ def main():
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
         expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
-    global CLANG, AR, TOOLCHAIN_BIN, DEPS
+    NINJA = (args.ninja or NINJA).resolve()
     dlls = SDL3_DLLS
     if args.toolchain:
         TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
