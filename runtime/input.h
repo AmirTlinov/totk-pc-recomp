@@ -19,6 +19,7 @@ void input_block(int on);
 // releases the cursor around an F11 window change, (0) captures it again once the client area has its new size.
 #ifdef _WIN32
 int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
+int input_cursor_released(void);   // Esc or a non-client activation released the cursor (probe)
 #endif
 void input_cursor_suspend(int on);
 
