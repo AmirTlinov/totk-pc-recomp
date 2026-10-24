@@ -59,7 +59,7 @@ python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR
 
 - On a folder with `totk-install.json` only `--dest` is needed; the game files only when the extraction must run again.
 - stdout: one JSON event per line, types `start`, `plan`, `step` (started, done, skipped), `progress` (step, phase,
-  done/total/unit), `warning`, `error`, `end` (`installer/events.py`). Messages are ids with parameters;
+  done/total/unit), `space` (bytes needed and free on the install disk and the temp disk), `warning`, `error`, `end` (`installer/events.py`). Messages are ids with parameters;
   `installer/text/en.json` holds their English text. The human-readable log goes to `<temp>/logs/`.
 - Exit codes: 0 done, 1 failed, 2 bad command line, 3 cancelled. The window cancels with Ctrl+Break to the
   installer's process group.
@@ -67,6 +67,13 @@ python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR
   resume and update are one rule; output kept from another release is re-hashed first.
 - Peak space on the install disk is about 36 GiB, not 22: the extraction copies both Program NCAs (16.3 GiB) next to
   the merged RomFS (15.9 GiB) before it deletes them. The check computes the exact figure.
+- Window (`python -m installer.gui`, `installer/gui.py` draws, `installer/guilogic.py` decides): form, step list with
+  progress, space line, collapsible log, Cancel (Ctrl+Break to the CLI's process group, then it waits for the exit),
+  finish screen with Open folder. English or Russian, chosen from the Windows display language, switchable in the
+  window; every sentence is an id in `installer/text/<en|ru>.json`. A folder with `totk-install.json` needs only the
+  folder. `--selftest [--shots DIR]` builds every screen in both languages and closes itself.
+- `tests/installer_gui_test.py`: event model, form, catalogs, cancel, the self-closing window and one end-to-end run
+  of the CLI in `--verify` mode (needs `build/install-test` and `build/extracted/v121`; see its docstring).
 - `tests/installer_test.py`: bookkeeping with fake steps. `tests/installer_e2e.py`: a dev-mode run with the files of
   `config.local.toml`.
 
@@ -75,7 +82,7 @@ python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR
 The unpacked release; `tools/make_release.py` assembles it, CI zips it:
 
 ```
-TotK-Setup.exe        starts python/pythonw.exe -m installer (a small launcher)
+TotK-Setup.exe        starts python/pythonw.exe -m installer.gui (installer/launcher/launcher.c, no console)
 installer/            the installer: steps, CLI, window, en/ru text catalog
 python/               Python 3.14.9 embeddable + numpy, lz4, cryptography, cffi, pycparser (+ tkinter for the window)
 recomp/, tools/       the lifter and the build, extraction and shader scripts the steps run (copied from the repo)
@@ -84,6 +91,7 @@ runtime/              libtotkrt.a and the headers the generated code and modules
 bin/                  totk_xlate.exe, hactool.exe, SDL3.dll, libopus-0.dll, ninja.exe
 data/                 shader_list.tsv (MacNativeGames, MIT)
 THIRD_PARTY_NOTICES.md
+totk.ini.example, VERSION  the default ini; the release string (git describe of the build)
 ```
 
 - SDL3 comes from the upstream release, not MSYS2: MSYS2's DLL imports the LGPL libiconv.
