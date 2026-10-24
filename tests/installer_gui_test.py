@@ -3,13 +3,14 @@
     .venv-py314\\Scripts\\python tests\\installer_gui_test.py
 
 The end-to-end test runs the real CLI in --verify mode on a finished install (every step skips) and folds its events
-through the same code the window uses. The install is build/inst-gui/e2e-install: hard links to build/install-test, so
+through the same code the window uses (the fixture's step keys are recomputed for the checkout under test, because the keys fingerprint recomp/, tools/ and runtime/). The install is build/inst-gui/e2e-install: hard links to build/install-test, so
 nothing there is written, except the state file and totk.ini, which a run rewrites and which are copied. The run hashes
 the 17 GB RomFS; it is skipped when the hash differs from the expected one in all three tries. On the developer machine
 (RAM with a bad bit) a buffered read of a file sometimes returns flipped bits from the page cache while the file on
 disk is intact (an unbuffered read of install-test's romfs.bin gives the expected hash), so such a skip is the machine,
 not the installer. It is also skipped when build/install-test is absent.
 """
+import io
 import json
 import os
 import queue
@@ -21,10 +22,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from installer import layout as layouts  # noqa: E402
 from installer import state as statefile  # noqa: E402
+from installer.events import Reporter  # noqa: E402
+from installer.runner import Context  # noqa: E402
+from installer.steps import all_steps  # noqa: E402
 from installer.guilogic import (DONE, FAILED, PENDING, RUNNING, SKIPPED, Catalog, Form, Model, Process,  # noqa: E402
                                 amount, describe_event, parse_line, windows_ui_language)
 
@@ -309,19 +315,28 @@ class SmokeTest(unittest.TestCase):
 
 
 def make_fixture():
-    """build/inst-gui/e2e-install: links to install-test (see the module docstring); rebuilt when absent."""
-    if (FIXTURE / statefile.NAME).is_file():
-        return FIXTURE
-    shutil.rmtree(FIXTURE, ignore_errors=True)
-    for folder, _dirs, files in os.walk(INSTALLED):
-        target = FIXTURE / Path(folder).relative_to(INSTALLED)
-        target.mkdir(parents=True, exist_ok=True)
-        for name in files:
-            src, dst = Path(folder) / name, target / name
-            if name in COPIED and target == FIXTURE:
-                shutil.copy2(src, dst)
-            else:
-                os.link(src, dst)
+    """build/inst-gui/e2e-install: links to install-test (see the module docstring), with the step keys of the state
+    set to the ones this checkout computes, so the install counts as current for it."""
+    if not (FIXTURE / statefile.NAME).is_file():
+        shutil.rmtree(FIXTURE, ignore_errors=True)
+        for folder, _dirs, files in os.walk(INSTALLED):
+            target = FIXTURE / Path(folder).relative_to(INSTALLED)
+            target.mkdir(parents=True, exist_ok=True)
+            for name in files:
+                src, dst = Path(folder) / name, target / name
+                if name in COPIED and target == FIXTURE:
+                    shutil.copy2(src, dst)
+                else:
+                    os.link(src, dst)
+    layout = layouts.find(ROOT)
+    state = statefile.load(FIXTURE)
+    options = SimpleNamespace(base=None, update=None, keys=None, lang=None)
+    ctx = Context(layout, FIXTURE, ROOT / 'build' / 'inst-gui' / 'e2e-temp', Reporter(out=io.StringIO()), options, state=state)
+    ctx.steps = all_steps()
+    ctx.plan()
+    for step_id, record in state['steps'].items():
+        record['key'] = ctx.keys[step_id]
+    statefile.save(FIXTURE, state)
     return FIXTURE
 
 
