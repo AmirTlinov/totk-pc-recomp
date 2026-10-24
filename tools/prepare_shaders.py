@@ -16,8 +16,9 @@ pipeline once, so the GPU driver's own disk cache holds them (vk_pipeline.c "sta
 a 12-core machine (inventory 1, translation 3, library builds 0.6) and 1.3 GB of shader cache; the seed files can be
 deleted afterwards.
 
-Game-derived output stays in the build directory (ignored). The list is read from refs/ at preparation time; nothing
-of it is copied into the repository. Needs Python 3.14 (compression.zstd), so run it in .venv-py314:
+Game-derived output stays in the build directory (ignored). The list is read at preparation time from tools/data/shader_list.tsv when that file exists (the installer archive
+bundles it; it stays out of the repository), else from refs/ through git; nothing of it is copied into the
+repository. Needs Python 3.14 (compression.zstd), so run it in .venv-py314 or the embeddable 3.14:
 
     .venv-py314\\Scripts\\python tools\\prepare_shaders.py build\\v121 [--version v121] [--list <tsv>] [--no-run]
 """
@@ -50,9 +51,14 @@ CONTROL = 0x880
 ANS_REC = 4 + 32 + 32 + 147 + 1
 
 
+BUNDLED_LIST = ROOT / 'tools' / 'data' / 'shader_list.tsv'   # the installer archive carries a copy (no git, no refs/)
+
+
 def read_list(path):
     if path:
         return Path(path).read_text(encoding='utf-8')
+    if BUNDLED_LIST.is_file():
+        return BUNDLED_LIST.read_text(encoding='utf-8')
     return subprocess.run(['git', '-C', str(ROOT / 'refs' / 'MacNativeGames'), 'show', ':'.join(LIST_REF)],
                           check=True, capture_output=True, encoding='utf-8').stdout
 
@@ -111,7 +117,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('build', type=Path, help='build directory holding totk.exe (build\\v121)')
     ap.add_argument('--version', default='v121', help='build/extracted/<version>')
-    ap.add_argument('--list', help='a shader_list.tsv instead of the one in refs/MacNativeGames')
+    ap.add_argument('--list', help='a shader_list.tsv instead of tools/data/shader_list.tsv or refs/MacNativeGames')
     ap.add_argument('--no-run', action='store_true', help='write the seed files only')
     a = ap.parse_args()
     t0 = time.monotonic()

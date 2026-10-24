@@ -62,9 +62,16 @@ def version_dir(expected):
     return 'v0' if expected['version'] == 0 else 'v' + expected['display_version'].replace('.', '')
 
 
+# The embeddable Python (a ._pth file) does not put a script's directory on sys.path, so a vendored script that imports
+# its siblings fails when started by path. This stub adds the directory, then runs the script as __main__.
+RUN_SCRIPT = ('import os, runpy, sys; p = sys.argv[1]; sys.path.insert(0, os.path.dirname(p)); sys.argv = sys.argv[1:]; '
+              "runpy.run_path(p, run_name='__main__')")
+
+
 def run_logged(command, log):
+    args = [str(c) for c in command]
     with log.open('w') as out:
-        code = subprocess.run([str(c) for c in command], stdout=out, stderr=subprocess.STDOUT).returncode
+        code = subprocess.run([args[0], '-c', RUN_SCRIPT, *args[1:]], stdout=out, stderr=subprocess.STDOUT).returncode
     require(code == 0, f'{Path(command[1]).name} failed; see {log.relative_to(ROOT)}')
 
 
