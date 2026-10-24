@@ -35,7 +35,8 @@ release that changes nothing game-derived skips the rebuild.
 ## Setup steps
 
 1. **Check** before writing anything: the files open with the keys, the update is 1.2.1 (by hash, as
-   `tools/extract.py`), the keys are new enough for the update, about 22 GB is free on the target disk, the CPU has
+   `tools/extract.py`), the keys are new enough for the update, enough space is free on the target disk (about 36 GiB at the peak of a
+   first install, 20 GiB after it), the CPU has
    AVX2 (`-march=x86-64-v3`), a Vulkan 1.3 GPU exists. Each failure is one clear message.
 2. **Extract** ExeFS and RomFS into the install folder and verify the hashes.
 3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt`) into a temp folder next to the installer.
@@ -47,6 +48,27 @@ release that changes nothing game-derived skips the rebuild.
 6. **Clean up** the temp folder (generated C and objects, about 1.3 GB).
 
 A cancelled or failed setup resumes from the last finished step (`totk-install.json`).
+
+## Command line
+
+`installer/` (stdlib only; `installer/layout.py` maps the release folder and, in a repository, the dev toolchain):
+
+```
+python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR [--root DIR] [--temp DIR] [--verify]
+```
+
+- On a folder with `totk-install.json` only `--dest` is needed; the game files only when the extraction must run again.
+- stdout: one JSON event per line, types `start`, `plan`, `step` (started, done, skipped), `progress` (step, phase,
+  done/total/unit), `warning`, `error`, `end` (`installer/events.py`). Messages are ids with parameters;
+  `installer/text/en.json` holds their English text. The human-readable log goes to `<temp>/logs/`.
+- Exit codes: 0 done, 1 failed, 2 bad command line, 3 cancelled. The window cancels with Ctrl+Break to the
+  installer's process group.
+- Each step records a key over its inputs (runner.py). A step with the recorded key and intact output is skipped, so
+  resume and update are one rule; output kept from another release is re-hashed first.
+- Peak space on the install disk is about 36 GiB, not 22: the extraction copies both Program NCAs (16.3 GiB) next to
+  the merged RomFS (15.9 GiB) before it deletes them. The check computes the exact figure.
+- `tests/installer_test.py`: bookkeeping with fake steps. `tests/installer_e2e.py`: a dev-mode run with the files of
+  `config.local.toml`.
 
 ## Release layout
 

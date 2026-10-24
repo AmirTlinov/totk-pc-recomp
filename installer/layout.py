@@ -2,11 +2,12 @@
 
 Release (docs/installer.md "Release layout"), root = the unpacked folder:
 
-    python/python.exe       runs every tool (numpy, lz4, cryptography, compression.zstd)
+    python/python.exe       runs every tool (numpy, lz4, cryptography, compression.zstd); its ._pth puts .., ../tools
+                            and ../recomp on sys.path, so `python -m installer` imports from the release folder
     recomp/, tools/         the lifter and the scripts; recomp/patches-v121.txt, tools/data/expected-v1.2.1.json
     llvm/                   llvm-mingw (bin/clang.exe)
-    runtime/                libtotkrt.a, the headers and install-side sources (romfs.c), and include/ + lib/ of
-                            Vulkan, SDL3, Opus, libvpx and VMA (build_game.py --deps)
+    runtime/                libtotkrt.a, the headers and install-side sources (romfs.c); runtime/deps/ holds
+                            include/ + lib/ of Vulkan, SDL3, Opus, libvpx and VMA (build_game.py --deps)
     bin/                    totk_xlate.exe (+ totk_xlate.id), hactool.exe, ninja.exe, SDL3.dll, libopus-0.dll
     data/shader_list.tsv    the MacNativeGames shader list
     totk.ini.example
@@ -79,7 +80,7 @@ def release_layout(root):
         python=root / 'python' / ('python' + EXE),
         tools=root / 'tools', recomp=root / 'recomp', patches=root / 'recomp' / 'patches-v121.txt',
         expected=root / 'tools' / 'data' / 'expected-v1.2.1.json',
-        llvm=root / 'llvm', deps=root / 'runtime', runtime=root / 'runtime',
+        llvm=root / 'llvm', deps=root / 'runtime' / 'deps', runtime=root / 'runtime',
         runtime_lib=root / 'runtime' / 'libtotkrt.a',
         ninja=root / 'bin' / ('ninja' + EXE), hactool=root / 'bin' / ('hactool' + EXE),
         xlate=root / 'bin' / ('totk_xlate' + EXE),
