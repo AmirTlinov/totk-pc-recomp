@@ -41,6 +41,17 @@
 # rumble_strength = 130
 # rumble_curve = 0.6
 # rumble_triggers = 0
+# Remap buttons, one line per Switch button: bind_<A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LCLICK RCLICK> =
+# comma separated pad:<name> and key:<name> entries, or none. A line replaces that button's defaults (pad and keyboard);
+# buttons without a line keep them. Invalid entries are logged and skipped.
+#   pad names: south east west north l r zl zr start back lstick rstick dpad_left dpad_up dpad_right dpad_down
+#   key names: a-z 0-9 space tab lshift lctrl up down left right mouse_l mouse_r mouse_m
+# Defaults: A = pad:east, key:E. B = pad:south, key:lshift. X = pad:north, key:space. Y = pad:west, key:mouse_l.
+# A pad that reports A/B and X/Y swapped (some GuliKit models): swap them back, keyboard keys stay.
+# bind_A = pad:south, key:E
+# bind_B = pad:east, key:lshift
+# bind_X = pad:west, key:space
+# bind_Y = pad:north, key:mouse_l
 
 [files]
 # Folder with RomFS mod files that replace or add game files. Default: none.
