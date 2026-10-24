@@ -7,6 +7,8 @@ recompiled only when it, a header it includes or its flags change.
     .venv\\Scripts\\python tools\\build_game.py --modules subsdk0   # one module (links if it has no calls into others)
     .venv\\Scripts\\python tools\\build_game.py --jobs 8
     .venv\\Scripts\\python tools\\build_game.py --out build/v121-t2   # a separate build directory
+    .venv\\Scripts\\python tools\\build_game.py --toolchain toolchain/llvm-mingw-<version>/llvm-mingw-<version>-ucrt-x86_64 \\
+        --out build/v121-llvmmingw                                    # llvm-mingw instead of MSYS2 UCRT64
 
 Every runtime/*.c is compiled. build/<version>/modules.c carries the layout, the linked function tables, the
 expected SHA-256 of each ExeFS file (tools/data/expected-<display version>.json) and the default game paths
@@ -33,6 +35,16 @@ bad shared object stops the fork and asks for a main build run, which recompiles
 Compile jobs share a memory budget (MEM_BUDGET, default the smaller of 50 GiB and 80% of RAM) at JOB_MEM per job, so a
 big machine does not run out of memory on the largest chunks. Each phase reports its wall time and the peak memory
 of its processes (Windows job object accounting: committed private bytes).
+
+--ninja PATH names the Ninja to run; without MSYS2 the bin/ninja.exe of the release folder (tools/make_release.py) is used.
+--toolchain DIR builds with an llvm-mingw tree (DIR/bin/clang.exe) instead of MSYS2 UCRT64 clang. Ninja still comes
+from MSYS2. The libraries and headers MSYS2 supplies (Vulkan, SDL3, Opus, libvpx, VMA) then come from --deps DIR
+(default toolchain/deps-mingw: include/, lib/ with the import libraries and libvpx.a, bin/ with the DLLs), and the C++
+runtime is libc++ from llvm-mingw. Such a build never reuses another build's generated objects.
+
+Split build. --make-runtime-lib compiles only runtime/ into <out>/libtotkrt.a (what CI prebuilds). --runtime-lib PATH
+then compiles only the generated C and the install-time files (modules.c and INSTALL_SIDE, which bake the player's
+game hashes in) and links them with that library. The library holds no game-derived data.
 
 Standard library only.
 """
@@ -67,6 +79,15 @@ RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
 LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Wl,--Map=$builddir/totk.map']   # the map feeds tools/prof_report.py
 LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end of M4; libvpx static (movies)
 VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
+# --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
+LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lvulkan-1', '-lSDL3', '-lopus',
+                  '-l:libvpx.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
+DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
+INSTALL_SIDE = {'romfs.c'}   # runtime sources that include romfs_config.h: compiled per install, not in the library
+LIB_NAME = 'libtotkrt.a'
+AR = UCRT / 'llvm-ar.exe'
+TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
+DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
 DISPLAY_VERSIONS = {'v0': '1.0.0', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}
 
@@ -182,11 +203,14 @@ def module_glue(layout, linked, hashes, paths):
     return '\n'.join(out)
 
 
-def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False):
+def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=None, make_lib=False):
     """build.ninja text, and the object lists per module. With prebuilt the generated objects already exist in
-    out/obj and are link inputs without a compile edge."""
+    out/obj and are link inputs without a compile edge. runtime_lib: a prebuilt library replaces the runtime objects
+    except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
     inc = f'-I {flag_path(RUNTIME)} -I {flag_path(gen)}'
-    rt_inc = f'{inc} -I {flag_path(out)} -I {flag_path(VMA_INCLUDE)}'   # romfs_config.h, vk_mem_alloc.h
+    vma = f'{flag_path(DEPS / "include")} -I {flag_path(DEPS / "include" / "vma")}' if DEPS else flag_path(VMA_INCLUDE)
+    rt_inc = f'{inc} -I {flag_path(out)} -I {vma}'   # romfs_config.h, vk_mem_alloc.h (and the deps headers)
+    libs = [f'-L{flag_path(DEPS / "lib")}'] + LLVM_LINK_LIBS if DEPS else LINK_LIBS
     lines = [
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',
@@ -195,7 +219,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False):
         f'genflags = {" ".join(GEN_FLAGS)} {inc}',
         f'rtflags = {" ".join(RT_FLAGS)} {rt_inc}',
         f'ldflags = {" ".join(LINK_FLAGS)}',
-        f'libs = {" ".join(LINK_LIBS)}',
+        f'libs = {" ".join(libs)}',
         '',
         'pool gen',
         f'  depth = {pool_depth}',
@@ -229,14 +253,35 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False):
                 lines.append('  pool = gen')
             objs[mod].append(o)
     rt = []
-    for src in runtime_sources(skip) + [out / 'modules.c']:
+    sources = runtime_sources(skip)
+    if make_lib:
+        sources = [p for p in sources if p.name not in INSTALL_SIDE]
+    elif runtime_lib:
+        sources = [p for p in sources if p.name in INSTALL_SIDE] + [out / 'modules.c']
+    else:
+        sources += [out / 'modules.c']
+    for src in sources:
         o = runtime_object(out, src)
         lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]
     exe = out / 'totk.exe'
-    lines += ['', f'build {ninja_path(exe)}: link ' + ' '.join(ninja_path(o) for o in every),
+    if make_lib:
+        exe = out / LIB_NAME
+        lines += ['', 'rule ar', f'  command = {AR.as_posix()} rcs $out $in', '  description = AR $out', '', f'build {ninja_path(exe)}: ar ' + ' '.join(ninja_path(o) for o in every),
+                  'build objects: phony ' + ' '.join(ninja_path(o) for o in every), f'default {ninja_path(exe)}', '']
+        return '\n'.join(lines), objs, exe
+    rule = 'link'
+    if runtime_lib:
+        # Whole archive: the weak probe stubs in gfx_stubs.c would otherwise satisfy references to the probes before the
+        # linker looks into the library, and the real probes would stay out of totk.exe.
+        rule = 'link_lib'
+        lines += ['', 'rule link_lib',
+                  f'  command = $cc $ldflags @$out.rsp -Wl,--whole-archive {flag_path(runtime_lib)} -Wl,--no-whole-archive $libs -o $out',
+                  '  rspfile = $out.rsp', '  rspfile_content = $in_newline', '  description = LINK $out']
+    lines += ['', f'build {ninja_path(exe)}: {rule} ' + ' '.join(ninja_path(o) for o in every) +
+              (f' | {ninja_path(runtime_lib)}' if runtime_lib else ''),
               'build objects: phony ' + ' '.join(ninja_path(o) for o in every), f'default {ninja_path(exe)}', '']
     return '\n'.join(lines), objs, exe
 
@@ -517,6 +562,16 @@ def main():
     ap.add_argument('--romfs', type=Path, help="totk.exe's default RomFS directory with romfs.bin and index.json "
                                                '(default build/extracted/<version>/romfs)')
     ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile)")
+    ap.add_argument('--toolchain', type=Path, help='llvm-mingw directory (with bin/clang.exe) to build with instead of '
+                                                   'MSYS2 UCRT64 clang')
+    ap.add_argument('--ninja', type=Path, help='ninja.exe to build with (default: MSYS2 UCRT64, else bin/ninja.exe of the '
+                                               'release folder)')
+    ap.add_argument('--deps', type=Path, help=f'with --toolchain: include/, lib/ and bin/ of Vulkan, SDL3, Opus, libvpx '
+                                              f'and VMA (default {DEFAULT_DEPS.relative_to(ROOT).as_posix()})')
+    ap.add_argument('--make-runtime-lib', action='store_true',
+                    help=f'build only <out>/{LIB_NAME} from runtime/ (no generated C, no totk.exe)')
+    ap.add_argument('--runtime-lib', type=Path, help=f'link against this {LIB_NAME} instead of compiling runtime/ '
+                                                    f'({", ".join(sorted(INSTALL_SIDE))} and modules.c still compile)')
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
@@ -533,6 +588,18 @@ def main():
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
         expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
+    global CLANG, AR, NINJA, TOOLCHAIN_BIN, DEPS
+    if args.ninja:
+        NINJA = args.ninja.resolve()
+    elif not NINJA.is_file() and (ROOT / 'bin' / 'ninja.exe').is_file():
+        NINJA = ROOT / 'bin' / 'ninja.exe'   # the release folder (tools/make_release.py)
+    dlls = SDL3_DLLS
+    if args.toolchain:
+        TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
+        CLANG = TOOLCHAIN_BIN / 'clang.exe'
+        AR = TOOLCHAIN_BIN / 'llvm-ar.exe'
+        DEPS = (args.deps or DEFAULT_DEPS).resolve()
+        dlls = sorted((DEPS / 'bin').glob('*.dll'))
     for tool in (CLANG, NINJA):
         if not tool.is_file():
             sys.exit(f'{tool} not found: install MSYS2 UCRT64 clang, lld and ninja (docs/toolchain-msys2-python.md)')
@@ -566,8 +633,12 @@ def main():
     skip = {s for s in args.skip_runtime.split(',') if s}
     main_out = (ROOT / 'build' / args.version).resolve()
     pairs = None
-    if args.full_build:
+    if args.make_runtime_lib:
+        mods, linked, why = {}, [], ''
+    elif args.full_build:
         why = '--full-build'
+    elif args.toolchain:
+        why = f'--toolchain {flag_path(args.toolchain)}'
     elif out == main_out:
         why = ''
     else:
@@ -580,10 +651,14 @@ def main():
             unlink_shared(out, mods)
         if why:
             print(f'build_game: compiling all generated C: {why}')
-    text, objs, exe = ninja_file(gen, out, mods, jobs, skip, pairs is not None)
+    runtime_lib = args.runtime_lib.resolve() if args.runtime_lib else None
+    if runtime_lib and not runtime_lib.is_file():
+        sys.exit(f'{runtime_lib} not found: build it with --make-runtime-lib')
+    text, objs, exe = ninja_file(gen, out, mods, jobs, skip, pairs is not None, runtime_lib,
+                                 args.make_runtime_lib)
     write_if_changed(out / 'build.ninja', text)
 
-    env = dict(os.environ, PATH=str(UCRT) + os.pathsep + os.environ.get('PATH', ''))
+    env = dict(os.environ, PATH=str(TOOLCHAIN_BIN or UCRT) + os.pathsep + os.environ.get('PATH', ''))
     base = [str(NINJA), '-f', str(out / 'build.ninja'), '-j', str(jobs)]
     nfiles = sum(len(v) for v in mods.values())
     print(f'build_game: {nfiles} generated files in {len(linked)} modules ({", ".join(linked)}), {jobs} jobs', flush=True)
@@ -598,13 +673,18 @@ def main():
     verify_objects(out, objs, pairs is not None, main_out, pairs, base, env)
     if args.compile_only:
         return
+    if args.make_runtime_lib:
+        exe.unlink(missing_ok=True)   # ar rcs would keep members of deleted sources
     code, dt, peak_one, _ = run_measured(base + [flag_path(exe)], env)
     print(f'link: {dt:.1f} s, peak {mib(peak_one)}')
     if code:
         print(f'build_game: link failed, {flag_path(exe)} is the old one (a running totk.exe from this dir locks it)',
               file=sys.stderr)
         sys.exit(code)
-    for dll in SDL3_DLLS:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to totk.exe
+    if args.make_runtime_lib:
+        print(f'{below_root(exe)}: {mib(exe.stat().st_size)}')
+        return
+    for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to totk.exe
         shutil.copy2(dll, exe.parent / dll.name)
     sections, image = pe_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
