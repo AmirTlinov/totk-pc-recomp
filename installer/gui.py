@@ -15,6 +15,11 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    from PIL import ImageGrab   # only the screenshots of --selftest --shots need it; the release has no PIL
+except ImportError:
+    ImageGrab = None
+
 from . import ini
 from . import layout as layouts
 from .guilogic import (DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGES, Catalog, Form, Model, Process,
@@ -453,7 +458,8 @@ SAMPLE_RUN = [
 
 
 def grab(root, path):
-    from PIL import ImageGrab
+    if ImageGrab is None:
+        raise SystemExit('--shots needs Pillow')
     root.attributes('-topmost', True)
     root.update()
     x, y, w, h = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
