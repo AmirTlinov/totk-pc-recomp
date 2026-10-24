@@ -25,6 +25,12 @@ other `totk.exe` or `ninja.exe` runs. The log's first and last lines record the 
 
 - `--env TOTK_TRACE=perf,sched`, then `python tools/perf_summary.py <log> <lo> <hi>`: fps, max frame and the
   render-thread buckets per 60 frames. Per-thread run, core, host, lock and addr shares come per 120 presents.
+  A second `perf: frame N: gpu avg` line per window has the GPU busy time per frame (timestamp queries per submission
+  part, `vk_sync.c`; upload batches not included), fence waits of the render thread and of other threads, VRAM use and
+  budget (`VK_EXT_memory_budget`), process RAM and `bound: gpu|cpu|pace` (pace: the frame waited for pacing 15% of the
+  time or more; gpu: the GPU was busy 80% of the interval or more).
+- The pool census (`mem: census`, `vk_memory.c` `vk_mem_census`) is logged at frame 1800, with `perf` every 1800
+  frames: pools by kind and flags, and the bytes bound or copied per frame by pool class since frame 1200.
 - `TOTK_PROFILE=1 TOTK_PROFILE_FRAMES=lo-hi`: sampling profiler (`runtime/prof_win.c`). Resolve `exe+0x...` RVAs
   with the build's `totk.map`.
 - `tools/regress.py <build> --base build/v121-m4 [--routes fight,rock,island,field] [--repeat 3] [--cold] [--validation]

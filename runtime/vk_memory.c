@@ -307,7 +307,13 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
 
 // Per-thread copies of resolved import and physical pools that overlap no other index entry (so pidx_find picks them for
 // any range inside), valid while pool_gen is unchanged: the replay resolves a few pools thousands of times per frame.
-typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; } ResolveHit;
+static int rec_class(const PoolRec *r) {
+    if (r->kind != POOL_IMPORT) return VK_MCLS_DEVICE;
+    return r->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? VK_MCLS_HOST_NOACC
+         : r->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? VK_MCLS_HOST_CACHED : VK_MCLS_HOST_UNC;
+}
+
+typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; } ResolveHit;
 static _Thread_local ResolveHit rhit[4];
 static _Thread_local unsigned rhit_next;
 
@@ -322,6 +328,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
             out->offset = addr - h->base;
             out->avail = h->end - addr;
             out->alloc = h->alloc;
+            out->cls = h->cls;
             if (h->alloc) out->alloc_offset = out->offset;
             return 1;
         }
@@ -334,12 +341,13 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
             ResolveHit *h = &rhit[rhit_next++ & 3];
             h->gen = __atomic_load_n(&pool_gen, __ATOMIC_RELAXED);   // stable: changed only under the exclusive lock
-            h->lo = e->lo, h->hi = e->hi, h->buf = r->buf;
+            h->lo = e->lo, h->hi = e->hi, h->buf = r->buf, h->cls = rec_class(r);
             if (r->kind == POOL_IMPORT) h->base = r->import_lo, h->end = r->import_hi, h->alloc = NULL;
             else h->base = r->lo, h->end = r->lo + r->size, h->alloc = r->alloc;
         }
     }
     if (r && r->kind == POOL_IMPORT && r->buf) {
+        out->cls = rec_class(r);
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
@@ -349,6 +357,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->offset = out->alloc_offset = addr - r->lo;
         out->avail = r->size - out->offset;
         out->alloc = r->alloc;
+        out->cls = VK_MCLS_DEVICE;
         ok = 1;
     } else if (r && r->kind == POOL_VIRT) {
         uint64_t rel = addr - r->lo, k = rel / NVN_VPOOL_PAGE;
@@ -360,6 +369,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
             out->offset = out->alloc_offset = off;
             out->avail = end - off;
             out->alloc = ph->alloc;
+            out->cls = VK_MCLS_DEVICE;
             ok = out->avail >= size;
             if (ok && !ph->used) InterlockedExchange(&ph->used, 1);   // read first: the flag is only ever set
         }
@@ -368,6 +378,101 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
     ReleaseSRWLockShared(&pool_lock);
     if (!ok) memset(out, 0, sizeof *out);
     return ok;
+}
+
+int vk_mem_class_of(uint64_t addr) {
+    VkMemSpan m;
+    return vk_mem_resolve(addr, 1, &m) ? m.cls : VK_MCLS_NONE;
+}
+
+// ---------------------------------------------------------------- census
+static volatile LONG64 traffic[VK_MCLS_N][VK_MUSE_N];
+
+void vk_mem_count(int cls, int use, uint64_t bytes) {
+    if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N) InterlockedAdd64(&traffic[cls][use], (LONG64)bytes);
+}
+
+static void flag_names(uint32_t f, char *buf, size_t n) {
+    static const char *const names[] = {"CPU_NO_ACCESS", "CPU_UNCACHED", "CPU_CACHED", "GPU_NO_ACCESS", "GPU_UNCACHED",
+                                        "GPU_CACHED", "SHADER_CODE", "COMPRESSIBLE", "PHYSICAL", "VIRTUAL"};
+    size_t k = 0;
+    buf[0] = 0;
+    for (int i = 0; i < 10; i++)
+        if (f >> i & 1) k += (size_t)snprintf(buf + k, k < n ? n - k : 0, "%s%s", k ? "|" : "", names[i]);
+    if (!k) snprintf(buf, n, "none");
+}
+
+// One line per (kind, flags) group of the live pools, then the bytes the replay bound or copied per frame by pool
+// class since the previous census (the first one: since frame 1200). Logged at frame 1800 (in the world from the
+// run-game saves) and with TOTK_TRACE=perf every 1800 frames.
+void vk_mem_census(uint64_t frame) {
+    static uint64_t window_start;
+    if (frame == 1200) {   // loading is over: the first window starts here
+        for (int c = 0; c < VK_MCLS_N; c++)
+            for (int u = 0; u < VK_MUSE_N; u++) InterlockedExchange64(&traffic[c][u], 0);
+        window_start = frame;
+        return;
+    }
+    if (frame % 1800 || !(frame == 1800 || (rt_trace & RT_TRACE_PERF))) return;
+    typedef struct { int kind; uint32_t flags; uint64_t n, bytes; } Group;
+    Group g[64];
+    int ng = 0;
+    uint64_t total[4] = {0}, count[4] = {0};
+    AcquireSRWLockShared(&pool_lock);
+    for (int i = 0; i < pool_index.n; i++) {
+        const PoolRec *r = pool_index.e[i].buf;
+        int j = 0;
+        while (j < ng && (g[j].kind != r->kind || g[j].flags != r->flags)) j++;
+        if (j == ng && ng < 64) g[ng++] = (Group){r->kind, r->flags, 0, 0};
+        if (j < ng) g[j].n++, g[j].bytes += r->size;
+        total[r->kind] += r->size, count[r->kind]++;
+    }
+    ReleaseSRWLockShared(&pool_lock);
+    rt_log("mem: census at frame %llu: import %llu pools %.1f MiB (%ld without a GPU buffer), physical %llu pools %.1f MiB, "
+           "virtual %llu pools %.1f MiB of address space",
+           (unsigned long long)frame, (unsigned long long)count[POOL_IMPORT], total[POOL_IMPORT] / 1048576.0,
+           n_import_failures, (unsigned long long)count[POOL_PHYS], total[POOL_PHYS] / 1048576.0,
+           (unsigned long long)count[POOL_VIRT], total[POOL_VIRT] / 1048576.0);
+    static const char *const kinds[] = {"", "import", "physical", "virtual"};
+    for (int j = 0; j < ng; j++) {
+        char f[160];
+        flag_names(g[j].flags, f, sizeof f);
+        rt_log("mem:   %s %#x %s: %llu pools, %.1f MiB", kinds[g[j].kind], g[j].flags, f, (unsigned long long)g[j].n,
+               g[j].bytes / 1048576.0);
+    }
+    uint64_t frames = window_start && frame > window_start ? frame - window_start : frame;
+    static const char *const cls[] = {"", "host CPU_NO_ACCESS", "host CPU_UNCACHED", "host CPU_CACHED", "device", "scratch"};
+    rt_log("mem: traffic per frame over %llu frames, MiB (bound ranges, not bytes read): class: vertex index uniform "
+           "storage indirect copy-src gpu-write cpu-read", (unsigned long long)frames);
+    for (int c = 1; c < VK_MCLS_N; c++) {
+        double v[VK_MUSE_N];
+        for (int u = 0; u < VK_MUSE_N; u++) v[u] = InterlockedExchange64(&traffic[c][u], 0) / 1048576.0 / (double)(frames ? frames : 1);
+        rt_log("mem:   %s: %.2f %.2f %.2f %.2f %.3f %.2f %.2f %.3f", cls[c], v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    }
+    window_start = frame;
+}
+
+int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
+    VkCtx *c = vk_ctx();
+    *used = *budget = 0, *exact = 0;
+    if (!c) return 0;
+    const VkPhysicalDeviceMemoryProperties *mp = &c->mem_props;
+    if (c->has_memory_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+        vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+        for (uint32_t h = 0; h < p2.memoryProperties.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+            if (p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                *used += b.heapUsage[h], *budget += b.heapBudget[h];
+        *exact = 1;
+        return *budget != 0;
+    }
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            *used += vb[h].statistics.blockBytes, *budget += mp->memoryHeaps[h].size;
+    return *budget != 0;
 }
 
 // ---------------------------------------------------------------- page write generations

@@ -114,12 +114,28 @@ void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-wat
 
 // GPU address -> backing (section 3.1). avail: bytes from offset that stay contiguous in buffer. alloc/alloc_offset:
 // the device-local memory behind physical and (through the page table) virtual pool addresses, NULL for imported pools.
+// cls: the pool class of the backing (VK_MCLS_*), for the traffic census.
 typedef struct {
     VkBuffer buffer;
     VkDeviceSize offset, avail;
     VmaAllocation alloc;
     VkDeviceSize alloc_offset;
+    int cls;
 } VkMemSpan;
+// Traffic census (vk_memory.c vk_mem_census): bytes the replay binds or copies, by pool class and use. Imported pools by
+// their CPU access flag; DEVICE is physical memory (directly or through a virtual pool); SCRATCH the replay's transient
+// copies. CPU_READ counts bytes host code reads from pool storage in place of the GPU (misaligned binds, byte indices,
+// counter words); GPU_WRITE what copies, fills, counter reports and uniform updates write.
+enum { VK_MCLS_NONE, VK_MCLS_HOST_NOACC, VK_MCLS_HOST_UNC, VK_MCLS_HOST_CACHED, VK_MCLS_DEVICE, VK_MCLS_SCRATCH, VK_MCLS_N };
+enum { VK_MUSE_VB, VK_MUSE_IB, VK_MUSE_UBO, VK_MUSE_SSBO, VK_MUSE_IND, VK_MUSE_COPY_SRC, VK_MUSE_GPU_WRITE,
+       VK_MUSE_CPU_READ, VK_MUSE_N };
+void vk_mem_count(int cls, int use, uint64_t bytes);
+int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
+void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
+                                                  // with TOTK_TRACE=perf, every 1800 frames
+// VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
+// 0: this allocator's own allocations against the heap sizes. 0 when unknown.
+int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
 // Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
 // range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
