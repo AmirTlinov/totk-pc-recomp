@@ -30,7 +30,11 @@ other `totk.exe` or `ninja.exe` runs. The log's first and last lines record the 
   budget (`VK_EXT_memory_budget`), process RAM and `bound: gpu|cpu|pace` (pace: the frame waited for pacing 15% of the
   time or more; gpu: the GPU was busy 80% of the interval or more).
 - The pool census (`mem: census`, `vk_memory.c` `vk_mem_census`) is logged at frame 1800, with `perf` every 1800
-  frames: pools by kind and flags, and the bytes bound or copied per frame by pool class since frame 1200.
+  frames: pools by kind and flags, and the bytes bound or copied per frame by pool class since frame 1200. Also at
+  frame 600. `mem: class` (once at start) says whether the GPU counts as uma or discrete and lists its heaps and types.
+- With `perf`, `mem: dirty` every 60 frames: what a VRAM mirror of the buffer-bound pools would upload (pages the CPU
+  wrote per frame and per submit, eager and lazy, by pool class), FlushMappedRange calls and bytes, and the mirror
+  size. The census costs about 1.1 ms of CPU per frame on the submitting thread; `perf_summary.py` summarises it.
 - `TOTK_PROFILE=1 TOTK_PROFILE_FRAMES=lo-hi`: sampling profiler (`runtime/prof_win.c`). Resolve `exe+0x...` RVAs
   with the build's `totk.map`.
 - `tools/regress.py <build> --base build/v121-m4 [--routes fight,rock,island,field] [--repeat 3] [--cold] [--validation]
