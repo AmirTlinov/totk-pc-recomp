@@ -141,6 +141,10 @@
  "ui.amount_objects": "{done} / {total} files",
  "ui.amount_shaders": "{done} / {total} shaders",
  "ui.amount_other": "{done} / {total} {unit}",
+ "ui.seconds": "{n} s",
+ "param.input.base": "base game",
+ "param.input.update": "update",
+ "param.input.keys": "keys",
 
  "launcher.title": "TotK Setup",
  "launcher.python_missing": "The setup files are incomplete: the python folder next to TotK-Setup.exe is missing. Unpack the whole archive again and start TotK-Setup.exe from the unpacked folder.",

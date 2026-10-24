@@ -75,7 +75,7 @@
  "prepare.shaders_failed": "Не удалось подготовить шейдеры (код выхода {code}). Подробности: {log}",
  "cleanup.ini_failed": "Не удаётся записать totk.ini: {detail}",
 
- "warn.lang_needs_fonts": "Тексту на языке {lang} нужны системные шрифты Switch, которые установка не извлекает; часть текста может не отображаться.",
+ "warn.lang_needs_fonts": "Для языка «{lang}» нужны системные шрифты Switch, которые установка не извлекает; часть текста может не отображаться.",
  "warn.npdm_differs": "main.npdm отличается от эталонного дампа 1.2.1; используются только модули с кодом.",
 
  "ui.title": "Установка TotK",
@@ -141,6 +141,10 @@
  "ui.amount_objects": "{done} / {total} файлов",
  "ui.amount_shaders": "{done} / {total} шейдеров",
  "ui.amount_other": "{done} / {total} {unit}",
+ "ui.seconds": "{n} с",
+ "param.input.base": "базовая игра",
+ "param.input.update": "обновление",
+ "param.input.keys": "ключи",
 
  "launcher.title": "Установка TotK",
  "launcher.python_missing": "Файлы установки неполные: рядом с TotK-Setup.exe нет папки python. Распакуйте архив целиком заново и запустите TotK-Setup.exe из распакованной папки.",

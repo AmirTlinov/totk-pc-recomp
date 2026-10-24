@@ -130,6 +130,40 @@ class ModelTest(unittest.TestCase):
         self.assertEqual(m.states['check'], PENDING)
 
 
+class RunStatesTest(unittest.TestCase):
+    OK = [START, {'type': 'plan', 'run': ['check', 'extract'], 'skip': {'lift': 'current', 'compile': 'current',
+                                                                     'prepare': 'current', 'cleanup': 'not_needed'}},
+          {'type': 'step', 'step': 'check', 'state': 'started'}, {'type': 'step', 'step': 'check', 'state': 'done'},
+          {'type': 'step', 'step': 'extract', 'state': 'started'}, {'type': 'step', 'step': 'extract', 'state': 'done'},
+          {'type': 'step', 'step': 'lift', 'state': 'skipped'}, {'type': 'step', 'step': 'compile', 'state': 'skipped'},
+          {'type': 'step', 'step': 'prepare', 'state': 'skipped'}, {'type': 'step', 'step': 'cleanup', 'state': 'done'},
+          {'type': 'end', 'result': 'ok', 'seconds': 1}]
+    FAILED = [START, {'type': 'step', 'step': 'check', 'state': 'started'}, {'type': 'step', 'step': 'check', 'state': 'done'},
+              {'type': 'step', 'step': 'extract', 'state': 'started'},
+              {'type': 'error', 'id': 'extract.romfs_mismatch', 'step': 'extract', 'params': {}},
+              {'type': 'warning', 'id': 'warn.lang_needs_fonts', 'params': {'lang': 'ko'}},
+              {'type': 'end', 'result': 'failed', 'seconds': 1}]
+
+    def test_ok_run_has_only_done_and_skipped_steps(self):
+        m = fold(*self.OK)
+        m.finish(0)
+        self.assertEqual(m.result, 'ok')
+        self.assertIsNone(m.error)
+        self.assertEqual({m.states[s] for s in m.steps}, {DONE, SKIPPED})
+
+    def test_a_new_run_keeps_nothing_of_the_failed_one(self):
+        m = fold(*self.FAILED)
+        m.finish(1)
+        self.assertEqual(m.states['extract'], FAILED)
+        for e in self.OK:   # the same model object fed a second run (the window makes a new one, but even then)
+            m.apply(e)
+        m.finish(0)
+        self.assertEqual({m.states[s] for s in m.steps}, {DONE, SKIPPED})
+        self.assertIsNone(m.error)
+        self.assertEqual(m.warnings, [])
+        self.assertEqual(m.result, 'ok')
+
+
 class FormTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -209,6 +243,18 @@ class CatalogTest(unittest.TestCase):
         for lang in ('en', 'ru'):
             cat.set_language(lang)
             self.assertEqual([i for i in ids if not cat.has(i)], [])
+
+    def test_codes_become_names(self):
+        for lang, korean in (('en', 'Korean'), ('ru', 'Корейский')):
+            cat = Catalog(lang)
+            self.assertIn(korean, cat('warn.lang_needs_fonts', lang='ko'))
+            self.assertNotIn(' ko ', cat('warn.lang_needs_fonts', lang='ko'))
+            self.assertNotIn('extract', cat('state.output_changed', step='extract'))
+            for word in ('base', 'update', 'keys'):
+                self.assertIn(cat('param.input.' + word), cat('check.keys_wrong', input=word))
+            self.assertNotIn('en-US', cat('check.lang_unknown', lang='xx', known='ja, en-US'))
+        self.assertEqual(Catalog('en')('check.lang_unknown', lang='xx', known='ja, en-US'),
+                         "Unknown language 'xx'. Known: Japanese, English (US).")
 
     def test_fallback_and_params(self):
         cat = Catalog('ru')

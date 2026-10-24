@@ -48,6 +48,7 @@ class App:
         self.process = None
         self.closing = False
         self.run_args = run_args or {}   # extra CLI options for tests: temp, verify
+        self.log_entries = []            # events and raw lines of the run, rendered by render_log
         self.bound = []                  # (widget, option, id, params) retranslated on a language switch
         self.vars = {n: tk.StringVar() for n in ('base', 'update', 'keys', 'dest')}
         self.vars['lang'] = tk.StringVar()
@@ -103,6 +104,7 @@ class App:
         self.refresh_form()
         self.refresh_run()
         self.refresh_finish()
+        self.render_log()
 
     def switch_language(self):
         self.cat.set_language(self.ui_var.get())
@@ -326,15 +328,15 @@ class App:
         event = parse_line(line)
         if event is None:
             if line.strip():
-                self.add_log(line.rstrip())
+                self.log_entries.append(line.rstrip())
+                self.append_log(line.rstrip())
             return
         before = list(self.model.steps)
         self.model.apply(event)
         if self.model.steps != before:
             self.build_step_rows(self.model.steps)
-        text = describe_event(self.cat, event)
-        if text:
-            self.add_log(text)
+        self.log_entries.append(event)
+        self.append_log(describe_event(self.cat, event))
 
     def refresh_run(self):
         m = self.model
@@ -379,15 +381,26 @@ class App:
         self.bind_text(self.log_toggle, 'text', 'ui.hide_log' if self.log_open else 'ui.show_log')
 
     def clear_log(self):
+        self.log_entries = []
+        self.render_log()
+
+    def render_log(self):
+        """The whole log from the kept events in the current language (raw CLI lines stay as they are)."""
         self.log.configure(state='normal')
         self.log.delete('1.0', 'end')
-        self.log.configure(state='disabled')
-
-    def add_log(self, text):
-        self.log.configure(state='normal')
-        self.log.insert('end', text + '\n')
+        for entry in self.log_entries:
+            text = entry if isinstance(entry, str) else describe_event(self.cat, entry)
+            if text:
+                self.log.insert('end', text + '\n')
         self.log.see('end')
         self.log.configure(state='disabled')
+
+    def append_log(self, text):
+        if text:
+            self.log.configure(state='normal')
+            self.log.insert('end', text + '\n')
+            self.log.see('end')
+            self.log.configure(state='disabled')
 
     def cancel(self):
         if self.process:
@@ -457,6 +470,19 @@ SAMPLE_RUN = [
 ]
 
 
+SAMPLE_OK = [SAMPLE_START, {'type': 'plan', 'run': ['check', 'extract'], 'skip': {'lift': 'current', 'compile': 'current',
+                                                                       'prepare': 'current', 'cleanup': 'not_needed'}},
+             {'type': 'step', 'step': 'check', 'state': 'started'},
+             {'type': 'step', 'step': 'check', 'state': 'done', 'seconds': 1.0},
+             {'type': 'step', 'step': 'extract', 'state': 'started'},
+             {'type': 'step', 'step': 'extract', 'state': 'done', 'seconds': 1.0},
+             {'type': 'step', 'step': 'lift', 'state': 'skipped', 'reason': 'current'},
+             {'type': 'step', 'step': 'compile', 'state': 'skipped', 'reason': 'current'},
+             {'type': 'step', 'step': 'prepare', 'state': 'skipped', 'reason': 'current'},
+             {'type': 'step', 'step': 'cleanup', 'state': 'done', 'seconds': 0.1},
+             {'type': 'end', 'result': 'ok', 'seconds': 3}]
+
+
 def grab(root, path):
     if ImageGrab is None:
         raise SystemExit('--shots needs Pillow')
@@ -472,7 +498,7 @@ def selftest(layout, shots=None):
     root = tk.Tk()
     root.geometry('720x640+60+40')
     app = App(root, 'en', layout)
-    steps = []
+    steps, mixed = [], []
 
     def shot(name):
         root.update()
@@ -494,6 +520,7 @@ def selftest(layout, shots=None):
             steps.append(app.form_error.cget('text'))
             shot(f'form-{tag}')
             app.model = Model()
+            app.clear_log()
             app.build_step_rows(app.model.steps)
             app.show('run')
             for e in SAMPLE_RUN:
@@ -502,8 +529,18 @@ def selftest(layout, shots=None):
             app.toggle_log()
             app.refresh_run()
             shot(f'run-{tag}')
+            if lang == 'en':   # the log follows the window language: no English line may remain after the switch
+                app.ui_var.set('ru')
+                app.switch_language()
+                text = app.log.get('1.0', 'end')
+                mixed.append('Checking' in text or 'Extracting' not in text and 'Распаковка' not in text)
+                app.ui_var.set('en')
+                app.switch_language()
+            app.model = Model()
+            for e in SAMPLE_OK:
+                app.model.apply(e)
+            app.model.dest = 'Z:/selftest/TotK'
             app.model.finish(0)
-            app.model.result = 'ok'
             app.refresh_finish()
             app.show('finish')
             shot(f'finish-ok-{tag}')
@@ -525,7 +562,7 @@ def selftest(layout, shots=None):
     root.after(200, run_all)
     root.after(60000, root.destroy)   # never leaves a window open
     root.mainloop()
-    return 0 if len(steps) == len(UI_LANGUAGES) and all(steps) else 1
+    return 0 if len(steps) == len(UI_LANGUAGES) and all(steps) and mixed == [False] else 1
 
 
 def main(argv=None):

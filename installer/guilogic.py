@@ -25,6 +25,8 @@ from .events import render
 TEXT = Path(__file__).resolve().parent / 'text'
 UI_LANGUAGES = ('en', 'ru')
 STEP_ORDER = ('check', 'extract', 'lift', 'compile', 'prepare', 'cleanup')
+# message parameter -> catalog id prefix of the names that replace its raw values
+PARAM_NAMES = {'lang': 'lang.', 'known': 'lang.', 'step': 'step.', 'input': 'param.input.'}
 LANG_RU = 0x19   # primary language id of Russian in a Windows LANGID
 
 
@@ -51,7 +53,21 @@ class Catalog:
         text = self.texts.get(id) or self.english.get(id)
         if text is None:
             return id
-        return render({id: text}, id, {k: flat(v) for k, v in params.items()})
+        return render({id: text}, id, {k: self.param(k, v) for k, v in params.items()})
+
+    def param(self, name, value):
+        """A message parameter as the player should read it: language codes, step ids and input names become the
+        catalog's names (the ones the pickers and the step list show); the rest stays as it is."""
+        prefix = PARAM_NAMES.get(name)
+        if prefix:
+            if isinstance(value, (list, tuple)):
+                return ', '.join(self.param(name, v) for v in value)
+            ident = prefix + str(value)
+            if self.has(ident):
+                return self(ident)
+            if name == 'known':
+                return ', '.join(self(prefix + c) if self.has(prefix + c) else c for c in str(value).split(', '))
+        return flat(value)
 
 
 def flat(value):
@@ -185,6 +201,7 @@ class Model:
     def apply(self, e):
         kind = e['type']
         if kind == 'start':
+            self.__init__()   # a new run: nothing of an earlier one stays
             self.steps = list(e.get('steps') or STEP_ORDER)
             self.states = {s: PENDING for s in self.steps}
             self.mode, self.release = e.get('mode', ''), e.get('release', '')
@@ -259,7 +276,7 @@ def describe_event(cat, e):
     if kind == 'step':
         text = f'{cat("step." + e["step"])}: {cat("ui.state_" + e["state"])}'
         if 'seconds' in e:
-            text += f' ({e["seconds"]:.1f} s)'
+            text += f' ({cat("ui.seconds", n=format(e["seconds"], ".1f"))})'
         elif e.get('reason'):
             text += f' ({e["reason"]})'
         return text
