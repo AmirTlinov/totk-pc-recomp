@@ -411,6 +411,8 @@ class Extract(Step):
             rep.warning('warn.npdm_differs')
 
         romfs = dest / 'romfs'
+        if self.id in ctx.forced:
+            remove(romfs)   # the full hash failed: index.json still claims the extraction's hash
         if not extract.romfs_verified(romfs, expected):
             self.merge(ctx, base, update, keys, romfs, expected)
         report = json.loads((romfs / 'index.json').read_text())

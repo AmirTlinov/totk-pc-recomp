@@ -43,6 +43,8 @@ class Fake(runner.Step):
     def run(self, ctx):
         o = ctx.options
         o.ran.append(self.id)
+        if self.id in ctx.forced:
+            o.forced.append(self.id)
         if self.id == 'check':
             ctx.verify_kept(self.id)
         failure = o.fail.pop(self.id, None)
@@ -78,14 +80,15 @@ class Bed:
                         deps=Path('deps'), runtime=Path('rt'), runtime_lib=Path('lib'), ninja=Path('ninja'),
                         hactool=Path('hactool'), xlate=Path('xlate'))
         options = SimpleNamespace(inputs=inputs or {}, fail=dict(fail or {}), verify_ok=verify_ok or {}, ran=[],
-                                  verified=[])
+                                  verified=[], forced=[])
         out = io.StringIO()
         ctx = runner.Context(layout, self.dest, self.temp, Reporter(out=out), options, state=state.load(self.dest),
                              verify=verify)
         mode = ctx.mode
         result = runner.run_steps(fake_steps(), ctx)
         events = [json.loads(line) for line in out.getvalue().splitlines()]
-        return SimpleNamespace(result=result, ran=options.ran, verified=options.verified, events=events, mode=mode,
+        return SimpleNamespace(result=result, ran=options.ran, verified=options.verified, forced=options.forced,
+                               events=events, mode=mode,
                                state=state.load(self.dest))
 
     @staticmethod
@@ -173,6 +176,7 @@ class RunnerTest(unittest.TestCase):
         self.bed.run(release='1.0')
         r = self.bed.run(release='1.1', verify_ok={'extract': False})
         self.assertEqual(r.ran, ['check', 'extract', 'cleanup'])
+        self.assertEqual(r.forced, ['extract'])   # the step knows not to trust what it left behind
         warnings = [e for e in r.events if e['type'] == 'warning']
         self.assertEqual([(w['id'], w['params']) for w in warnings], [('state.output_changed', {'step': 'extract'})])
 
