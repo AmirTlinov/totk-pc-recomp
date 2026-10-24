@@ -287,8 +287,26 @@ NVN_API(nvnMemoryPoolFinalize) {
     o->span = 0;
     o->magic = 0;
 }
+static uint64_t flush_stat[2][3][2];   // nvn_flush_stats
+
+static void flush_note(int kind, const pool_t *p, uint64_t size) {
+    uint32_t f = p ? p->flags : 0;
+    int k = f & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? 2 : f & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? 0
+          : f & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? 1 : 2;
+    __atomic_fetch_add(&flush_stat[kind][k][0], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&flush_stat[kind][k][1], size, __ATOMIC_RELAXED);
+}
+
+void nvn_flush_stats(uint64_t out[2][3][2]) {
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 3; k++)
+            for (int j = 0; j < 2; j++) out[i][k][j] = __atomic_exchange_n(&flush_stat[i][k][j], 0, __ATOMIC_RELAXED);
+}
+
 // void nvnMemoryPoolFlushMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size): storage is coherent
-NVN_API(nvnMemoryPoolFlushMappedRange) { (void)c; }
+NVN_API(nvnMemoryPoolFlushMappedRange) {
+    if (rt_trace & RT_TRACE_PERF) flush_note(0, arg_p(c, 0), arg_x(c, 2));
+}
 // NVNmemoryPoolFlags nvnMemoryPoolGetFlags(const NVNmemoryPool *p)
 NVN_API(nvnMemoryPoolGetFlags) { ret_x(c, ((const pool_t *)arg_p(c, 0))->flags); }
 // void *nvnMemoryPoolMap(const NVNmemoryPool *p): NULL for CPU_NO_ACCESS
@@ -402,6 +420,7 @@ NVN_API(nvnBufferFlushMappedRange) {
     if (off < 0 || (uint64_t)off > o->size || size > o->size - (uint64_t)off)
         rt_fatal("nvn: BufferFlushMappedRange %#llx+%#llx outside the buffer (%#llx bytes)", (unsigned long long)off,
                  (unsigned long long)size, (unsigned long long)o->size);
+    if (rt_trace & RT_TRACE_PERF) flush_note(1, o->pool, size);
     uint64_t a = buf_address(o);
     if (a && !nvn_gpu_only(a)) nvn_guest_written(a + (uint64_t)off, size);
 }

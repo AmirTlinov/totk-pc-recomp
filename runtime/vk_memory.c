@@ -39,6 +39,11 @@ typedef struct PoolRec {
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
     volatile long used;                // resolved at least once: the GPU may still read it at finalize
+    // TOTK_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
+    uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
+    uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
+    uint8_t bufbound;                  // ever bound as a vertex, index, uniform, storage or indirect buffer
+    uint8_t untracked;                 // the last dirty scan found no write watch over it
 } PoolRec;
 
 static SRWLOCK pool_lock = SRWLOCK_INIT;
@@ -313,7 +318,7 @@ static int rec_class(const PoolRec *r) {
          : r->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? VK_MCLS_HOST_CACHED : VK_MCLS_HOST_UNC;
 }
 
-typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; } ResolveHit;
+typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; void *pool; } ResolveHit;
 static _Thread_local ResolveHit rhit[4];
 static _Thread_local unsigned rhit_next;
 
@@ -329,6 +334,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
             out->avail = h->end - addr;
             out->alloc = h->alloc;
             out->cls = h->cls;
+            out->pool = h->pool;
             if (h->alloc) out->alloc_offset = out->offset;
             return 1;
         }
@@ -342,12 +348,13 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
             ResolveHit *h = &rhit[rhit_next++ & 3];
             h->gen = __atomic_load_n(&pool_gen, __ATOMIC_RELAXED);   // stable: changed only under the exclusive lock
             h->lo = e->lo, h->hi = e->hi, h->buf = r->buf, h->cls = rec_class(r);
-            if (r->kind == POOL_IMPORT) h->base = r->import_lo, h->end = r->import_hi, h->alloc = NULL;
-            else h->base = r->lo, h->end = r->lo + r->size, h->alloc = r->alloc;
+            if (r->kind == POOL_IMPORT) h->base = r->import_lo, h->end = r->import_hi, h->alloc = NULL, h->pool = r;
+            else h->base = r->lo, h->end = r->lo + r->size, h->alloc = r->alloc, h->pool = NULL;
         }
     }
     if (r && r->kind == POOL_IMPORT && r->buf) {
         out->cls = rec_class(r);
+        out->pool = r;
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
@@ -404,16 +411,20 @@ static void flag_names(uint32_t f, char *buf, size_t n) {
 
 // One line per (kind, flags) group of the live pools, then the bytes the replay bound or copied per frame by pool
 // class since the previous census (the first one: since frame 1200). Logged at frame 1800 (in the world from the
-// run-game saves) and with TOTK_TRACE=perf every 1800 frames.
+// run-game saves), at frame 600, and with TOTK_TRACE=perf every 1800 frames.
+static void dirty_frame(uint64_t frame);
+
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    if (rt_trace & RT_TRACE_PERF) dirty_frame(frame);
     if (frame == 1200) {   // loading is over: the first window starts here
         for (int c = 0; c < VK_MCLS_N; c++)
             for (int u = 0; u < VK_MUSE_N; u++) InterlockedExchange64(&traffic[c][u], 0);
         window_start = frame;
         return;
     }
-    if (frame % 1800 || !(frame == 1800 || (rt_trace & RT_TRACE_PERF))) return;
+    // Frame 600 as well: runs on slow machines end before 1800.
+    if (frame != 600 && (frame % 1800 || !(frame == 1800 || (rt_trace & RT_TRACE_PERF)))) return;
     typedef struct { int kind; uint32_t flags; uint64_t n, bytes; } Group;
     Group g[64];
     int ng = 0;
@@ -600,6 +611,225 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked) {
     *checks = __atomic_exchange_n(&n_snap_checks, 0, __ATOMIC_RELAXED);
     *calls = __atomic_exchange_n(&n_snap_calls, 0, __ATOMIC_RELAXED);
     *untracked = __atomic_exchange_n(&n_snap_untracked, 0, __ATOMIC_RELAXED);
+}
+
+// ---------------------------------------------------------------- dirty census (TOTK_TRACE=perf)
+// What a device-local mirror of the buffer-bound pools would upload (build/mem-plan.md step 2). The replay notes every
+// imported pool it binds as a vertex, index, uniform, storage or indirect buffer (vk_mem_bound_note). At the start of
+// each submit one write-watch query per run of such pools stamps the pages written since with a new generation, in the
+// shared generation table (no second consumer of the OS bits: texture checks see the stamps), and the pages of those
+// pools are counted:
+// - eager: pages stamped after the previous submit's scan, in every buffer-bound pool (upload at every submit);
+// - lazy: pages stamped after the pool's previous count, in pools the previous submit bound (upload when bound);
+// - first use: the size of a pool the first time it is bound (a mirror copies the whole pool then).
+// Classes: CPU_CACHED, CPU_UNCACHED, other (CPU_NO_ACCESS). Logged as `mem: dirty` every 60 frames.
+#define DIRTY_UNSYNCED UINT32_MAX
+#define DIRTY_GAP 0x100000ull   // pools closer than this share one query (the gap's pages are stamped too)
+#define DIRTY_WIN 60
+enum { DC_CACHED, DC_UNC, DC_OTHER, DC_N };
+typedef struct {
+    uint64_t eager[DC_N], lazy[DC_N], first[DC_N];
+    uint64_t submits, queries, scan_ns, sub_max, frames;
+} DirtyAcc;
+static uint32_t dirty_sub = 1, dirty_gen;   // submit lock: the current submit number, generation of the last scan
+static uint64_t first_pending[DC_N], ever_n[DC_N], ever_bytes[DC_N];   // submit lock
+static PoolRec **dlist;                     // submit lock: the buffer-bound pools of a scan
+static int dcap;
+static SRWLOCK dirty_lock = SRWLOCK_INIT;   // everything below
+static DirtyAcc dfr, dwin;                  // this frame, this window
+static uint32_t dwin_kib[DIRTY_WIN][DC_N];  // eager KiB of each frame of the window
+static uint64_t live_n[DC_N], live_bytes[DC_N], live_untracked, ever_snap_n[DC_N], ever_snap_bytes[DC_N];
+
+static int dc_class(const PoolRec *r) {
+    int c = rec_class(r);
+    return c == VK_MCLS_HOST_CACHED ? DC_CACHED : c == VK_MCLS_HOST_UNC ? DC_UNC : DC_OTHER;
+}
+
+void vk_mem_bound_note(void *pool) {
+    PoolRec *r = pool;
+    if (r->bound_sub == dirty_sub) return;
+    r->bound_sub = dirty_sub;
+    if (r->bufbound) return;
+    r->bufbound = 1, r->synced_gen = DIRTY_UNSYNCED;
+    int k = dc_class(r);
+    ever_n[k]++, ever_bytes[k] += r->size, first_pending[k] += r->size;
+}
+
+static uint64_t page_lo(const PoolRec *r) { return r->lo & ~0xfffull; }
+static uint64_t page_hi(const PoolRec *r) { return (r->lo + r->size + 0xfff) & ~0xfffull; }
+
+// gen_lock held exclusively. 0: the range is not write-watched.
+static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
+    for (;;) {
+        uint64_t n = mem_written_pages(lo, hi - lo, gen_pages, sizeof gen_pages / sizeof *gen_pages);
+        if (n == UINT64_MAX) return 0;
+        for (uint64_t k = 0; k < n; k++) {
+            uint32_t *s = gen_slot(gen_pages[k], 1);
+            if (s) *s = g;
+        }
+        if (n < sizeof gen_pages / sizeof *gen_pages) return 1;
+    }
+}
+
+void vk_mem_dirty_submit(void) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    uint64_t t0 = kern_now_ns();
+    uint32_t prev = dirty_sub;   // the submit whose replay noted the bindings
+    dirty_sub = prev + 1 ? prev + 1 : 1;
+    uint64_t eager[DC_N] = {0}, lazy[DC_N] = {0}, ln[DC_N] = {0}, lb[DC_N] = {0}, untracked = 0, queries = 0;
+    AcquireSRWLockShared(&pool_lock);
+    if (dcap < pool_index.n) {
+        dcap = pool_index.n * 2;
+        dlist = realloc(dlist, (size_t)dcap * sizeof *dlist);
+        if (!dlist) rt_fatal("vk: out of memory for the dirty census");
+    }
+    int n = 0;
+    for (int i = 0; i < pool_index.n; i++) {
+        PoolRec *r = pool_index.e[i].buf;
+        if (r->kind == POOL_IMPORT && r->bufbound) dlist[n++] = r;
+    }
+    AcquireSRWLockExclusive(&gen_lock);
+    uint32_t g = ++gen_now, since = dirty_gen;
+    dirty_gen = g;
+    for (int i = 0; i < n;) {   // one query per run of pools (sorted by address)
+        uint64_t lo = page_lo(dlist[i]), hi = page_hi(dlist[i]);
+        int j = i + 1;
+        for (; j < n && page_lo(dlist[j]) <= hi + DIRTY_GAP; j++)
+            if (page_hi(dlist[j]) > hi) hi = page_hi(dlist[j]);
+        queries++;
+        int ok = query_stamp(lo, hi, g);
+        for (int k = i; k < j; k++) {
+            dlist[k]->untracked = 0;
+            if (!ok) queries++, dlist[k]->untracked = (uint8_t)!query_stamp(page_lo(dlist[k]), page_hi(dlist[k]), g);
+        }
+        i = j;
+    }
+    uint64_t covered = 0;
+    for (int i = 0; i < n; i++) {
+        PoolRec *r = dlist[i];
+        int k = dc_class(r);
+        ln[k]++, lb[k] += r->size;
+        int fresh = r->synced_gen == DIRTY_UNSYNCED, lz = !fresh && r->bound_sub == prev;
+        uint32_t ls = r->synced_gen;
+        if (fresh || r->bound_sub == prev) r->synced_gen = g;
+        if (r->untracked) { untracked += r->size; continue; }
+        if (fresh) continue;   // counted as first use
+        uint64_t lo = page_lo(r), hi = page_hi(r), ne = 0, nl = 0;
+        if (lo < covered) lo = covered;   // overlapping pools: each page once
+        if (lo >= hi) continue;
+        covered = hi;
+        for (uint64_t a = lo; a < hi;) {
+            uint64_t ci = a >> GEN_CHUNK_SHIFT, ce = (ci + 1) << GEN_CHUNK_SHIFT;
+            if (ce > hi) ce = hi;
+            const uint32_t *ch = ci < GEN_CHUNKS ? gen_chunk[ci] : NULL;
+            if (ch)
+                for (uint64_t x = a; x < ce; x += 1ull << GEN_PAGE_SHIFT) {
+                    uint32_t v = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
+                    ne += v > since;
+                    nl += lz && v > ls;
+                }
+            a = ce;
+        }
+        eager[k] += ne << GEN_PAGE_SHIFT, lazy[k] += nl << GEN_PAGE_SHIFT;
+    }
+    ReleaseSRWLockExclusive(&gen_lock);
+    ReleaseSRWLockShared(&pool_lock);
+    uint64_t tot = 0;
+    for (int k = 0; k < DC_N; k++) tot += eager[k];
+    AcquireSRWLockExclusive(&dirty_lock);
+    for (int k = 0; k < DC_N; k++) {
+        dfr.eager[k] += eager[k], dfr.lazy[k] += lazy[k], dfr.first[k] += first_pending[k];
+        first_pending[k] = 0;
+        live_n[k] = ln[k], live_bytes[k] = lb[k], ever_snap_n[k] = ever_n[k], ever_snap_bytes[k] = ever_bytes[k];
+    }
+    live_untracked = untracked;
+    dfr.submits++, dfr.queries += queries;
+    if (tot > dfr.sub_max) dfr.sub_max = tot;
+    dfr.scan_ns += kern_now_ns() - t0;
+    ReleaseSRWLockExclusive(&dirty_lock);
+}
+
+static void dirty_frame(uint64_t frame) {
+    AcquireSRWLockExclusive(&dirty_lock);
+    if (dwin.frames < DIRTY_WIN)
+        for (int k = 0; k < DC_N; k++) dwin_kib[dwin.frames][k] = (uint32_t)(dfr.eager[k] >> 10);
+    for (int k = 0; k < DC_N; k++) dwin.eager[k] += dfr.eager[k], dwin.lazy[k] += dfr.lazy[k], dwin.first[k] += dfr.first[k];
+    dwin.submits += dfr.submits, dwin.queries += dfr.queries, dwin.scan_ns += dfr.scan_ns, dwin.frames++;
+    if (dfr.sub_max > dwin.sub_max) dwin.sub_max = dfr.sub_max;
+    memset(&dfr, 0, sizeof dfr);
+    if (frame % DIRTY_WIN) { ReleaseSRWLockExclusive(&dirty_lock); return; }
+    DirtyAcc w = dwin;
+    uint32_t kib[DIRTY_WIN][DC_N];
+    memcpy(kib, dwin_kib, sizeof kib);
+    uint64_t lv[DC_N], lvb[DC_N], ev[DC_N], evb[DC_N], unt = live_untracked;
+    for (int k = 0; k < DC_N; k++) lv[k] = live_n[k], lvb[k] = live_bytes[k], ev[k] = ever_snap_n[k], evb[k] = ever_snap_bytes[k];
+    memset(&dwin, 0, sizeof dwin);
+    ReleaseSRWLockExclusive(&dirty_lock);
+    if (!w.frames) return;
+    uint64_t fl[2][3][2];
+    nvn_flush_stats(fl);
+    double f = (double)w.frames, M = 1048576.0;
+    uint64_t sub_tot = 0;
+    for (int k = 0; k < DC_N; k++) sub_tot += w.eager[k];
+#define C3(a, d) (a)[0] / (d), (a)[1] / (d), (a)[2] / (d)
+    rt_log("mem: dirty frame %llu: frames %llu submits_per_frame %.2f; per frame, cached/uncached/other: eager_mib "
+           "%.3f/%.3f/%.3f lazy_mib %.3f/%.3f/%.3f first_mib %.3f/%.3f/%.3f flush_pool_calls %.1f/%.1f/%.1f "
+           "flush_pool_mib %.3f/%.3f/%.3f flush_buf_calls %.1f/%.1f/%.1f flush_buf_mib %.3f/%.3f/%.3f; per submit: "
+           "avg_mib %.3f max_mib %.3f; mirror: live_pools %llu/%llu/%llu live_mib %.1f/%.1f/%.1f ever_pools %llu/%llu/%llu "
+           "ever_mib %.1f/%.1f/%.1f untracked_mib %.1f; cost: queries_per_frame %.1f scan_ms_per_frame %.3f",
+           (unsigned long long)frame, (unsigned long long)w.frames, w.submits / f,
+           C3(w.eager, f * M), C3(w.lazy, f * M), C3(w.first, f * M),
+           fl[0][0][0] / f, fl[0][1][0] / f, fl[0][2][0] / f, fl[0][0][1] / f / M, fl[0][1][1] / f / M, fl[0][2][1] / f / M,
+           fl[1][0][0] / f, fl[1][1][0] / f, fl[1][2][0] / f, fl[1][0][1] / f / M, fl[1][1][1] / f / M, fl[1][2][1] / f / M,
+           w.submits ? sub_tot / (double)w.submits / M : 0.0, w.sub_max / M,
+           (unsigned long long)lv[0], (unsigned long long)lv[1], (unsigned long long)lv[2], C3(lvb, M),
+           (unsigned long long)ev[0], (unsigned long long)ev[1], (unsigned long long)ev[2], C3(evb, M), unt / M,
+           w.queries / f, w.scan_ns / 1e6 / f);
+#undef C3
+    char line[DIRTY_WIN * 36 + 64];
+    size_t k = (size_t)snprintf(line, sizeof line, "mem: dirty frames KiB cached/uncached/other:");
+    for (uint64_t i = 0; i < w.frames && i < DIRTY_WIN; i++)
+        k += (size_t)snprintf(line + k, k < sizeof line ? sizeof line - k : 0, " %u/%u/%u", kib[i][0], kib[i][1], kib[i][2]);
+    rt_log("%s", line);
+}
+
+// Device class (build/mem-plan.md): INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
+// heap that is not device-local (host memory) -> discrete; otherwise uma (import everywhere). Only logged for now.
+void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m) {
+    int big_local = -1, host_heap = -1;
+    for (uint32_t h = 0; h < m->memoryHeapCount; h++) {
+        if (m->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            if (m->memoryHeaps[h].size >= (1ull << 30) && big_local < 0) big_local = (int)h;
+        } else if (host_heap < 0) host_heap = (int)h;
+    }
+    static const char *const types[] = {"other", "integrated", "discrete", "virtual", "cpu"};
+    int t = (int)p->deviceType;
+    const char *tn = t >= 0 && t <= 4 ? types[t] : "unknown";
+    const char *cls, *why;
+    if (p->deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) cls = "uma", why = "integrated gpu";
+    else if (p->deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) cls = "uma", why = "not a discrete gpu";
+    else if (big_local < 0) cls = "uma", why = "no device-local heap of 1 GiB or more";
+    else if (host_heap < 0) cls = "uma", why = "every heap is device-local";
+    else cls = "discrete", why = "device-local heap separate from host memory";
+    char line[2048];
+    size_t k = (size_t)snprintf(line, sizeof line, "mem: class %s (%s; device type %d %s, %s)", cls, why, t, tn, p->deviceName);
+    for (uint32_t h = 0; h < m->memoryHeapCount; h++)
+        k += (size_t)snprintf(line + k, k < sizeof line ? sizeof line - k : 0, "; heap %u %.0f MiB flags %#x%s%s", h,
+                              m->memoryHeaps[h].size / 1048576.0, m->memoryHeaps[h].flags,
+                              m->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " DEVICE_LOCAL" : "",
+                              m->memoryHeaps[h].flags & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT ? " MULTI_INSTANCE" : "");
+    rt_log("%s", line);
+    k = (size_t)snprintf(line, sizeof line, "mem: types");
+    for (uint32_t i = 0; i < m->memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m->memoryTypes[i].propertyFlags;
+        k += (size_t)snprintf(line + k, k < sizeof line ? sizeof line - k : 0, "; %u heap %u flags %#x%s%s%s%s%s", i,
+                              m->memoryTypes[i].heapIndex, f, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? " DEVICE_LOCAL" : "",
+                              f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? " HOST_VISIBLE" : "",
+                              f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? " HOST_COHERENT" : "",
+                              f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " HOST_CACHED" : "",
+                              f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? " LAZY" : "");
+    }
+    rt_log("%s", line);
 }
 
 // ---------------------------------------------------------------- upload batches and deferred destruction

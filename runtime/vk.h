@@ -121,6 +121,7 @@ typedef struct {
     VmaAllocation alloc;
     VkDeviceSize alloc_offset;
     int cls;
+    void *pool;   // the imported pool record behind the span (NULL for device memory), for VK_MEM_BOUND
 } VkMemSpan;
 // Traffic census (vk_memory.c vk_mem_census): bytes the replay binds or copies, by pool class and use. Imported pools by
 // their CPU access flag; DEVICE is physical memory (directly or through a virtual pool); SCRATCH the replay's transient
@@ -130,6 +131,14 @@ enum { VK_MCLS_NONE, VK_MCLS_HOST_NOACC, VK_MCLS_HOST_UNC, VK_MCLS_HOST_CACHED, 
 enum { VK_MUSE_VB, VK_MUSE_IB, VK_MUSE_UBO, VK_MUSE_SSBO, VK_MUSE_IND, VK_MUSE_COPY_SRC, VK_MUSE_GPU_WRITE,
        VK_MUSE_CPU_READ, VK_MUSE_N };
 void vk_mem_count(int cls, int use, uint64_t bytes);
+// TOTK_TRACE=perf dirty census (vk_memory.c): the replay notes each imported pool it binds as a vertex, index, uniform,
+// storage or indirect buffer; at the start of every submit the pages the CPU wrote in such pools since the previous
+// submit are counted from the shared page generations and logged as `mem: dirty` every 60 frames. Nothing when tracing
+// is off: VK_MEM_BOUND is one flag test at the call site.
+void vk_mem_bound_note(void *pool);
+#define VK_MEM_BOUND(sp) do { if ((rt_trace & RT_TRACE_PERF) && (sp).pool) vk_mem_bound_note((sp).pool); } while (0)
+void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its lock, before the replay
+void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
                                                   // with TOTK_TRACE=perf, every 1800 frames

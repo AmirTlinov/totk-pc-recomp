@@ -165,6 +165,7 @@ static int pick_device(void) {
         }
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
+    vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
 
