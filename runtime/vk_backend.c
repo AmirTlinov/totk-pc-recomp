@@ -159,6 +159,12 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
     vk_present_drain();
     vk_texture_write_back(addr, size);
 }
+static void vk_be_cpu_synced(uint64_t fence) {
+    if (!vk_texture_small_dirty()) return;
+    vk_sync_start();
+    vk_present_drain();
+    vk_texture_write_back_small(fence);
+}
 
 const GfxBackend gfx_vulkan_backend = {
     .name = "vulkan",
@@ -178,6 +184,7 @@ const GfxBackend gfx_vulkan_backend = {
     .write_texels = vk_be_write_texels,
     .guest_written = vk_be_guest_written,
     .guest_read = vk_be_guest_read,
+    .cpu_synced = vk_be_cpu_synced,
 };
 
 void vk_backend_shutdown(void) {

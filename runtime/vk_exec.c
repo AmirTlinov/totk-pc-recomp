@@ -47,6 +47,8 @@ VkExecFrame vk_exec_frame;
 static struct { const uint8_t *mem; uint32_t w, h, fmt, n; } fw[64];   // textures written this frame
 static int nfw;
 
+uint64_t vk_exec_recording_fence(void) { return x_here ? X.fence : 0; }
+
 void vk_exec_frame_written(const tex_t *t) {
     if (!(rt_trace & RT_TRACE_GFX) || !t) return;
     for (int i = 0; i < nfw; i++)
