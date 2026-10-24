@@ -22,6 +22,7 @@ prints `<log>: rc=<code>`. The game window opens behind the user's windows witho
 | `user-save-2026-10-21-monsters` | Moblins and Zonai constructs attack at once; use with `--script tools/input/fight.txt` |
 | `user-save-2026-10-21` | Hyrule field facing the castle, rainy; distant sky over the castle |
 | `user-save-2026-10-23-pillars` | Hyrule field by standing stone pillars, about 17:40, a Zonai construct beside Link; use with `--script tools/input/backrun.txt` (runs backward from 1550: phantom rocks, a one-frame glitch at about 1605) |
+| `user-save-2026-10-24-brightbloom` | Cave, about 20:40: a Brightbloom plant at the lower left (its bulb floats beside the stem, `build/v121-bloom/NOTES.md`), teal Moblin and Bokoblin ahead or Zonai constructs (runs differ) |
 | `user-save-2026-10-22-island` | Sky island edge; use with `--script tools/input/island.txt` (runs off, skydives, opens the paraglider with B at frame 1975; X does nothing in a dive) |
 
 `--frames` counts presents. Pick `1500 + the frames you need in-world`.
