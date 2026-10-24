@@ -212,7 +212,9 @@ def build_python(out):
     py = out / 'python'
     with zipfile.ZipFile(fetch('python-embed')) as z:
         z.extractall(py)
-    (py / 'python314._pth').write_text('python314.zip\n.\nLib/site-packages\n', encoding='utf-8')   # embeddable: no site-packages by default
+    (py / 'python314._pth').write_text('python314.zip\n.\nLib/site-packages\n..\n../tools\n../recomp\n', encoding='utf-8')
+    # The embeddable Python ignores the script directory and PYTHONPATH once a ._pth file exists, so the folder's own code
+    # (installer/, and tools/*.py and recomp/*.py importing their siblings) has to be on the list.
     env = dict(os.environ, UV_CACHE_DIR=str(MAIN_ROOT / 'toolchain' / 'uv-cache'))
     run(['uv', 'pip', 'install', '--target', py / 'Lib' / 'site-packages', '--python', sys.executable,
          '--python-platform', 'windows', '--python-version', '3.14', '--only-binary', ':all:',
@@ -383,7 +385,7 @@ def prove(out):
     chk = MAIN_ROOT / 'build' / 'release-check'
     env = clean_env(out / 'python', out / 'llvm' / 'bin', out / 'bin')
     t0 = time.time()
-    run([out / 'python' / 'python.exe', '-I', out / 'tools' / 'build_game.py', '--toolchain', out / 'llvm',
+    run([out / 'python' / 'python.exe', out / 'tools' / 'build_game.py', '--toolchain', out / 'llvm',
          '--deps', out / 'runtime' / 'deps', '--runtime', out / 'runtime', '--runtime-lib', out / 'runtime' / 'libtotkrt.a',
          '--ninja', out / 'bin' / 'ninja.exe', '--gen', gen, '--out', chk, '--exefs', ext / 'exefs', '--romfs', ext / 'romfs',
          '--profile', chk / 'profile'], env=env)
