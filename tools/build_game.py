@@ -86,6 +86,7 @@ DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 INSTALL_SIDE = {'romfs.c'}   # runtime sources that include romfs_config.h: compiled per install, not in the library
 LIB_NAME = 'libtotkrt.a'
 AR = UCRT / 'llvm-ar.exe'
+WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
@@ -146,10 +147,10 @@ def chunk_files(gen, mod):
 
 def write_if_changed(path, text):
     """Keep the mtime of an unchanged file so Ninja does not rebuild from it."""
-    if path.exists() and path.read_text() == text:
+    if path.exists() and path.read_text(encoding='utf-8', errors='replace') == text:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, newline='\n')
+    path.write_text(text, encoding='utf-8', newline='\n')   # Ninja and clang read UTF-8; paths may be non-ASCII
 
 
 def c_string(s):
@@ -160,9 +161,9 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 
 def runtime_sources(skip=()):
-    """Every runtime/*.c and runtime/platform/*.c except the names in skip, so a task adds a file without editing this
-    script."""
-    pats = ('*.c', '*.cpp', 'platform/*.c')
+    """Every runtime/*.c, runtime/platform/*.c and runtime/*.rc except the names in skip, so a task adds a file without
+    editing this script."""
+    pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip)
 
 
@@ -236,6 +237,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         '  depfile = $out.d',
         '  description = CC $in',
         '',
+        'rule rc',
+        f'  command = {WINDRES.as_posix()} -I {flag_path(RUNTIME)} -O coff $in -o $out',
+        '  description = RC $in',
+        '',
         'rule link',
         '  command = $cc $ldflags @$out.rsp $libs -o $out',
         '  rspfile = $out.rsp',
@@ -262,7 +267,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources += [out / 'modules.c']
     for src in sources:
         o = runtime_object(out, src)
-        lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
+        lines.append(f'build {ninja_path(o)}: {"rc" if src.suffix == ".rc" else "cc_rt"} {ninja_path(src)}')
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]
@@ -295,7 +300,7 @@ def main_objects(gen, main_out, rt_dir, mods):
         return None, f'{flag_path(main_ninja)} not found'
     if gen != (ROOT / 'generated' / main_out.name).resolve():
         return None, 'generated C directory is not the main one'
-    lines = main_ninja.read_text().splitlines()
+    lines = main_ninja.read_text(encoding='utf-8').splitlines()
     sources = dict(l[6:].split(': cc_gen ') for l in lines if l.startswith('build ') and ': cc_gen ' in l)
     flags = next((l for l in lines if l.startswith('genflags = ')), '')
     if not flags.startswith('genflags = ' + ' '.join(GEN_FLAGS) + ' -I '):
@@ -383,7 +388,7 @@ def read_manifest(path):
     """{object path below obj/: (sha256, size, mtime_ns)}; empty when the file is missing."""
     man = {}
     if path.is_file():
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding='utf-8').splitlines():
             sha, size, mtime, rel = line.split(' ', 3)
             man[rel] = (sha, int(size), int(mtime))
     return man
@@ -588,7 +593,7 @@ def main():
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
         expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
-    global CLANG, AR, NINJA, TOOLCHAIN_BIN, DEPS
+    global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
         NINJA = args.ninja.resolve()
     elif not NINJA.is_file() and (ROOT / 'bin' / 'ninja.exe').is_file():
@@ -598,6 +603,7 @@ def main():
         TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
         CLANG = TOOLCHAIN_BIN / 'clang.exe'
         AR = TOOLCHAIN_BIN / 'llvm-ar.exe'
+        WINDRES = TOOLCHAIN_BIN / 'llvm-windres.exe'
         DEPS = (args.deps or DEFAULT_DEPS).resolve()
         dlls = sorted((DEPS / 'bin').glob('*.dll'))
     for tool in (CLANG, NINJA):
