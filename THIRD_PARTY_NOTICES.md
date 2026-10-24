@@ -19,7 +19,7 @@ Code copied or adapted from another project is listed here with its source, the 
 | deko3d block-linear image layout, as ported in MacNativeGames' `nvn_tex.c` (Apple parts dropped, layout math unchanged; licence text in `games/totk/third_party/d2r_gfx/LICENSE.deko3d`, reproduced in the file header) | https://github.com/devkitPro/deko3d (`source/dk_image.cpp`), via MacNativeGames @ `b75be8cfa704df3701e86130c8ced268e79d6b11` (`games/totk/third_party/d2r_gfx/gfx/nvn/nvn_tex.c`, `nvn_tex.h`), Copyright (C) 2018-2020 fincs | zlib | M4 task T3b: `runtime/nvn_tex.c`, `runtime/nvn_tex.h` |
 | MacNativeGames texture auto-layout goldens (40 original-SDK size and block-height cases) | https://github.com/ly05010419/MacNativeGames @ `b75be8cfa704df3701e86130c8ced268e79d6b11` (`games/totk/tests/texture_auto_layout/probe.c`), Copyright (c) 2026 jhaizhou | MIT | M4 task T3b: `runtime/nvn_tex_probe.c`; T3f: `runtime/nvn_probe.c` (four of the cases, through the procs) |
 | MacNativeGames block-linear deswizzler (address function; copy loop split out as `tex_bl_copy`) | https://github.com/ly05010419/MacNativeGames @ `b75be8cfa704df3701e86130c8ced268e79d6b11` (`games/totk/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c`), Copyright (c) 2026 jhaizhou | MIT | M4 task T5a: `runtime/tex_deswizzle.c`, `runtime/tex.h` |
-| SDL 3.4.18 (MSYS2 `mingw-w64-ucrt-x86_64-SDL3`), dynamic link, `SDL3.dll` and its dependency `libiconv-2.dll` (LGPL-2.1, unmodified, not linked into the exe) copied next to `totk.exe` | https://libsdl.org, Copyright (c) 1997-2026 Sam Lantinga | zlib | `runtime/input_win.c` (gamepad input, rumble, gyro and accelerometer) |
+| SDL 3.4.18, dynamic link, `SDL3.dll` copied next to `totk.exe`. Developer builds use the MSYS2 build (`mingw-w64-ucrt-x86_64-sdl3`, which imports `libiconv-2.dll`, LGPL-2.1, unmodified, copied beside it); the installer release ships the upstream release `SDL3-3.4.18-win32-x64.zip`, which imports no libiconv | https://libsdl.org, Copyright (c) 1997-2026 Sam Lantinga | zlib | `runtime/input_win.c` (gamepad input, rumble, gyro and accelerometer) |
 | libopus (MSYS2 `mingw-w64-ucrt-x86_64-opus`), dynamic link, `libopus-0.dll` copied next to `totk.exe` | https://opus-codec.org, Copyright (c) 2001-2023 Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon | BSD-3-Clause | `runtime/ov_media.c` (nn::codec hardware Opus decoder) |
 | Vulkan Memory Allocator 3.4.0 (MSYS2 `mingw-w64-ucrt-x86_64-vulkan-memory-allocator`), header-only, compiled into `totk.exe` | https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator, Copyright (c) 2017-2026 Advanced Micro Devices, Inc. | MIT | `runtime/vk_vma.cpp` (the allocator behind `runtime/vk_memory.c`) |
 | MacNativeGames host movie decoder (`movie::Decoder` for VP9 over libvpx: entry list, buffer and event semantics, NV12 output format, PTS pacing) | https://github.com/ly05010419/MacNativeGames @ `b75be8cfa704df3701e86130c8ced268e79d6b11` (`games/totk/runtime/movie_host.c`, `movie_host.h`), Copyright (c) 2026 MacNativeGames contributors | MIT | `runtime/ov_movie.c`, `runtime/movie.h` |
@@ -31,6 +31,26 @@ These tools run on the developer's or player's machine during the build. They ar
 
 | Tool | Source | License | Purpose |
 |---|---|---|---|
-| hactool | https://github.com/SciresM/hactool @ `1d64a83450e025622f3468c28fc4164dad2c5ef6`, with patches from MacNativeGames | ISC | NCA and update container extraction |
+| hactool (the installer release ships it, see below) | https://github.com/SciresM/hactool @ `1d64a83450e025622f3468c28fc4164dad2c5ef6`, with patches from MacNativeGames | ISC | NCA and update container extraction |
 | Capstone | https://www.capstone-engine.org | BSD-3-Clause | ARM64 disassembly for analysis |
 | Unicorn | https://www.unicorn-engine.org | GPL-2.0 (Python bindings BSD) | Differential testing of the lifter; never linked into the game |
+
+## Distributed in the installer release
+
+`tools/make_release.py` assembles these into the release folder of `docs/installer.md`. Versions and sha256 of every download are pinned in that script; licence texts are in the folder's `licenses/` and in each component's own folder.
+
+| Component | Source | License | Where in the release |
+|---|---|---|---|
+| CPython 3.14.9 embeddable package, with `tkinter` and Tcl/Tk 9.0.4 taken from the python.org 3.14.9 installer's component MSI (unpacked, never run); includes `vcruntime140*.dll` (Microsoft, redistributable with Python), OpenSSL, libffi, SQLite, zlib, libtommath | https://www.python.org/downloads/release/python-3149/ | PSF-2.0 (Tcl/Tk: Tcl/Tk licence, BSD-style) | `python/` |
+| numpy 2.5.4 (with its bundled OpenBLAS), lz4 4.4.5, cryptography 50.0.2 (with its bundled OpenSSL), cffi 2.1.1, pycparser 3.11 | PyPI binary wheels, pins in `tools/requirements-installer.txt` | BSD-3-Clause; lz4 BSD-3-Clause; cryptography Apache-2.0 OR BSD-3-Clause; cffi MIT; pycparser BSD-3-Clause | `python/Lib/site-packages/` |
+| llvm-mingw 20261020 (LLVM/Clang/LLD 23, mingw-w64, libc++, libunwind, compiler-rt), x86_64 subset | https://github.com/mstorsjo/llvm-mingw/releases/tag/20261020 | Apache-2.0 with LLVM exception; mingw-w64 ZPL-2.1/BSD/public domain; libc++ and libunwind Apache-2.0 with LLVM exception and MIT/UIUC; winpthreads MIT | `llvm/` |
+| SDL 3.4.18 upstream Windows release (`SDL3.dll`) and mingw development package (headers, `libSDL3.dll.a`) | https://github.com/libsdl-org/SDL/releases/tag/release-3.4.18 | zlib | `bin/SDL3.dll`, `runtime/deps/` |
+| libopus 1.6.1 (MSYS2 `mingw-w64-ucrt-x86_64-opus` 1.6.1-2; `libopus-0.dll` imports only KERNEL32 and the UCRT api-ms-win-crt DLLs), headers and import library | https://repo.msys2.org/mingw/ucrt64/ | BSD-3-Clause | `bin/libopus-0.dll`, `runtime/deps/` |
+| libvpx 1.17.0 (MSYS2 `mingw-w64-ucrt-x86_64-libvpx` 1.17.0-1), headers and static library compiled into `totk.exe`; `libvpx-LICENSE.txt` and `libvpx-PATENTS.txt` come from the v1.17.0 source tag | https://github.com/webmproject/libvpx | BSD-3-Clause with the WebM patent grant | `runtime/deps/`, `licenses/` |
+| Vulkan-Headers and Vulkan-Loader 1.4.363.0 (MSYS2 packages; headers and `libvulkan-1.dll.a` only, no loader DLL) | https://github.com/KhronosGroup | Apache-2.0 OR MIT | `runtime/deps/` |
+| Vulkan Memory Allocator 3.4.0 (MSYS2 package), header | https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator | MIT | `runtime/deps/` |
+| Ninja 1.13.2 (`ninja-win.zip`) | https://github.com/ninja-build/ninja/releases/tag/v1.13.2 | Apache-2.0 | `bin/ninja.exe` |
+| hactool (SciresM @ `1d64a83450e025622f3468c28fc4164dad2c5ef6` plus MacNativeGames' `portable-patches.diff`: `MNG_TITLE_KEYS` and a relaxed BKTR size check), built with MSYS2 UCRT64 clang; imports only KERNEL32 and the UCRT | https://github.com/SciresM/hactool | ISC | `bin/hactool.exe` |
+| `totk_xlate.exe` (Ryujinx shader translator, NativeAOT build of `tools/xlate/`, see the Ryujinx row above) | built by `tools/build_xlate.py` | MIT | `bin/totk_xlate.exe` |
+| MacNativeGames shader variant list | https://github.com/ly05010419/MacNativeGames @ `b75be8cfa704df3701e86130c8ced268e79d6b11` (`games/totk/assets/shader_list.tsv`), Copyright (c) 2026 MacNativeGames contributors | MIT | `data/shader_list.tsv` |
+

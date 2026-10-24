@@ -36,6 +36,7 @@ Compile jobs share a memory budget (MEM_BUDGET, default the smaller of 50 GiB an
 big machine does not run out of memory on the largest chunks. Each phase reports its wall time and the peak memory
 of its processes (Windows job object accounting: committed private bytes).
 
+--ninja PATH names the Ninja to run; without MSYS2 the bin/ninja.exe of the release folder (tools/make_release.py) is used.
 --toolchain DIR builds with an llvm-mingw tree (DIR/bin/clang.exe) instead of MSYS2 UCRT64 clang. Ninja still comes
 from MSYS2. The libraries and headers MSYS2 supplies (Vulkan, SDL3, Opus, libvpx, VMA) then come from --deps DIR
 (default toolchain/deps-mingw: include/, lib/ with the import libraries and libvpx.a, bin/ with the DLLs), and the C++
@@ -563,6 +564,8 @@ def main():
     ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile)")
     ap.add_argument('--toolchain', type=Path, help='llvm-mingw directory (with bin/clang.exe) to build with instead of '
                                                    'MSYS2 UCRT64 clang')
+    ap.add_argument('--ninja', type=Path, help='ninja.exe to build with (default: MSYS2 UCRT64, else bin/ninja.exe of the '
+                                               'release folder)')
     ap.add_argument('--deps', type=Path, help=f'with --toolchain: include/, lib/ and bin/ of Vulkan, SDL3, Opus, libvpx '
                                               f'and VMA (default {DEFAULT_DEPS.relative_to(ROOT).as_posix()})')
     ap.add_argument('--make-runtime-lib', action='store_true',
@@ -585,7 +588,11 @@ def main():
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
         expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
     hashes = json.loads(Path(expected).read_text())['exefs_sha256']
-    global CLANG, AR, TOOLCHAIN_BIN, DEPS
+    global CLANG, AR, NINJA, TOOLCHAIN_BIN, DEPS
+    if args.ninja:
+        NINJA = args.ninja.resolve()
+    elif not NINJA.is_file() and (ROOT / 'bin' / 'ninja.exe').is_file():
+        NINJA = ROOT / 'bin' / 'ninja.exe'   # the release folder (tools/make_release.py)
     dlls = SDL3_DLLS
     if args.toolchain:
         TOOLCHAIN_BIN = (args.toolchain / 'bin').resolve()
