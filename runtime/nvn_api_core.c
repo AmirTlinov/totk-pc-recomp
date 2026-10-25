@@ -58,6 +58,11 @@ static void ov_memcpy(Cpu *c) {
 HOST_OVERRIDE("memcpy", ov_memcpy);
 
 __attribute__((weak)) void nvn_submit_prepare(const uint64_t *handles, int n) { (void)handles, (void)n; }
+__attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
+    memcpy(out, handles, sizeof *out * (size_t)n);
+}
+__attribute__((weak)) int gfx_replay_async(void) { return 0; }
+__attribute__((weak)) uint64_t gfx_replayed_submits(void) { return nvn_submit_count(); }
 
 // ---------- pools: GPU window (section 3.1) and the address index
 static SRWLOCK pool_lock = SRWLOCK_INIT;   // guards gva and index
@@ -560,7 +565,9 @@ NVN_API(nvnQueueFinish) {
 static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 
 // void nvnQueueSubmitCommands(NVNqueue *q, int n, const NVNcommandHandle *handles): replayed on this thread with its
-// core given up (section 2.2); the newest fence value is what QueueFenceSync records
+// core given up (section 2.2), or queued for the replay thread (TOTK_REPLAY_ASYNC, vk_backend.c); the newest fence
+// value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
+// for both.
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
@@ -569,8 +576,22 @@ NVN_API(nvnQueueSubmitCommands) {
     NVN_BLOCKING();
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
     q->submits++;
-    nvn_submit_prepare(h, n);
-    uint64_t f = gfx_backend()->submit(h, n), prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
+    uint64_t f;
+    if (gfx_replay_async()) {
+        // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
+        static SRWLOCK submit_lock = SRWLOCK_INIT;
+        uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
+        if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
+        AcquireSRWLockExclusive(&submit_lock);
+        nvn_submit_prepare_async(h, hs, n);
+        f = gfx_backend()->submit(hs, n);
+        ReleaseSRWLockExclusive(&submit_lock);
+        if (hs != local) free(hs);
+    } else {
+        nvn_submit_prepare(h, n);
+        f = gfx_backend()->submit(h, n);
+    }
+    uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     __atomic_store_n(&lod_fence[no % LOD_RING], f, __ATOMIC_RELAXED);
     __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);

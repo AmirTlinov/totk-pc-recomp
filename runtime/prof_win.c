@@ -269,11 +269,22 @@ static uint64_t wait_ns[PERF_N], frame_ns[PERF_N], worst_ns[PERF_N];   // window
 
 uint64_t perf_begin(void) { return kern_now_ns(); }
 
+static volatile DWORD replay_tid;   // asynchronous replay (vk_backend.c): its waits hold up the frame too
+
+void perf_replay_thread(void) { replay_tid = GetCurrentThreadId(); }
+
 void perf_end(int kind, uint64_t t0) {
-    if (!t0 || GetCurrentThreadId() != render_tid) return;
+    if (!t0) return;
+    DWORD tid = GetCurrentThreadId();
+    if (tid != render_tid && tid != replay_tid) return;
     uint64_t d = kern_now_ns() - t0;
-    wait_ns[kind] += d;
-    frame_ns[kind] += d;
+    if (tid == render_tid && !replay_tid) {   // one thread adds: no atomics on the synchronous path
+        wait_ns[kind] += d;
+        frame_ns[kind] += d;
+        return;
+    }
+    __atomic_fetch_add(&wait_ns[kind], d, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&frame_ns[kind], d, __ATOMIC_RELAXED);
 }
 
 static volatile LONG64 other_wait_ns;     // perf_gpu_wait on threads other than the render thread, over the window

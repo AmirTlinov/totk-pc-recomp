@@ -28,6 +28,7 @@ void prof_write(void);                          // idempotent; boot.c calls it b
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
+void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
 // first texture uploads and re-uploads after CPU writes, draws skipped while a shader translates in the background,
 // draws that waited for their pending pipeline and got it, draws into a target the previous frame did not render that

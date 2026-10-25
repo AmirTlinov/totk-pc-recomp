@@ -10,8 +10,19 @@
 // Back-edge pacing: the present thread submits the blit at once, then holds the host present (vkQueuePresentKHR) until
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
 // replay took. The blit is already on the queue, so the wait blocks no submission.
+//
+// Asynchronous replay (TOTK_REPLAY_ASYNC, default 1; 0 keeps the synchronous path unchanged): nvnQueueSubmitCommands
+// and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
+// order; the replay thread runs the synchronous submit and present bodies in that order, so every value is signalled
+// by the submission it was handed out for. The game runs at most one frame ahead: queueing present N waits until the
+// replay thread handled present N-1. Calls that read or free GPU state that queued work may use drain the queue first
+// (replay_drain), each cause counted. Design and the orderings it keeps: build/v121-replayq/NOTES.md.
 #include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
+#include "cfg.h"
 #include "flight.h"
 #include "gfx.h"
 #include "host.h"
@@ -21,7 +32,7 @@
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
 
 static SRWLOCK pl = SRWLOCK_INIT;
 static CONDITION_VARIABLE pcv = CONDITION_VARIABLE_INIT;   // job queued, job taken, job submitted
@@ -52,7 +63,10 @@ static DWORD WINAPI present_main(void *arg) {
         ReleaseSRWLockExclusive(&pl);
         if (flight_on) vk_thumbs_frame(j.frame);
         vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.w, j.h, j.has_crop ? j.crop : NULL);
-        vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
+        uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
+        if (j.value && f != j.value)
+            rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,
+                     (unsigned long long)f, (unsigned long long)j.value);
         AcquireSRWLockExclusive(&pl);
         busy = 0;
         WakeAllConditionVariable(&pcv);
@@ -84,11 +98,11 @@ void vk_present_drain(void) {
     perf_end(PERF_DRAIN, p0);
 }
 
-static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+// The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
+// presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
+static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
+                          uint64_t value) {
     static volatile long n_skipped;
-    vk_sync_start();
-    uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
-    perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
     vk_exec_frame_log(t, frame);
     vk_mem_census(frame);
     if (vk_dump_armed) vk_dump_present(frame);
@@ -97,10 +111,15 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     if (!img || !(img->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         if (InterlockedIncrement(&n_skipped) <= 8)
             rt_log("vk: present of texture %p (format %#x) skipped: no colour image", (const void *)t, t ? t->d.format : 0);
+        if (value) {   // the queued value is still signalled, in order
+            vk_present_drain();
+            uint64_t f = vk_sync_submit(NULL, 0);
+            if (f != value) rt_fatal("vk: skipped present signalled %llu, queued as %llu", (unsigned long long)f, (unsigned long long)value);
+        }
         return;
     }
     PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = kern_now_ns()};
+                    .at = at_ns, .queued = queued, .value = value};
     if (crop) {
         j.has_crop = 1;
         for (int i = 0; i < 4; i++) j.crop[i] = crop[i];
@@ -121,35 +140,223 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     if (rdoc_active()) { vk_present_drain(); rdoc_after_present(frame); }
 }
 
-// Pipelines (T6b) drop a released program's pipelines here.
-WEAK void vk_program_release(const prog_t *p) { (void)p; }
+// ---- Asynchronous replay
+enum { RI_SUBMIT, RI_PRESENT };
+typedef struct {
+    int kind, n, has_crop, crop[4];
+    uint64_t value, submit_no, at, queued;
+    uint64_t *h;
+    const tex_t *tex;
+} ReplayItem;
+#define RQ_CAP 64
+enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
+       DR_GUEST_READ, DR_FRAME, DR_FULL, DR_N };
+static const char *const dr_name[DR_N] = {"pool_fini", "map_virtual", "texture_release", "program_release", "finish",
+                                          "read_texels", "write_texels", "guest_read", "frame bound", "queue full"};
 
-static int vk_be_pool_init(pool_t *p) { vk_sync_start(); return vk_pool_init(p); }
-static void vk_be_pool_fini(pool_t *p) { vk_sync_start(); vk_present_drain(); vk_pool_fini(p); }
-static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
-    vk_sync_start();
-    vk_present_drain();
-    return vk_pool_map_virtual(v, n, requests);
+static SRWLOCK rl = SRWLOCK_INIT;
+static CONDITION_VARIABLE rcv = CONDITION_VARIABLE_INIT;   // item queued, item taken, item done
+static ReplayItem rq[RQ_CAP];
+static int rq_head, rq_n, r_busy, r_started;
+static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
+// Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
+static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr_twaits[DR_N], dr_tns[DR_N];
+
+int vk_replay_async(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_REPLAY_ASYNC");
+        on = !(e && !strcmp(e, "0"));
+        rt_log("vk: replay %s (TOTK_REPLAY_ASYNC=%d)",
+               on ? "on its own thread, at most one frame behind the game" : "on the submitting thread", on);
+    }
+    return on;
 }
-static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
-static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
-static void vk_be_texture_release(const tex_t *t) { vk_sync_start(); vk_present_drain(); vk_texture_release(t); }
-static void vk_be_program_release(const prog_t *p) { vk_program_release(p); }
-static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+
+// The front end's view (nvn_api_core.c, nvn_api_cmd.c): replay is asynchronous only on this back end.
+int gfx_replay_async(void) { return gfx_backend() == &gfx_vulkan_backend && vk_replay_async(); }
+
+// The newest submit number (nvn_submit_count) whose replay is done: recording copies it used may be freed.
+uint64_t gfx_replayed_submits(void) {
+    if (!gfx_replay_async()) return nvn_submit_count();
+    AcquireSRWLockShared(&rl);
+    uint64_t v = r_submit_done;
+    ReleaseSRWLockShared(&rl);
+    return v;
+}
+
+static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
     vk_present_drain();
     vk_texture_new_submit();
     return vk_sync_submit(handles, n);
 }
-static void vk_be_finish(void) { vk_sync_start(); vk_present_drain(); vk_sync_finish(); }
+
+static DWORD WINAPI replay_main(void *arg) {
+    (void)arg;
+    perf_replay_thread();
+    AcquireSRWLockExclusive(&rl);
+    for (;;) {
+        while (!rq_n) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
+        ReplayItem it = rq[rq_head];
+        rq_head = (rq_head + 1) % RQ_CAP;
+        rq_n--;
+        r_busy = 1;
+        WakeAllConditionVariable(&rcv);
+        ReleaseSRWLockExclusive(&rl);
+        if (it.kind == RI_SUBMIT) {
+            uint64_t f = submit_sync(it.h, it.n);
+            if (f != it.value)
+                rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
+                         (unsigned long long)it.value);
+            free(it.h);
+        } else {
+            uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
+            present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
+        }
+        AcquireSRWLockExclusive(&rl);
+        if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
+        else r_presents_done++;
+        r_busy = 0;
+        WakeAllConditionVariable(&rcv);
+    }
+    return 0;
+}
+
+static void wait_counted(int why, uint64_t t0) {   // rl held
+    uint64_t d = kern_now_ns() - t0;
+    dr_waits[why]++, dr_twaits[why]++;
+    dr_ns[why] += d, dr_tns[why] += d;
+    perf_end(PERF_DRAIN, t0);
+}
+
+// Queues an item (waits while the queue is full) and returns its value, reserved under rl so values follow queue order.
+static uint64_t replay_enqueue(ReplayItem *it) {
+    AcquireSRWLockExclusive(&rl);
+    if (!r_started) {
+        HANDLE h = CreateThread(NULL, 0, replay_main, NULL, 0, NULL);
+        if (!h) rt_fatal("vk: cannot start the replay thread (error %lu)", GetLastError());
+        CloseHandle(h);
+        r_started = 1;
+    }
+    if (rq_n == RQ_CAP) {
+        uint64_t p0 = perf_begin();
+        dr_calls[DR_FULL]++, dr_tcalls[DR_FULL]++;
+        while (rq_n == RQ_CAP) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
+        wait_counted(DR_FULL, p0);
+    }
+    it->value = vk_sync_reserve();
+    rq[(rq_head + rq_n) % RQ_CAP] = *it;
+    rq_n++;
+    WakeAllConditionVariable(&rcv);
+    ReleaseSRWLockExclusive(&rl);
+    return it->value;
+}
+
+// Returns once every queued item was replayed and submitted. Back-end entries only: the replay thread never calls them.
+static void replay_drain(int why) {
+    if (!gfx_replay_async()) return;
+    AcquireSRWLockExclusive(&rl);
+    dr_calls[why]++, dr_tcalls[why]++;
+    if (rq_n || r_busy) {
+        uint64_t p0 = perf_begin();
+        while (rq_n || r_busy) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
+        wait_counted(why, p0);
+    }
+    ReleaseSRWLockExclusive(&rl);
+}
+
+// What made the game wait for the replay: since the last line (every 1800 game frames), or over the run (at exit).
+static void replay_log(uint64_t frame, int total) {
+    char buf[1024];
+    int k = 0;
+    AcquireSRWLockExclusive(&rl);
+    const uint64_t *c = total ? dr_tcalls : dr_calls, *w = total ? dr_twaits : dr_waits, *t = total ? dr_tns : dr_ns;
+    for (int i = 0; i < DR_N && k < (int)sizeof buf - 96; i++)
+        if (c[i] || w[i])
+            k += snprintf(buf + k, sizeof buf - (size_t)k, "%s %s %llu calls, %llu waited %.1f ms", k ? ";" : "", dr_name[i],
+                          (unsigned long long)c[i], (unsigned long long)w[i], t[i] / 1e6);
+    memset(dr_calls, 0, sizeof dr_calls);
+    memset(dr_waits, 0, sizeof dr_waits);
+    memset(dr_ns, 0, sizeof dr_ns);
+    ReleaseSRWLockExclusive(&rl);
+    rt_log("vk: replay queue %s frame %llu:%s", total ? "over the run to" : "at", (unsigned long long)frame,
+           k ? buf : " no waits");
+}
+
+static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
+    vk_sync_start();
+    if (!gfx_replay_async()) {
+        uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
+        perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
+        present_image(t, crop, at_ns, kern_now_ns(), frame, 0);
+        return;
+    }
+    // Frame bound: the replay thread handled the previous present before this one is queued.
+    AcquireSRWLockExclusive(&rl);
+    dr_calls[DR_FRAME]++, dr_tcalls[DR_FRAME]++;
+    if (r_presents_done < r_presents_queued) {
+        uint64_t p0 = perf_begin();
+        while (r_presents_done < r_presents_queued) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
+        wait_counted(DR_FRAME, p0);
+    }
+    r_presents_queued++;
+    ReleaseSRWLockExclusive(&rl);
+    uint64_t frame = ++game_frames;
+    perf_present(frame);
+    if (frame % 1800 == 0) replay_log(frame, 0);
+    ReplayItem it = {.kind = RI_PRESENT, .tex = t, .at = at_ns, .queued = kern_now_ns()};
+    if (crop) {
+        it.has_crop = 1;
+        for (int i = 0; i < 4; i++) it.crop[i] = crop[i];
+    }
+    replay_enqueue(&it);
+}
+
+// Pipelines (T6b) drop a released program's pipelines here.
+WEAK void vk_program_release(const prog_t *p) { (void)p; }
+
+static int vk_be_pool_init(pool_t *p) { vk_sync_start(); return vk_pool_init(p); }
+static void vk_be_pool_fini(pool_t *p) { vk_sync_start(); replay_drain(DR_POOL_FINI); vk_present_drain(); vk_pool_fini(p); }
+static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
+    vk_sync_start();
+    replay_drain(DR_MAP_VIRTUAL);
+    vk_present_drain();
+    return vk_pool_map_virtual(v, n, requests);
+}
+static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
+static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
+static void vk_be_texture_release(const tex_t *t) {
+    vk_sync_start();
+    replay_drain(DR_TEX_RELEASE);
+    vk_present_drain();
+    vk_texture_release(t);
+}
+static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEASE); vk_program_release(p); }
+// Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
+// the value returned is the one the replay will signal.
+static uint64_t vk_be_submit(const uint64_t *handles, int n) {
+    if (!gfx_replay_async()) return submit_sync(handles, n);
+    vk_sync_start();
+    ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
+    if (n > 0) {
+        it.h = malloc(sizeof *it.h * (size_t)n);
+        if (!it.h) rt_fatal("vk: out of memory (replay queue)");
+        memcpy(it.h, handles, sizeof *it.h * (size_t)n);
+    }
+    return replay_enqueue(&it);
+}
+static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
 static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                               uint64_t img) {
     vk_sync_start();
+    replay_drain(DR_READ_TEXELS);
     vk_read_texels(t, v, r, dst, row, img);
 }
 static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
                                uint64_t img) {
     vk_sync_start();
+    replay_drain(DR_WRITE_TEXELS);
     vk_present_drain();
     vk_write_texels(t, v, r, src, row, img);
 }
@@ -157,9 +364,12 @@ static void vk_be_guest_written(uint64_t addr, uint64_t size) { vk_sync_start();
 static void vk_be_guest_read(uint64_t addr, uint64_t size) {
     if (!vk_texture_cpu_stale(addr, size)) return;
     vk_sync_start();
+    replay_drain(DR_GUEST_READ);
     vk_present_drain();
     vk_texture_write_back(addr, size);
 }
+// After a fence wait: the value is done, so its replay is too; a later submission the replay records meanwhile marks
+// its targets with a later fence, which write_back_small leaves alone. No drain.
 static void vk_be_cpu_synced(uint64_t fence) {
     if (!vk_texture_small_dirty()) return;
     vk_sync_start();
@@ -189,6 +399,8 @@ const GfxBackend gfx_vulkan_backend = {
 };
 
 void vk_backend_shutdown(void) {
+    replay_drain(DR_FINISH);
+    if (gfx_replay_async() && r_started) replay_log(game_frames, 1);
     vk_present_drain();
     vk_sync_shutdown();
     vk_mem_shutdown();

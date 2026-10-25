@@ -42,6 +42,7 @@ static SRWLOCK st_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE cv_work = CONDITION_VARIABLE_INIT;   // a submission, a callback or stop
 static CONDITION_VARIABLE cv_done = CONDITION_VARIABLE_INIT;   // done advanced
 static uint64_t issued, done;     // newest submitted value; newest value whose side effects ran
+static uint64_t reserved;         // asynchronous replay: newest value handed out before its submission (>= issued)
 static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
@@ -223,6 +224,7 @@ void vk_sync_start(void) {
         }
         AcquireSRWLockExclusive(&st_lock);
         issued = done = now;
+        if (reserved < now) reserved = now;
         stop = 0;
         ReleaseSRWLockExclusive(&st_lock);
         vk_mem_note_submit(now);
@@ -299,6 +301,17 @@ VkCommandBuffer vk_sync_split(void) {
     vkBeginCommandBuffer(s->cb, &bi);
     ts_begin(s->cb);
     return s->cb;
+}
+
+// Asynchronous replay (vk_backend.c): the value the next queued submission or present will signal. Values are handed
+// out in queue order and the replay thread submits them in that order, so each vk_sync_submit gets exactly its value.
+uint64_t vk_sync_reserve(void) {
+    vk_sync_start();
+    AcquireSRWLockExclusive(&st_lock);
+    if (reserved < issued) reserved = issued;
+    uint64_t v = ++reserved;
+    ReleaseSRWLockExclusive(&st_lock);
+    return v;
 }
 
 uint64_t vk_sync_submit(const uint64_t *handles, int n) {
@@ -378,8 +391,8 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     vk_sync_start();
     AcquireSRWLockExclusive(&st_lock);
     int ok;
-    if (value > issued) {
-        ok = 0;   // never submitted: never reached (as in the null back end)
+    if (value > issued && value > reserved) {
+        ok = 0;   // never submitted nor queued: never reached (as in the null back end)
     } else {
         uint64_t t0 = kern_now_ns();
         while (done < value) {

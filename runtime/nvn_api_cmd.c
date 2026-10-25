@@ -160,7 +160,7 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
 // ---------- recording copies
 // A handle points just past a copy_prefix. Copies are indexed by the 4 KiB page of their control-memory position, so
 // adding control memory again releases the copies recorded there without walking every live copy.
-typedef struct { uint64_t magic, bytes, made_at, used_at; } copy_prefix;
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred; } copy_prefix;   // deferred: 0 unknown, 1 none, 2 some
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -168,6 +168,30 @@ static SRWLOCK copy_lock = SRWLOCK_INIT;    // guards the two maps, the counters
 static nvn_hmap copy_pages = {.klen = 8};   // page -> copy_bucket
 static nvn_hmap copy_live = {.klen = 8};    // handle -> copy_prefix of a live copy
 static uint64_t ncopies, copy_bytes, copies_made, nsubmits;
+// Asynchronous replay: copies released by the game, and per-submission clones, that a queued submission still reads.
+// Freed once gfx_replayed_submits() reaches their used_at. Empty with synchronous replay.
+static copy_prefix **zombies;
+static uint32_t nzombies, cap_zombies;
+
+static void zombie_add(copy_prefix *pf) {   // copy_lock held
+    if (nzombies == cap_zombies) {
+        cap_zombies = cap_zombies ? cap_zombies * 2 : 64;
+        zombies = realloc(zombies, sizeof *zombies * cap_zombies);
+        if (!zombies) rt_fatal("nvn: out of memory (released recording copies)");
+    }
+    zombies[nzombies++] = pf;
+}
+
+static void zombie_sweep(uint64_t replayed) {   // copy_lock held
+    for (uint32_t i = 0; i < nzombies;) {
+        if (zombies[i]->used_at <= replayed) {
+            free(zombies[i]);
+            zombies[i] = zombies[--nzombies];
+        } else {
+            i++;
+        }
+    }
+}
 
 static copy_prefix *copy_find(uint64_t handle) {   // copy_lock held
     return nvn_hm_get(&copy_live, &handle);
@@ -258,7 +282,9 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
 // Adding control memory again retires every recording copy made in it (the driver's handle lived there).
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
+    uint64_t replayed = gfx_replayed_submits();
     AcquireSRWLockExclusive(&copy_lock);
+    if (nzombies) zombie_sweep(replayed);
     for (uintptr_t pg = lo >> COPY_PAGE_SHIFT; pg <= (hi - 1) >> COPY_PAGE_SHIFT; pg++) {
         copy_bucket *b = nvn_hm_get(&copy_pages, &pg);
         if (!b) continue;
@@ -271,7 +297,8 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             ncopies--;
             copy_bytes -= pf->bytes;
             pf->magic = 0;
-            free(pf);
+            if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
+            else free(pf);
             b->v[i] = b->v[--b->n];
         }
         if (!b->n) {
@@ -836,16 +863,17 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
 // What the console reads at the submit call is read here, on the game thread: every handle must be a live recording,
 // and deferred binds take the handles the game's arrays hold now (the game fills its tables for the next frame as soon
 // as the submit returns). The result is written into the recording copy.
-static uint64_t def_reads, def_changed;
+static uint64_t def_reads, def_changed, n_clones;
 
-static void resolve_deferred(const uint8_t *p, int depth) {
+static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds
+    int nd = 0;
     for (;;) {
         op_hdr h;
         memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
             rt_fatal("nvn: corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)p,
                      h.op, h.size);
-        if (h.op == OP_END) return;
+        if (h.op == OP_END) return nd;
         if (h.op == OP_JUMP) {
             memcpy(&p, p + 8, 8);
             continue;
@@ -854,10 +882,11 @@ static void resolve_deferred(const uint8_t *p, int depth) {
             uint64_t t;
             memcpy(&t, p + 8, 8);
             if (depth >= 16) rt_fatal("nvn: deferred bind resolution: call depth over 16");
-            resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1);
+            nd += resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1);
         } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
             p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
             if (b->src && b->n > 0 && b->n <= 32) {
+                nd++;
                 uint64_t cur[32];
                 memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
                 __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
@@ -877,6 +906,45 @@ void nvn_submit_prepare(const uint64_t *handles, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
     for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+}
+
+// Asynchronous replay. A copy a queued submission still reads keeps that submission's deferred binds: when it holds
+// deferred binds (or is not known to hold none), this submission gets a clone, resolved here and freed after its replay.
+void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
+    uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
+    uint64_t replayed = gfx_replayed_submits();
+    AcquireSRWLockExclusive(&copy_lock);
+    if (nzombies) zombie_sweep(replayed);
+    for (int i = 0; i < n; i++) {
+        copy_prefix *pf = copy_find(handles[i]);
+        if (!pf) {
+            ReleaseSRWLockExclusive(&copy_lock);
+            rt_fatal("nvn: QueueSubmitCommands: command handle %#llx is not a live recording (released or never recorded)",
+                     (unsigned long long)handles[i]);
+        }
+        out[i] = handles[i];
+        if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
+            size_t sz = sizeof *pf + pf->bytes;
+            copy_prefix *cl = malloc(sz);
+            if (!cl) rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
+            memcpy(cl, pf, sz);
+            cl->magic = 0;   // not a live handle: the game never sees it
+            cl->used_at = now;
+            zombie_add(cl);
+            out[i] = (uintptr_t)(cl + 1);
+            __atomic_fetch_add(&n_clones, 1, __ATOMIC_RELAXED);
+        } else {
+            pf->used_at = now;
+        }
+    }
+    ReleaseSRWLockExclusive(&copy_lock);
+    for (int i = 0; i < n; i++) {
+        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
+        if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
+    }
+    if (now % 7200 == 0)
+        rt_log("nvn: asynchronous replay at submit %llu: %llu recording clones so far, %u copies waiting for the replay",
+               (unsigned long long)now, (unsigned long long)__atomic_load_n(&n_clones, __ATOMIC_RELAXED), nzombies);
 }
 
 uint64_t nvn_submit_count(void) { return __atomic_load_n(&nsubmits, __ATOMIC_RELAXED); }
