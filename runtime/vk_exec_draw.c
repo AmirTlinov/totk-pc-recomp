@@ -1447,6 +1447,26 @@ static void bind_vertex_buffers(VkExec *ex) {
     B.vb_valid = 1;
 }
 
+// TOTK_PIPE_SKIP: which draws are skipped, rather than waited for, while their shaders or pipeline build.
+// strict (0): only draws whose pass targets were all rendered in the previous presented frame; a pass with a target
+//   that was not counts as one-shot and waits.
+// any (1, default): also draws in a pass with at least one target rendered in the previous frame (a per-frame depth
+//   buffer or g-buffer with a colour target the frame before did not use: half-resolution effect buffers in fights).
+//   Passes with none (volumes, LUTs, shadow layers seen for the first time) still wait.
+// fullscreen (2): as any, and full-screen draws into such passes are skipped instead of waiting from their budget.
+static int pipe_skip_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = cfg_get("TOTK_PIPE_SKIP");
+        mode = !e || !*e ? 1 : !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
+        static const char *const what[3] = {"only draws into per-frame passes (TOTK_PIPE_SKIP=strict)",
+                                            "draws into passes with a target the previous frame rendered",
+                                            "those and full-screen draws (TOTK_PIPE_SKIP=fullscreen)"};
+        rt_log("vk_exec: draws skipped while their pipeline builds: %s", what[mode]);
+    }
+    return mode;
+}
+
 // The previous draw's shaders, kept while its program, bound pipeline state, the vertex and fragment stages' first 32
 // texture and image handles and every slot's resolution (vk_texture_slots_gen, read unlocked: a registration racing
 // with it is ordered after this draw, as answers_for's own check would order it) stay the same: answers_for reads
@@ -1516,9 +1536,9 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
-    int oneshot = -1;   // -1: not looked up
+    int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (vs_wait || fs_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
         perf_count(PERF_CNT_ONESHOT_WAIT);
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
@@ -1535,28 +1555,42 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     const VkPipeInfo *info = NULL;
     int pending;
     // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) waits for
-    // its pipeline: skipping it can leave a black tile. The waits share 50 ms per presented frame. A one-shot draw
-    // waits without that budget. Everything else is skipped while its pipeline is built.
+    // its pipeline: skipping it can leave a black tile. The waits share 50 ms per presented frame
+    // (TOTK_PIPE_SKIP=fullscreen skips them instead). A one-shot draw waits without that budget. Everything else is
+    // skipped while its pipeline is built.
     static uint64_t wait_frame;
     static uint64_t wait_left_ns;
     uint32_t wait_ms = 0;
     uint64_t t0 = 0;
     if (oneshot > 0) {
         wait_ms = ONESHOT_WAIT_MS;
-    } else if (count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
+    } else if (skip < 2 && count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
         uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
         if (f != wait_frame) wait_frame = f, wait_left_ns = 50000000;
         wait_ms = (uint32_t)(wait_left_ns / 1000000);
         if (wait_ms) t0 = kern_now_ns();
     }
+    uint64_t w0 = kern_now_ns();
     VkPipeline p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
     if (t0) {
         uint64_t spent = kern_now_ns() - t0;
         wait_left_ns = spent < wait_left_ns ? wait_left_ns - spent : 0;
     }
-    if (pending && oneshot < 0 && !vk_exec_targets_recent(ex)) {
+    const char *why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
+    if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
         perf_count(PERF_CNT_ONESHOT_WAIT);
+        why = "one-shot";
         p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
+    }
+    uint64_t waited = kern_now_ns() - w0;
+    static int wait_logs;
+    if (why && waited >= 2000000 && wait_logs < 200) {
+        char tg[512];
+        wait_logs++;
+        vk_exec_targets_describe(ex, tg, sizeof tg);
+        rt_log("vk_exec: frame %llu: a draw waited %.1f ms for its pipeline (%s%s): %u vertices, pass %ux%u, %s",
+               (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
+               pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h, tg);
     }
     if (pending) return 0;   // a background worker is building it: the draw is skipped until it is ready
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;

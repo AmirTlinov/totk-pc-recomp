@@ -96,8 +96,9 @@ Check these classes before you re-investigate a symptom that looks like one of t
   waits for a fence, targets up to 64 KiB rendered before it go back too (`vk_texture.c`
   `vk_texture_write_back_small`): the 128x128 cut map is read with no invalidate. Without it a cut left the grass
   standing, with no blades and no insects.
-- A one-shot draw (a target not rendered in the previous frame) waits for its shader and pipeline instead of being
-  skipped: `vk_exec_draw.c` `prepare_draw`. Skipping left the cloud and fog volumes empty for the session.
+- A one-shot draw (a pass none of whose targets the previous frame rendered) waits for its shader and pipeline instead
+  of being skipped: `vk_exec_draw.c` `prepare_draw`, `TOTK_PIPE_SKIP`. Skipping left the cloud and fog volumes empty
+  for the session. Its stage libraries build on idle workers in parallel (`vk_pipeline.c` `lib_wait`).
 - Storage buffers bound by Ryujinx first-use order instead of the NVN c0 slot: `vk_exec_draw.c` `ssbo_slot`. It showed
   as tile rectangles.
 - 3D colour targets rejected: `vk_exec.c` `resolve_target`. The grading LUT was never written, so the dialog

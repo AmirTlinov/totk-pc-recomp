@@ -308,14 +308,38 @@ static int tfr_recent(const VkExecTarget *t, uint64_t stamp) {
     return tfr_match(e, t) && (e->last == stamp ? e->prev : e->last) == stamp - 1;
 }
 
-int vk_exec_targets_recent(VkExec *ex) {
+int vk_exec_targets_recent(VkExec *ex, int any) {
     resolve_rt(ex);
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    int n = 0;
-    for (int i = 0; i < 8; i++)
-        if (ex->color[i].image && (n++, !tfr_recent(&ex->color[i], stamp))) return 0;
-    if (ex->depth.image && (n++, !tfr_recent(&ex->depth, stamp))) return 0;
-    return n > 0;
+    int n = 0, recent = 0;
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if (!t->image) continue;
+        n++;
+        if (tfr_recent(t, stamp)) recent++;
+        else if (!any) return 0;
+    }
+    return any ? recent > 0 : n > 0;
+}
+
+// One line naming each target of the current pass: format, extent, layer and the two frames it was last rendered in
+// (prepare_draw's pipeline wait log).
+void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap) {
+    resolve_rt(ex);
+    size_t n = 0;
+    buf[0] = 0;
+    for (int i = 0; i < 9 && n < cap; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        if (!t->image) continue;
+        const TargetFrames *e = tfr_slot(t);
+        int m = tfr_match(e, t);
+        int w = snprintf(buf + n, cap - n, "%s%c%d fmt %d %ux%u L%u seen %llu/%llu", n ? "; " : "", i < 8 ? 'c' : 'd',
+                         i < 8 ? i : 0, (int)t->format, t->width, t->height, t->base_layer,
+                         (unsigned long long)(m ? e->last : 0), (unsigned long long)(m ? e->prev : 0));
+        if (w < 0) break;
+        n += (size_t)w;
+    }
+    if (!n) snprintf(buf, cap, "no targets");
 }
 
 // ---- passes and barriers
