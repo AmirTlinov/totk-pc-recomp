@@ -141,19 +141,19 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 }
 
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE };
 typedef struct {
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued;
     uint64_t *h;
-    const tex_t *tex;
+    const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
 } ReplayItem;
-#define RQ_CAP 64
+#define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
        DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
-static const char *const dr_name[DR_N] = {"pool_fini", "map_virtual", "texture_release", "program_release", "finish",
-                                          "read_texels (writer fence)", "write_texels", "guest_read", "frame bound", "queue full",
-                                          "check drain"};
+static const char *const dr_name[DR_N] = {
+    "pool_fini", "map_virtual", "texture_release (queued)", "program_release", "finish", "read_texels (writer fence)",
+    "write_texels", "guest_read", "frame bound", "queue full", "check drain"};
 
 static SRWLOCK rl = SRWLOCK_INIT;
 static CONDITION_VARIABLE rcv = CONDITION_VARIABLE_INIT;   // item queued, item taken, item done
@@ -214,6 +214,10 @@ static DWORD WINAPI replay_main(void *arg) {
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
                          (unsigned long long)it.value);
             free(it.h);
+        } else if (it.kind == RI_RELEASE) {
+            vk_present_drain();
+            vk_texture_release(it.tex);
+            free((void *)it.tex);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
@@ -249,7 +253,7 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         while (rq_n == RQ_CAP) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
         wait_counted(DR_FULL, p0);
     }
-    it->value = vk_sync_reserve();
+    it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
     WakeAllConditionVariable(&rcv);
@@ -341,11 +345,25 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
 }
 static void vk_be_texture_register(int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(id, t, v); }
 static void vk_be_sampler_register(int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(id, s); }
+// Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
+// slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
+// released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.
 static void vk_be_texture_release(const tex_t *t) {
     vk_sync_start();
-    replay_drain(DR_TEX_RELEASE);
-    vk_present_drain();
-    vk_texture_release(t);
+    if (!gfx_replay_async()) {
+        vk_present_drain();
+        vk_texture_release(t);
+        return;
+    }
+    if (!t || !t->mem) return;
+    tex_t *copy = malloc(sizeof *copy);
+    if (!copy) rt_fatal("vk: out of memory (replay queue)");
+    *copy = *t;
+    ReplayItem it = {.kind = RI_RELEASE, .tex = copy};
+    AcquireSRWLockExclusive(&rl);
+    dr_calls[DR_TEX_RELEASE]++, dr_tcalls[DR_TEX_RELEASE]++;
+    ReleaseSRWLockExclusive(&rl);
+    replay_enqueue(&it);
 }
 static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEASE); vk_program_release(p); }
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
