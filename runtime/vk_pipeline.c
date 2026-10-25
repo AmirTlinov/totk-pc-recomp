@@ -1632,9 +1632,10 @@ static struct {
     LibJob *head, *tail;
     int idle;                          // workers asleep on work_cv
     int running;                       // jobs workers are building
-    int on;                            // TOTK_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw)
+    int on;                            // TOTK_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw);
+                                       // set by vk_pipeline_async_enable, before the replay runs
     uint64_t waits, queued, by_worker, stolen, timeouts;
-} U = {.on = -1};
+} U;
 
 // A building entry for key, NULL when out of memory. Caller holds P.lock and found none.
 static Lib *lib_new(uint64_t h, const void *key, uint32_t size) {
@@ -1998,8 +1999,9 @@ static DWORD WINAPI pipe_worker(void *arg) {
     int me = (int)(intptr_t)arg;
     AcquireSRWLockExclusive(&P.lock);
     for (;;) {
-        // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once.
-        while (!U.head && !A.head && !(A.low && (A.threads < 3 || A.low_running < A.threads - 1))) {
+        // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once
+        // (not with TOTK_PIPE_WAIT=draw).
+        while (!U.head && !A.head && !(A.low && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
             U.idle++;
             SleepConditionVariableSRW(&work_cv, &P.lock, INFINITE, 0);
             U.idle--;
@@ -2117,6 +2119,8 @@ static void workers_drain(void) {
 }
 
 void vk_pipeline_async_enable(void) {
+    const char *w = cfg_get("TOTK_PIPE_WAIT");
+    U.on = !(w && !strcmp(w, "draw"));
     const char *e = cfg_get("TOTK_PIPE_SYNC");
     if (e && *e && strcmp(e, "0")) return;
     A.on = 1;
@@ -2295,9 +2299,8 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     // leaves them to the job.
     static int draw_build = -1;
     if (draw_build < 0) {
-        const char *e = cfg_get("TOTK_GPL_DRAW_BUILD"), *w = cfg_get("TOTK_PIPE_WAIT");
+        const char *e = cfg_get("TOTK_GPL_DRAW_BUILD");
         draw_build = !(e && !strcmp(e, "0"));
-        U.on = !(w && !strcmp(w, "draw"));
         rt_log("vk_pipeline: a draw that waits for its pipeline %s", !draw_build ? "leaves its libraries to its job"
                : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
                       : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
