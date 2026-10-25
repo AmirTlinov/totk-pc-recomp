@@ -138,6 +138,30 @@ void vk_mem_count(int cls, int use, uint64_t bytes);
 void vk_mem_bound_note(void *pool);
 #define VK_MEM_BOUND(sp) do { if ((rt_trace & RT_TRACE_PERF) && (sp).pool) vk_mem_bound_note((sp).pool); } while (0)
 void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its lock, before the replay
+// VRAM mirror of buffer-bound pools (vk_memory.c, build/mem-plan.md). vk_mirror_on: TOTK_MEMORY=mirror|verify, or the
+// device class is discrete and TOTK_MEMORY is unset or auto; set at device selection. The replay (submitting thread
+// under vk_sync_submit's lock) calls:
+// - VK_MEM_USE at a vertex, index, uniform, storage or indirect binding of a span vk_mem_resolve returned: the pool's
+//   mirror is created on first use and sp.buffer becomes it (same offsets); a pool that stays imported keeps its buffer.
+// - VK_MEM_PICK where a copy, fill or update reads or writes a span: the mirror if the pool has one, never a new one.
+// - vk_mem_gpu_wrote after recording a GPU write of [sp.offset, sp.offset + size) into sp.buffer: a mirror's bytes go
+//   back to guest memory at the end of the submission. No-op for imported buffers.
+// - vk_mem_mirror_begin at the start of a submission's recording, vk_mem_mirror_end (records the write-backs; returns
+//   the commands recorded) after its last barrier.
+// vk_sync.c records the copies the mirrors' first accesses queued (vk_mem_mirror_pending) into a prologue command
+// buffer with vk_mem_mirror_prologue and submits it right before each part.
+extern int vk_mirror_on;
+void vk_mem_use(VkMemSpan *sp);
+void vk_mem_pick(VkMemSpan *sp);
+#define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
+#define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
+void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
+void vk_mem_mirror_begin(void);
+int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
+int vk_mem_mirror_pending(void);
+void vk_mem_mirror_prologue(VkCommandBuffer cb);
+int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
+                                          // 1 when it has one
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
@@ -223,6 +247,7 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   /
 void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
+uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
 VkSampler vk_sampler_by_id(int id);                 // VK_NULL_HANDLE for an empty slot
 VkSampler vk_sampler_for(const samp_par *s);        // cached by content
 int vk_sampler_params(int id, samp_par *out);       // parameters of a sampler slot; 0 for an empty slot
@@ -237,6 +262,7 @@ void vk_sync_start(void);                  // vk_init (fatal without a device) a
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 uint64_t vk_sync_fence_done(void);         // highest done value
+uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c: T6c): records the command handles of one submission into cb, which the caller has

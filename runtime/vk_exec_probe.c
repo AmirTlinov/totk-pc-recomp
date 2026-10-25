@@ -802,6 +802,54 @@ static int test_nvnx(const GfxBackend *b, uint8_t *guest, int *bytes) {
     return 0;
 }
 
+// VRAM mirror (vk_memory.c; skipped in import mode): a pool given its mirror as on a first buffer use, after which
+// buffer copies and fills read and write the mirror. The first use copies the whole pool; CPU writes between
+// submissions reach the mirror through write watch; GPU writes reach guest memory by the fence, and only the bytes
+// written: CPU bytes beside a GPU fill keep their values.
+static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
+    *bytes = 0;
+    if (!vk_mirror_on) return 0;
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0xC00000, .size = 0x100000,
+                   .game_mem = guest + 0xC00000};
+    CHECK(b->pool_init(&pool), "pool_init of a CPU-visible pool for the mirror part");
+    uint8_t *m = pool.mem;
+    for (int i = 0; i < 4096; i++) m[i] = (uint8_t)(i * 13 + 1);
+    memset(m + 0x1000, 0xEE, 0x5000);
+    CHECK(vk_mem_mirror_probe((uint64_t)(uintptr_t)m), "the pool got no VRAM mirror");
+    static _Alignas(8) uint8_t stream[1024];
+    uint64_t a = (uint64_t)(uintptr_t)m;
+    // 1: B2B in the mirror after its first-use copy, and a fill; both written back.
+    uint8_t *p = put(stream, OP_BEGIN, NULL, 0);
+    const p_copy_b2b c1 = {a, a + 0x1000, 4096};
+    const p_clear_buf f1 = {a + 0x2000, 0x800, 0x5a5a5a5au, 0};
+    p = put(p, OP_COPY_B2B, &c1, sizeof c1);
+    p = put(p, OP_CLEAR_BUF, &f1, sizeof f1);
+    CHECK(xf_submit(b, stream, p), "fence_wait of the first mirror submission timed out");
+    for (int i = 0; i < 4096; i++) CHECK(m[0x1000 + i] == m[i], "mirror B2B byte %d is %02x, expected %02x", i, m[0x1000 + i], m[i]);
+    for (int i = 0; i < 0x800; i++) CHECK(m[0x2000 + i] == 0x5a, "mirror fill byte %d is %02x", i, m[0x2000 + i]);
+    for (int i = 0x800; i < 0x1000; i++) CHECK(m[0x2000 + i] == 0xEE, "byte %#x past the mirror fill is %02x", i, m[0x2000 + i]);
+    // 2: the CPU rewrites the source; the next submission copies the new bytes.
+    for (int i = 0; i < 4096; i++) m[i] = (uint8_t)(i * 7 + 5);
+    p = put(stream, OP_BEGIN, NULL, 0);
+    const p_copy_b2b c2 = {a, a + 0x3000, 4096};
+    p = put(p, OP_COPY_B2B, &c2, sizeof c2);
+    CHECK(xf_submit(b, stream, p), "fence_wait of the second mirror submission timed out");
+    for (int i = 0; i < 4096; i++)
+        CHECK(m[0x3000 + i] == m[i], "B2B byte %d after a CPU write is %02x, expected %02x (write not mirrored)", i,
+              m[0x3000 + i], m[i]);
+    // 3: CPU bytes in the page of a GPU fill, written before the submission, survive the write-back.
+    memset(m + 0x4000, 0x11, 0x800);
+    p = put(stream, OP_BEGIN, NULL, 0);
+    const p_clear_buf f3 = {a + 0x4800, 0x800, 0x77777777u, 0};
+    p = put(p, OP_CLEAR_BUF, &f3, sizeof f3);
+    CHECK(xf_submit(b, stream, p), "fence_wait of the third mirror submission timed out");
+    for (int i = 0; i < 0x800; i++) CHECK(m[0x4000 + i] == 0x11, "CPU byte %#x beside a fill is %02x", i, m[0x4000 + i]);
+    for (int i = 0; i < 0x800; i++) CHECK(m[0x4800 + i] == 0x77, "fill byte %#x is %02x", i, m[0x4800 + i]);
+    b->pool_fini(&pool);
+    *bytes = 4096 + 0x1000 + 4096 + 0x1000;
+    return 0;
+}
+
 int probe_vkexec(void) {
     layouts_equal = 0;
     main_tid = GetCurrentThreadId();
@@ -819,8 +867,9 @@ int probe_vkexec(void) {
     if (!bad) bad = test_xfer(b, guest, &xfer_bytes);
     int zero_bytes = 0;
     if (!bad) bad = test_c0() || test_zero(b, guest, &zero_bytes);
-    int nvnx_bytes = 0;
+    int nvnx_bytes = 0, mirror_bytes = 0;
     if (!bad) bad = test_nvnx(b, guest, &nvnx_bytes);
+    if (!bad) bad = test_mirror(b, guest, &mirror_bytes);
     b->finish();
     vk_pipeline_shutdown();   // the pipelines and the draw part's stand-ins go before the device
     vk_exec_draw_shutdown();
@@ -860,5 +909,10 @@ int probe_vkexec(void) {
     printf("probe-vkexec: c0 and zero parts passed (c0 tables, dispatch size, point size and base instance at their offsets, "
            "unbound slots zero; %d bytes of an unwritten physical-pool texture read zero, TOTK_FIX_ZERO=%s)\n",
            zero_bytes, cfg_get("TOTK_FIX_ZERO") ? cfg_get("TOTK_FIX_ZERO") : "1");
+    if (vk_mirror_on)
+        printf("probe-vkexec: mirror part passed (B2B and fill in a VRAM mirror written back by the fence, a CPU write "
+               "between submissions mirrored, CPU bytes beside a fill kept, %d bytes compared)\n", mirror_bytes);
+    else
+        printf("probe-vkexec: mirror part skipped (memory mode import)\n");
     return 0;
 }

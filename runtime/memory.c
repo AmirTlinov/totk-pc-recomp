@@ -67,21 +67,142 @@ static void *reserve_at(uint64_t at, uint64_t size, DWORD extra) {
     return p;
 }
 
+// ---- frozen regions
+// A 2 MiB region of the watched reservations that nothing wrote for a while can be made read-only (mem_freeze), so the
+// back end's write-watch queries skip it: no page of a frozen region changes before a thaw. The first write faults and
+// thaw_handler makes the region writable again before the write retries. A kernel write into guest memory (a file
+// read) fails on a read-only page instead of faulting, so file reads thaw their buffer first (mem_thaw), and so does
+// every commit, decommit and protection change here. A region stays thawed for FRZ_HOLD_MS after a mem_thaw: a file
+// read still in flight writes its buffer later. frz_lock is a leaf lock: nothing writes guest memory under it.
+#define FRZ_SHIFT 21
+#define FRZ_SIZE (1ull << FRZ_SHIFT)
+#define FRZ_HOLD_MS 5000u
+static volatile uint8_t frz[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
+static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCount of the last thaw request, 0 never
+static volatile LONG nfrz;
+static SRWLOCK frz_lock = SRWLOCK_INIT;
+static volatile LONG64 frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+
+static int watched(uint64_t addr, uint64_t size) {
+    const RtGuestLayout *g = &L;
+    return (addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size) ||
+           (addr >= g->alias.base && size <= ALIAS_SIZE && addr - g->alias.base <= ALIAS_SIZE - size);
+}
+
+// frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
+static void thaw_locked(uint64_t r, int why) {
+    if (why == 2) thaw_ms[r] = (uint32_t)GetTickCount64() | 1;
+    if (!frz[r]) return;
+    DWORD old;
+    uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE;
+    if (!VirtualProtect((void *)(uintptr_t)a, FRZ_SIZE, PAGE_READWRITE, &old)) {
+        // Not all committed (cannot happen while mapping changes thaw under frz_lock): the read-only runs only.
+        MEMORY_BASIC_INFORMATION mbi;
+        while (a < end && VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) {
+            uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (b > end) b = end;
+            if (mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READONLY &&
+                !VirtualProtect((void *)(uintptr_t)a, b - a, PAGE_READWRITE, &old))
+                rt_fatal("memory: thawing %#llx+%#llx failed (error %lu)", (unsigned long long)a,
+                         (unsigned long long)(b - a), GetLastError());
+            a = b;
+        }
+    }
+    __atomic_store_n(&frz[r], 0, __ATOMIC_RELEASE);
+    InterlockedDecrement(&nfrz);
+    InterlockedIncrement64(&frz_count[why]);
+}
+
+// frz_lock held exclusively.
+static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
+    if (!n || a >= RT_ADDRESS_LIMIT) return;
+    uint64_t r0 = a >> FRZ_SHIFT, r1 = (a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1) >> FRZ_SHIFT;
+    for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
+}
+
+void mem_thaw(uint64_t a, uint64_t n) {
+    AcquireSRWLockExclusive(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
+    thaw_range_locked(a, n, 2);
+    ReleaseSRWLockExclusive(&frz_lock);
+}
+
+int mem_freeze(uint64_t a) {
+    if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
+    uint64_t r = a >> FRZ_SHIFT;
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD old;
+    int ok = 0;
+    AcquireSRWLockExclusive(&frz_lock);
+    if (frz[r]) ok = 1;
+    else if (thaw_ms[r] && (int32_t)((uint32_t)GetTickCount64() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
+    else if (VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+             mbi.Protect == PAGE_READWRITE && (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize >= a + FRZ_SIZE &&
+             VirtualProtect((void *)(uintptr_t)a, FRZ_SIZE, PAGE_READONLY, &old)) {
+        __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
+        InterlockedIncrement(&nfrz);
+        InterlockedIncrement64(&frz_count[0]);
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&frz_lock);
+    return ok;
+}
+
+int mem_frozen(uint64_t a) { return a < RT_ADDRESS_LIMIT && __atomic_load_n(&frz[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE); }
+
+void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws) {
+    *frozen = (uint64_t)__atomic_load_n(&nfrz, __ATOMIC_RELAXED);
+    *freezes = (uint64_t)InterlockedExchange64(&frz_count[0], 0);
+    *fault_thaws = (uint64_t)InterlockedExchange64(&frz_count[1], 0);
+    *other_thaws = (uint64_t)InterlockedExchange64(&frz_count[2], 0) + (uint64_t)InterlockedExchange64(&frz_count[3], 0);
+}
+
+// The first write into a frozen region thaws it and retries. A fault in a region another thread thawed meanwhile
+// retries too; any other fault goes on to the crash handler.
+static LONG CALLBACK thaw_handler(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t a = er->ExceptionInformation[1];
+    if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    AcquireSRWLockExclusive(&frz_lock);
+    int was = frz[a >> FRZ_SHIFT];
+    thaw_locked(a >> FRZ_SHIFT, 1);
+    ReleaseSRWLockExclusive(&frz_lock);
+    if (was) return EXCEPTION_CONTINUE_EXECUTION;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE)
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
-    if (n && !VirtualAlloc((void *)(uintptr_t)a, n, MEM_COMMIT, PAGE_READWRITE))
+    AcquireSRWLockExclusive(&frz_lock);
+    thaw_range_locked(a, n, 3);
+    int ok = !n || VirtualAlloc((void *)(uintptr_t)a, n, MEM_COMMIT, PAGE_READWRITE);
+    ReleaseSRWLockExclusive(&frz_lock);
+    if (!ok)
         rt_fatal("memory: commit %s %#llx+%#llx failed (error %lu)", what, (unsigned long long)a,
                  (unsigned long long)n, GetLastError());
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
-    if (n && !VirtualFree((void *)(uintptr_t)a, n, MEM_DECOMMIT))
+    AcquireSRWLockExclusive(&frz_lock);
+    thaw_range_locked(a, n, 3);
+    int ok = !n || VirtualFree((void *)(uintptr_t)a, n, MEM_DECOMMIT);
+    ReleaseSRWLockExclusive(&frz_lock);
+    if (!ok)
         rt_fatal("memory: decommit %s %#llx+%#llx failed (error %lu)", what, (unsigned long long)a,
                  (unsigned long long)n, GetLastError());
 }
 
 static void protect(uint64_t a, uint64_t n, DWORD prot, const char *what) {
     DWORD old;
-    if (n && !VirtualProtect((void *)(uintptr_t)a, n, prot, &old))
+    AcquireSRWLockExclusive(&frz_lock);
+    thaw_range_locked(a, n, 3);
+    int ok = !n || VirtualProtect((void *)(uintptr_t)a, n, prot, &old);
+    ReleaseSRWLockExclusive(&frz_lock);
+    if (!ok)
         rt_fatal("memory: protect %s %#llx+%#llx failed (error %lu)", what, (unsigned long long)a,
                  (unsigned long long)n, GetLastError());
 }
@@ -129,6 +250,7 @@ void mem_init(void) {
         if (reserve_at(at, ALIAS_SIZE, MEM_WRITE_WATCH)) alias = at;
     if (!alias) reexec_or_fail("a 64 GiB alias region below 2^39");
 
+    AddVectoredExceptionHandler(1, thaw_handler);   // before the crash handler
     alias_pages = VirtualAlloc(NULL, ALIAS_PAGES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!alias_pages) rt_fatal("memory: cannot allocate the alias page map");
     const char *pool = cfg_get("TOTK_APP_POOL");
@@ -148,18 +270,22 @@ const RtGuestLayout *mem_layout(void) { return &L; }
 
 // Adapted from LAS Recomp runtime/platform/windows.c:40-63 @ da35b83 (MIT, Copyright (c) 2026 Peiikai): GetWriteWatch
 // with the reset flag. A range inside one watched reservation (stack and heap block, or alias region) only.
-uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+static uint64_t written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, DWORD flags) {
     if (!max || !size) return 0;
-    const RtGuestLayout *g = &L;
-    int low_block = addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size;
-    int alias = addr >= g->alias.base && size <= ALIAS_SIZE && addr - g->alias.base <= ALIAS_SIZE - size;
-    if (!low_block && !alias) return UINT64_MAX;
+    if (!watched(addr, size)) return UINT64_MAX;
     ULONG_PTR n = (ULONG_PTR)max;
     DWORD gran;
     _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
-    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran))
-        return UINT64_MAX;
+    if (GetWriteWatch(flags, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran)) return UINT64_MAX;
     return n;
+}
+
+uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+    return written_pages(addr, size, pages, max, WRITE_WATCH_FLAG_RESET);
+}
+
+uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
+    return written_pages(addr, size, pages, max, 0);
 }
 
 static uint64_t image_bytes(void) {

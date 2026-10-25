@@ -107,27 +107,33 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
     free(t);
 }
 
-// At the start of a part's command buffer (sub_lock held).
-static void ts_begin(VkCommandBuffer cb) {
-    ts_cur = -1;
-    if (ts_state != 1) return;
+// At the start of a command buffer (sub_lock held): the pair it times, -1 untimed.
+static int ts_open(VkCommandBuffer cb) {
+    if (ts_state != 1) return -1;
     uint32_t p = ts_next % TS_PAIRS;
-    if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { InterlockedIncrement64(&ts_missed); return; }
+    if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { InterlockedIncrement64(&ts_missed); return -1; }
     ts_next++;
     ts_busy[p] = 1;
     vkCmdResetQueryPool(cb, ts_pool, 2 * p, 2);
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool, 2 * p);
-    ts_cur = (int)p;
+    return (int)p;
 }
 
-// At the end of the part, before vkEndCommandBuffer; fence: the value whose completion covers the part.
-static void ts_end(VkCommandBuffer cb, uint64_t fence) {
-    if (ts_cur < 0) return;
-    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)ts_cur + 1);
+// At its end, before vkEndCommandBuffer; fence: the value whose completion covers it.
+static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence) {
+    if (pair < 0) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)pair + 1);
     TsRead *t = malloc(sizeof *t);
     if (!t) rt_fatal("vk: out of memory");
-    t->pair = (uint32_t)ts_cur;
+    t->pair = (uint32_t)pair;
     vk_completion_add(fence, ts_read_cb, t);
+}
+
+// The pair of the part being recorded.
+static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); }
+
+static void ts_end(VkCommandBuffer cb, uint64_t fence) {
+    ts_close(cb, ts_cur, fence);
     ts_cur = -1;
 }
 
@@ -227,27 +233,47 @@ void vk_sync_start(void) {
     ReleaseSRWLockExclusive(&start_lock);
 }
 
-// A command buffer the GPU no longer uses, claimed for value `fence`. Called with sub_lock held.
-static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
+// The index of a command buffer the GPU no longer uses, claimed for value `fence`. Called with sub_lock held; may move
+// slots[].
+static int claim_slot(VkCtx *c, uint64_t fence) {
     uint64_t gpu = 0;
     vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
     for (int i = 0; i < nslots; i++)
         if (slots[i].fence <= gpu) {
             slots[i].fence = fence;
-            cur_slot = i;
-            return &slots[i];
+            return i;
         }
     CmdSlot *n = realloc(slots, sizeof *n * (size_t)(nslots + 1));
     if (!n) rt_fatal("vk: out of memory (command buffers)");
     slots = n;
     CmdSlot *s = &slots[nslots];
-    cur_slot = nslots;
     VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cmd_pool,
                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     if (vkAllocateCommandBuffers(c->device, &ai, &s->cb) != VK_SUCCESS) rt_fatal("vk: command buffer allocation");
     s->fence = fence;
-    nslots++;
-    return s;
+    return nslots++;
+}
+
+static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
+    cur_slot = claim_slot(c, fence);
+    return &slots[cur_slot];
+}
+
+// The copies the replay's first accesses to VRAM mirrors queued (vk_memory.c), in a command buffer of their own that is
+// submitted right before the part that needs them and timed like a part; VK_NULL_HANDLE when there are none. After the
+// part was recorded, sub_lock held; may move slots[].
+static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
+    if (!vk_mem_mirror_pending()) return VK_NULL_HANDLE;
+    int i = claim_slot(c, fence);   // before reading slots: the claim may move it
+    VkCommandBuffer cb = slots[i].cb;
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    int pair = ts_open(cb);
+    vk_mem_mirror_prologue(cb);
+    ts_close(cb, pair, fence);
+    vkEndCommandBuffer(cb);
+    return cb;
 }
 
 VkCommandBuffer vk_sync_split(void) {
@@ -256,8 +282,11 @@ VkCommandBuffer vk_sync_split(void) {
     ts_end(cb, cur_fence);
     vkEndCommandBuffer(cb);
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
-    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+    VkCommandBuffer pro = prologue(c, cur_fence);
+    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
+                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1};
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
@@ -292,11 +321,16 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     perf_replay(t0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
     vk_upload_flush(0);
-    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb};
+    VkCommandBuffer pro = prologue(c, fence);
+    s = &slots[cur_slot];
+    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
+                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
                                  .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = recorded ? 1 : 0,
-                        .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
+                        .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
@@ -364,6 +398,8 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
 }
 
 uint64_t vk_sync_fence_done(void) { return __atomic_load_n(&done, __ATOMIC_ACQUIRE); }
+
+uint64_t vk_sync_issued(void) { return __atomic_load_n(&issued, __ATOMIC_ACQUIRE); }
 
 void vk_sync_finish(void) {
     vk_sync_start();
