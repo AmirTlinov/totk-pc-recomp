@@ -23,7 +23,7 @@ static int n_entries;
 // Every name the runtime reads (and the patch sets in generated/), without the prefix. A file key outside this list is
 // logged as unknown. A new variable goes here too, or its ini key logs a harmless "unknown key" line.
 static const char *const known[] = {
-    "APP_POOL", "ASSUME_FOCUS", "ASTC", "ASTC_TIME", "AUDIO", "AUDIO_OFF", "AUDIO_PREFILL_MS", "BACKGROUND_WINDOW", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT",
+    "APP_POOL", "ASSUME_FOCUS", "ASTC", "ASTC_TIME", "ASYNC_PREEMPT", "AUDIO", "AUDIO_OFF", "AUDIO_PREFILL_MS", "BACKGROUND_WINDOW", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT",
     "BIND_MINUS", "BIND_PLUS", "BIND_R", "BIND_RCLICK", "BIND_RIGHT", "BIND_SKIP", "BIND_STATS", "BIND_UP", "BIND_X", "BIND_Y", "BIND_ZL",
     "BIND_ZR",
     "CLOTH_REALTIME", "CORE_DIAG", "DESC_TEMPLATE", "DUMP", "DUMP_BUF", "DUMP_DIR", "DUMP_LOG", "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT",
