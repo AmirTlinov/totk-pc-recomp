@@ -1,7 +1,7 @@
 // Adapted from MacNativeGames games/totk/runtime/threads.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
 // contributors; itself from d2r-mobile dm/host/hle_thread.c), d2r-mobile dm/host/thread.c @ 53e7c5b (MIT, Copyright
-// (c) 2026 jhaizhou) and LAS Recomp runtime/kernel.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai); the preemption of virtual cores from
-// MacNativeGames threads.c @ 33e8fa8 (MIT, as above).
+// (c) 2026 jhaizhou) and LAS Recomp runtime/kernel.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai); the preemption of
+// virtual cores from MacNativeGames threads.c @ 33e8fa8 (MIT, as above).
 // Threads, synchronization, virtual cores and fibers of the Horizon kernel.
 //
 // One guest thread = one Windows thread with a 256 MiB reserved host stack (every guest BL is a host call) and its own
@@ -297,7 +297,9 @@ static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) 
 // TOTK_ASYNC_PREEMPT=0 keeps the old scheduling exactly: raw priorities, no interruption, no disable_count.
 #define AP_FIRST_NS 250000ull   // the waiter spins this long before the first interruption (most waits end sooner)
 #define AP_GAP_NS 1000000ull    // and interrupts the same owner at most this often
-static int g_ap = -1;
+static int g_ap = -1, g_ap_int, g_ap_noyield, g_ap_test;   // g_ap_test: TOTK_ASYNC_PREEMPT=4/5 (tests)   // g_ap_noyield: TOTK_ASYNC_PREEMPT=3, the stub only (test)   // g_ap_int: interrupt owners (TOTK_ASYNC_PREEMPT=2: inheritance and disable only)
+static int g_ap_log;              // redirects logged so far (AP_LOG_N)
+#define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
 static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
 void kern_ap_stub(void);
@@ -306,6 +308,9 @@ static void ap_init(void) {
     if (g_ap >= 0) return;
     const char *e = cfg_get("TOTK_ASYNC_PREEMPT");
     g_ap = !(e && !strcmp(e, "0"));
+    g_ap_int = g_ap && !(e && !strcmp(e, "2"));
+    g_ap_noyield = e && !strcmp(e, "3");
+    g_ap_test = e && (*e == '4' || *e == '5') ? *e - '0' : 0;   // 4: set the context back unchanged; 5: only suspend
     if (g_ap) {
         RtModule m[16];
         int n = rt_linked_modules(m, 16);
@@ -330,8 +335,10 @@ static void ap_init(void) {
             kern_host_track = 1;
         }
     }
-    rt_log("kernel: asynchronous preemption of virtual cores, priority inheritance, preemption disable: %s",
-           g_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns them off)" : "off");
+    rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
+           "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns all off)" : "off",
+           (unsigned long long)(g_gen_lo ? g_gen_lo - (uintptr_t)GetModuleHandleW(NULL) : 0),
+           (unsigned long long)(g_gen_hi ? g_gen_hi - (uintptr_t)GetModuleHandleW(NULL) : 0));
 }
 
 // Horizon's priority inheritance: o counts at the priority of the best thread blocked on a guest mutex it owns (the
@@ -364,7 +371,7 @@ __asm__(".text\n"
         ".p2align 4\n"
         "kern_ap_stub:\n"
         ".seh_proc kern_ap_stub\n"
-        "    subq $8, %rsp\n"
+        "    leaq -8(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
         ".seh_stackalloc 8\n"
         "    pushfq\n"
         ".seh_stackalloc 8\n"
@@ -471,7 +478,7 @@ static int ap_try(RtThread *w) {
     }
     CONTEXT ctx;
     memset(&ctx, 0, sizeof ctx);
-    ctx.ContextFlags = CONTEXT_CONTROL;
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;   // set back whole, so the kernel restores every GPR
     int r = AP_RETRY;
     if (!GetThreadContext(o->hthr, &ctx))
         g_ap_fail++;
@@ -482,14 +489,23 @@ static int ap_try(RtThread *w) {
     else if (tl[0]) {
         tl[1] = 1;
         g_ap_deferred++;
+    } else if (g_ap_test == 4) {
+        if (SetThreadContext(o->hthr, &ctx)) g_ap_sent++;
+    } else if (g_ap_test == 5) {
+        g_ap_sent++;
     } else {
         o->ap_rip = ctx.Rip;
         o->ap_pending = 1;
         ctx.Rip = (DWORD64)(uintptr_t)kern_ap_stub;
-        ctx.ContextFlags = CONTEXT_CONTROL;
         if (SetThreadContext(o->hthr, &ctx)) {
             g_ap_sent++;
             r = AP_SENT;
+            if (g_ap_log < AP_LOG_N) {
+                g_ap_log++;
+                rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
+                       (unsigned long long)(o->ap_rip - (uintptr_t)GetModuleHandleW(NULL)), (unsigned long long)ctx.Rsp,
+                       w->handle, w->prio);
+            }
         } else {
             o->ap_pending = 0;
             g_ap_fail++;
@@ -835,7 +851,7 @@ static void core_take(RtThread *t) {
     }
     core_kick();
     if (g_diag > 0) t->dg_cls = dg_class0(t);
-    if (g_ap > 0 && t->target && t->cur_core < 0) {   // most waits end within microseconds: spin before interrupting
+    if (g_ap_int && t->target && t->cur_core < 0) {   // most waits end within microseconds: spin before interrupting
         uint64_t end = kern_now_ns() + AP_FIRST_NS;
         unlock();
         while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) YieldProcessor();
@@ -845,7 +861,7 @@ static void core_take(RtThread *t) {
     int sampled = 0;
     while (t->cur_core < 0) {
         DWORD ms = INFINITE;
-        if (g_ap > 0 && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
+        if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
         int sample = g_diag > 0 && !sampled && t->dg_cls == DG_GAME;
         if (sample && ms == INFINITE) ms = 2;
         SleepConditionVariableSRW(&t->cv, &G, ms, 0);
@@ -925,7 +941,7 @@ void kern_ap_yield(void) {
     RtThread *t = tcur;
     lock();
     t->ap_pending = 0;
-    if (t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
+    if (!g_ap_noyield && t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
         if (g_diag > 0) {
             t->dg_pc = t->cur->pc;
             t->dg_lr = t->cur->x[30];
@@ -1183,7 +1199,7 @@ static __attribute__((noreturn)) void exit_now(RtThread *t) { longjmp(t->exit_jm
 
 // The calling host thread, for ap_try (TOTK_ASYNC_PREEMPT only).
 static HANDLE ap_open_self(void) {
-    if (!cores_enabled() || g_ap <= 0) return NULL;
+    if (!cores_enabled() || !g_ap_int) return NULL;
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
                           FALSE, GetCurrentThreadId());
     if (!h) rt_log("kernel: OpenThread for asynchronous preemption failed (error %lu)", GetLastError());
