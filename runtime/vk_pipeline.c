@@ -1456,10 +1456,15 @@ out:
 // thread of the draw that needs it (no link-time optimisation); the optimised pipeline is the job pipe_miss queued
 // (a monolithic build with the same modules), which replaces the fast one in the Pipe when done. Libraries and fast
 // pipelines live until vk_pipeline_shutdown.
+// Background build signalling, both with P.lock: work_cv wakes the pipeline workers, done_cv wakes threads waiting for a
+// pipeline or a stage library to be published.
+static CONDITION_VARIABLE work_cv = CONDITION_VARIABLE_INIT, done_cv = CONDITION_VARIABLE_INIT;
 #define LIB_BUCKETS 1024
 enum { LIB_VI, LIB_PR, LIB_FS, LIB_FO };
-typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t size; uint8_t pre, used, pad[2]; uint8_t key[]; } Lib;
-// pre: built by the boot prebuild ("stage library prebuild" below); used: a draw's link found it
+typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t size; uint8_t pre, used, building, pad;
+                     struct LibJob *job; uint8_t key[]; } Lib;
+// pre: built by the boot prebuild ("stage library prebuild" below); used: a draw's link found it; building: a thread
+// builds it or job holds it queued (pipe not set yet); entries live until libs_destroy
 static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
@@ -1603,6 +1608,10 @@ static Lib *lib_find(uint64_t h, const void *key, uint32_t size) {
 // Returns the entered handle. Caller holds P.lock.
 static VkPipeline lib_put(uint64_t h, const void *key, uint32_t size, VkPipeline pipe) {
     Lib *b = lib_find(h, key, size);
+    if (b && b->building) {   // another thread's build publishes the entry
+        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
+        return VK_NULL_HANDLE;
+    }
     if (b) {
         if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
         return b->pipe;
@@ -1615,10 +1624,71 @@ static VkPipeline lib_put(uint64_t h, const void *key, uint32_t size, VkPipeline
     return pipe;
 }
 
+// Shader libraries a waiting draw needs (lib_wait): queued here ahead of every pipeline job, so an idle worker builds
+// each at once and the vertex and fragment libraries of one draw build in parallel. A job no worker took is built by
+// the first thread that needs its library (lib_get, lib_wait). Under P.lock.
+typedef struct LibJob { struct LibJob *next; Lib *b; int kind; Layout *l; VkPipeState s; GKey k; } LibJob;
+static struct {
+    LibJob *head, *tail;
+    int idle;                          // workers asleep on work_cv
+    int running;                       // jobs workers are building
+    int on;                            // TOTK_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw)
+    uint64_t waits, queued, by_worker, stolen, timeouts;
+} U = {.on = -1};
+
+// A building entry for key, NULL when out of memory. Caller holds P.lock and found none.
+static Lib *lib_new(uint64_t h, const void *key, uint32_t size) {
+    Lib *b = calloc(1, sizeof *b + size);
+    if (!b) return NULL;
+    b->hash = h, b->size = size, b->building = 1;
+    memcpy(b->key, key, size);
+    b->next = libs[h % LIB_BUCKETS];
+    libs[h % LIB_BUCKETS] = b;
+    return b;
+}
+
+// Builds b (building, not queued) with P.lock released and publishes it; a failed build is entered as VK_NULL_HANDLE.
+static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *k, Layout *l) {
+    VkPipelineLayout lay = kind == LIB_PR ? half_layout(l, 0) : kind == LIB_FS ? half_layout(l, 1) : VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (lay || kind == LIB_VI || kind == LIB_FO) {
+        ReleaseSRWLockExclusive(&P.lock);
+        uint64_t t0 = qpc();
+        pipe = lib_create(kind, s, k, lay, b->key);
+        double ms = ms_since(t0);
+        AcquireSRWLockExclusive(&P.lock);
+        P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
+        if (ms > P.g.lib_max[kind]) P.g.lib_max[kind] = ms;
+    }
+    if (!pipe && ++P.g.lib_fail <= 8) rt_log("vk_pipeline: gpl: stage library %d not built", kind);
+    b->pipe = pipe, b->building = 0;
+    WakeAllConditionVariable(&done_cv);
+    return pipe;
+}
+
+// Takes b's queued job out of the queue and builds it on this thread. Caller holds P.lock.
+static void lib_steal(Lib *b) {
+    LibJob *j = b->job, **pp = &U.head, *prev = NULL;
+    while (*pp && *pp != j) prev = *pp, pp = &(*pp)->next;
+    if (*pp) *pp = j->next;
+    if (U.tail == j) U.tail = prev;
+    b->job = NULL;
+    lib_build(b, j->kind, &j->s, &j->k, j->l);
+    free(j);
+}
+
 static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout *l, const void *key, uint32_t size,
                           int build, int *miss) {
     uint64_t h = key_hash(key, size);
     Lib *have = lib_find(h, key, size);
+    while (have && have->building) {   // being built (wait) or queued (build it here)
+        if (!build) {
+            *miss = 1;
+            return VK_NULL_HANDLE;
+        }
+        if (have->job) U.stolen++, lib_steal(have);
+        else SleepConditionVariableSRW(&done_cv, &P.lock, INFINITE, 0);
+    }
     if (have) {
         if (have->pre && !have->used) have->used = 1, P.g.pre_used[kind]++;
         return have->pipe;
@@ -1628,12 +1698,14 @@ static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout 
         *miss = 1;
         return VK_NULL_HANDLE;
     }
+    Lib *b = lib_new(h, key, size);   // entered first, so other threads wait for this build instead of repeating it
+    if (b) return lib_build(b, kind, s, k, l);
     ReleaseSRWLockExclusive(&P.lock);
     uint64_t t0 = qpc();
     VkPipeline pipe = lib_create(kind, s, k, lay, key);
     double ms = ms_since(t0);
     AcquireSRWLockExclusive(&P.lock);
-    if ((have = lib_find(h, key, size))) {   // another thread built it meanwhile
+    if ((have = lib_find(h, key, size)) && !have->building) {   // another thread built it meanwhile
         if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
         return have->pipe;
     }
@@ -1654,6 +1726,26 @@ static void libs_destroy(void) {
     }
 }
 
+// The four library keys of pipeline s (key k).
+static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, FsKey *fk, FoKey *ok) {
+    memset(v, 0, sizeof *v);
+    v->kind = LIB_VI, v->topo_class = k->topo_class;
+    memcpy(v->attr_fmt, k->attr_fmt, sizeof v->attr_fmt), memcpy(v->attr_off, k->attr_off, sizeof v->attr_off);
+    memcpy(v->attr_bind, k->attr_bind, sizeof v->attr_bind), memcpy(v->rate, k->rate, sizeof v->rate);
+    memset(pk, 0, sizeof *pk);
+    GfxShaderIo fin[32];
+    pk->kind = LIB_PR, pk->vs = s->vs, pk->clamp = k->clamp, pk->poly_mode = k->poly_mode, pk->minus_w = k->minus_w;
+    pk->missing = vs_union_missing(s, fin);
+    for (int i = 0; i < 32; i++)
+        if (pk->missing >> i & 1) pk->fin[i] = fin[i];
+    memset(fk, 0, sizeof *fk);
+    fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
+    memset(ok, 0, sizeof *ok);
+    ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
+    ok->blend_en = k->blend_en, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
+    memcpy(ok->color, k->color, sizeof ok->color), memcpy(ok->blend, k->blend, sizeof ok->blend);
+}
+
 // A fast-linked pipeline for s from its stage libraries. Caller holds P.lock.
 // build 0 (drawing thread): links only when the shader libraries exist (vertex input and fragment output libraries,
 // which hold no shader, are built here); *final 0 = not yet, a worker builds them. build 1 (worker): builds the
@@ -1665,25 +1757,10 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
     if (!l->set1 || k->fbl) return VK_NULL_HANDLE;
     uint64_t t0 = qpc();
     ViKey vk_;
-    memset(&vk_, 0, sizeof vk_);
-    vk_.kind = LIB_VI, vk_.topo_class = k->topo_class;
-    memcpy(vk_.attr_fmt, k->attr_fmt, sizeof vk_.attr_fmt), memcpy(vk_.attr_off, k->attr_off, sizeof vk_.attr_off);
-    memcpy(vk_.attr_bind, k->attr_bind, sizeof vk_.attr_bind), memcpy(vk_.rate, k->rate, sizeof vk_.rate);
     PrKey pk;
-    memset(&pk, 0, sizeof pk);
-    GfxShaderIo fin[32];
-    pk.kind = LIB_PR, pk.vs = s->vs, pk.clamp = k->clamp, pk.poly_mode = k->poly_mode, pk.minus_w = k->minus_w;
-    pk.missing = vs_union_missing(s, fin);
-    for (int i = 0; i < 32; i++)
-        if (pk.missing >> i & 1) pk.fin[i] = fin[i];
     FsKey fk;
-    memset(&fk, 0, sizeof fk);
-    fk.kind = LIB_FS, fk.fs = s->fs, fk.dsb = k->dsb, fk.samples = k->samples, fk.a2c = k->a2c;
     FoKey ok;
-    memset(&ok, 0, sizeof ok);
-    ok.kind = LIB_FO, ok.n_color = k->n_color, ok.samples = k->samples, ok.a2c = k->a2c, ok.logic_op = k->logic_op;
-    ok.blend_en = k->blend_en, ok.depth = k->depth, ok.stencil = k->stencil, ok.wmask = k->wmask;
-    memcpy(ok.color, k->color, sizeof ok.color), memcpy(ok.blend, k->blend, sizeof ok.blend);
+    lib_keys(s, k, &vk_, &pk, &fk, &ok);
     int miss = 0;
     VkPipeline lib[4];
     lib[1] = lib_get(LIB_PR, s, k, l, &pk, sizeof pk, build, &miss);   // shader libraries first: no work when absent
@@ -1750,8 +1827,9 @@ static struct {
     Job *head, *tail;                  // draws' misses
     Job *low, *low_tail;               // prebuild
     uint32_t inflight;                 // queued or running, both queues
-    CONDITION_VARIABLE work, idle, done;   // all with P.lock; done: a job finished
-} A = {.work = CONDITION_VARIABLE_INIT, .idle = CONDITION_VARIABLE_INIT, .done = CONDITION_VARIABLE_INIT};
+    int low_running;                   // pool workers running a job taken from the low queue
+    CONDITION_VARIABLE idle;           // with P.lock: no job queued or running
+} A = {.idle = CONDITION_VARIABLE_INIT};
 
 // ---- pipeline keys (build/v121/pipeline-keys.bin next to the pipeline cache)
 // Every graphics pipeline built in a game run appends a KeyRec: the VkPipeState it was built from with the shader
@@ -1920,14 +1998,32 @@ static DWORD WINAPI pipe_worker(void *arg) {
     int me = (int)(intptr_t)arg;
     AcquireSRWLockExclusive(&P.lock);
     for (;;) {
-        while (!A.head && !A.low) SleepConditionVariableSRW(&A.work, &P.lock, INFINITE, 0);
+        // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once.
+        while (!U.head && !A.head && !(A.low && (A.threads < 3 || A.low_running < A.threads - 1))) {
+            U.idle++;
+            SleepConditionVariableSRW(&work_cv, &P.lock, INFINITE, 0);
+            U.idle--;
+        }
+        if (U.head) {   // a library a draw waits for
+            LibJob *lj = U.head;
+            if (!(U.head = lj->next)) U.tail = NULL;
+            lj->b->job = NULL;
+            if (A.prio_low[me]) A.prio_low[me] = 0, SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+            U.by_worker++, U.running++;
+            lib_build(lj->b, lj->kind, &lj->s, &lj->k, lj->l);   // releases P.lock while building
+            U.running--;
+            free(lj);
+            continue;
+        }
         Job *j = A.head;
+        int lowrun = !j;
         if (j) {
             if (!(A.head = j->next)) A.tail = NULL;
         } else {
             j = A.low;
             if ((A.low = j->next)) A.low->prev = NULL;
             else A.low_tail = NULL;
+            A.low_running++;
         }
         j->next = j->prev = NULL;
         j->worker = me;
@@ -1943,12 +2039,13 @@ static DWORD WINAPI pipe_worker(void *arg) {
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
                 j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
-                WakeAllConditionVariable(&A.done);
+                WakeAllConditionVariable(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
                 if (A.low) A.low->prev = j;
                 else A.low_tail = j;
                 A.low = j;
+                A.low_running -= lowrun;
                 continue;
             } else if (f) {
                 vkDestroyPipeline(P.device, f, NULL);
@@ -1974,8 +2071,9 @@ static DWORD WINAPI pipe_worker(void *arg) {
             K.promoted += j->demanded;
             if (!--K.left && !K.loading) prebuild_report();
         }
+        A.low_running -= lowrun;
         if (!--A.inflight) WakeAllConditionVariable(&A.idle);
-        WakeAllConditionVariable(&A.done);
+        WakeAllConditionVariable(&done_cv);
         if (pipe && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
         free(j);
     }
@@ -2007,7 +2105,14 @@ static void workers_drain(void) {
         free(j);
     }
     A.low = A.low_tail = NULL;
+    for (LibJob *j = U.head, *n; j; j = n) {   // queued library jobs too: their entries read as failed builds
+        n = j->next;
+        j->b->job = NULL, j->b->building = 0;
+        free(j);
+    }
+    U.head = U.tail = NULL;
     while (A.inflight) SleepConditionVariableSRW(&A.idle, &P.lock, INFINITE, 0);
+    while (U.running) SleepConditionVariableSRW(&done_cv, &P.lock, INFINITE, 0);
     ReleaseSRWLockExclusive(&P.lock);
 }
 
@@ -2034,7 +2139,7 @@ static void promote(Pipe *p) {
         if (A.tail) A.tail->next = j;
         else A.head = j;
         A.tail = j;
-        WakeConditionVariable(&A.work);
+        WakeConditionVariable(&work_cv);
     } else if (A.prio_low[j->worker]) {
         A.prio_low[j->worker] = 0;
         SetThreadPriority(A.thread[j->worker], THREAD_PRIORITY_NORMAL);
@@ -2093,9 +2198,78 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         A.tail = j;
     }
     A.inflight++;
-    WakeConditionVariable(&A.work);
+    WakeConditionVariable(&work_cv);
     *queued = 1;
     return p;
+}
+
+// A job still in the draw queue goes to the head of the low queue: its pipeline has (or is about to have) a fast-linked
+// one, so the optimised build waits behind other draws' misses. Caller holds P.lock.
+static void job_lower(Job *j) {
+    if (!j || j->worker >= 0 || j->low) return;
+    if (A.head == j) {
+        if (!(A.head = j->next)) A.tail = NULL;
+    } else {
+        Job *q = A.head;
+        while (q && q->next != j) q = q->next;
+        if (!q) return;
+        if (!(q->next = j->next)) A.tail = q;
+    }
+    j->low = 1, P.g.requeued++;
+    j->prev = NULL, j->next = A.low;
+    if (A.low) A.low->prev = j;
+    else A.low_tail = j;
+    A.low = j;
+}
+
+// A draw waits for pipeline s: its missing pre-rasterization and fragment shader libraries go to the head of the
+// worker queues (U), so they build in parallel on idle workers, and this thread sleeps until both are published or
+// end (now_ms) passes. A job no worker took within 1 ms (all busy) is built here. Caller holds P.lock.
+static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end) {
+    ViKey vk_;
+    PrKey pk;
+    FsKey fk;
+    FoKey ok;
+    lib_keys(s, k, &vk_, &pk, &fk, &ok);
+    U.waits++;
+    const void *key[2] = {&pk, &fk};
+    uint32_t size[2] = {sizeof pk, sizeof fk};
+    Lib *b[2];
+    int queued = 0;
+    for (int i = 0; i < 2; i++) {
+        uint64_t h = key_hash(key[i], size[i]);
+        if ((b[i] = lib_find(h, key[i], size[i]))) continue;
+        if (!half_layout(l, i)) return;   // gpl_link reports it
+        LibJob *j = calloc(1, sizeof *j);
+        if (!j || !(b[i] = lib_new(h, key[i], size[i]))) {
+            free(j);
+            return;
+        }
+        *j = (LibJob){.b = b[i], .kind = i ? LIB_FS : LIB_PR, .l = l, .s = *s, .k = *k};
+        b[i]->job = j;
+        if (U.tail) U.tail->next = j;
+        else U.head = j;
+        U.tail = j;
+        U.queued++, queued++;
+    }
+    if (queued) WakeAllConditionVariable(&work_cv);
+    double steal_at = now_ms() + 1.0;
+    for (;;) {
+        if (!b[0]->building && !b[1]->building) return;
+        double now = now_ms();
+        if (now >= end) {
+            U.timeouts++;
+            return;
+        }
+        Lib *q = b[0]->job ? b[0] : b[1]->job ? b[1] : NULL;
+        if (q && (now >= steal_at || !U.idle)) {
+            U.stolen++;
+            lib_steal(q);   // releases P.lock while building
+            continue;
+        }
+        double until = q && steal_at < end ? steal_at : end;
+        SleepConditionVariableSRW(&done_cv, &P.lock, (DWORD)(until - now) + 1, 0);
+    }
 }
 
 static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int async, int *pending, uint32_t wait_ms) {
@@ -2113,46 +2287,46 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     } else {
         p = pipe_miss(s, &k, h, async, &queued);
     }
-    // A draw that would wait (wait_ms) builds the missing shader libraries itself and links (about 0.12 ms per library
-    // from the driver's disk cache): the workers may all be in optimised builds of earlier pipelines, and its job would
-    // queue behind them. Its job then only does the optimised build, from the low queue. Other draws leave the
-    // libraries to the job and are skipped meanwhile. TOTK_GPL_DRAW_BUILD=0 leaves them to the job too.
+    // A draw that would wait (wait_ms) gets its missing shader libraries built at once, the vertex and fragment ones in
+    // parallel on idle workers (lib_wait; about 0.12 ms per library from the driver's disk cache, 5-180 ms cold), and
+    // links them here: its own job may queue behind optimised builds of earlier pipelines. The job then only does the
+    // optimised build, from the low queue. Other draws leave the libraries to the job and are skipped meanwhile.
+    // TOTK_PIPE_WAIT=draw builds them on this thread one after the other instead, as before; TOTK_GPL_DRAW_BUILD=0
+    // leaves them to the job.
     static int draw_build = -1;
     if (draw_build < 0) {
-        const char *e = cfg_get("TOTK_GPL_DRAW_BUILD");
+        const char *e = cfg_get("TOTK_GPL_DRAW_BUILD"), *w = cfg_get("TOTK_PIPE_WAIT");
         draw_build = !(e && !strcmp(e, "0"));
+        U.on = !(w && !strcmp(w, "draw"));
+        rt_log("vk_pipeline: a draw that waits for its pipeline %s", !draw_build ? "leaves its libraries to its job"
+               : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
+                      : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
     }
+    double end = wait_ms ? now_ms() + wait_ms : 0;
     if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay) {
-        int final, build = wait_ms != 0 && draw_build;
-        if (build) p->fast_tried = 1;   // the job, if a worker takes it meanwhile, goes straight to the optimised build
+        int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
-        VkPipeline f = gpl_link(s, &k, p->lay, build, &final);   // build 1 releases P.lock while building
+        if (build && U.on) {
+            job_lower(p->job);   // its worker would only wait for the same libraries; it links them if this draw cannot
+            lib_wait(s, &k, (Layout *)p->lay, end);   // releases P.lock while waiting
+            build = 0;                                // links here when both libraries exist (gpl_link build 0)
+        } else if (build) {
+            p->fast_tried = 1;   // the job, if a worker takes it meanwhile, goes straight to the optimised build
+        }
+        VkPipeline f = p->info.pipeline ? VK_NULL_HANDLE : gpl_link(s, &k, p->lay, build, &final);   // build 1 releases P.lock
         perf_end(PERF_PIPE, p0);
-        if (build) {
+        if (wait_ms && draw_build) {
             double ms = ms_since(t0);
             P.g.dlinks++, P.g.dlink_ms += ms;
             if (ms > P.g.dlink_max) P.g.dlink_max = ms;
-            if (ms > 5.0 && P.g.slow++ < 16) rt_log("vk_pipeline: gpl: a waiting draw built its libraries in %.1f ms", ms);
+            if (ms > 5.0 && P.g.slow++ < 16)
+                rt_log("vk_pipeline: gpl: a waiting draw %s its libraries in %.1f ms", U.on ? "got" : "built", ms);
         }
         if (final) p->fast_tried = 1;
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f;
-            Job *j = p->job;
-            if (j && j->worker < 0 && !j->low) {   // still in the draw queue: to the head of the low queue
-                if (A.head == j) {
-                    if (!(A.head = j->next)) A.tail = NULL;
-                } else {
-                    Job *q = A.head;
-                    while (q && q->next != j) q = q->next;
-                    if (q && !(q->next = j->next)) A.tail = q;
-                }
-                j->low = 1, P.g.requeued++;
-                j->prev = NULL, j->next = A.low;
-                if (A.low) A.low->prev = j;
-                else A.low_tail = j;
-                A.low = j;
-            }
-            WakeAllConditionVariable(&A.done);
+            job_lower(p->job);
+            WakeAllConditionVariable(&done_cv);
         } else if (f) {
             vkDestroyPipeline(P.device, f, NULL);   // a worker published one while the lock was free
         }
@@ -2160,9 +2334,9 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     if (p && p->building && !p->info.pipeline) {
         promote(p);
         uint64_t p0 = wait_ms ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
-        double end = wait_ms ? now_ms() + wait_ms : 0, now;
+        double now;
         while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
-            SleepConditionVariableSRW(&A.done, &P.lock, (DWORD)(end - now) + 1, 0);
+            SleepConditionVariableSRW(&done_cv, &P.lock, (DWORD)(end - now) + 1, 0);
         if (wait_ms) perf_end(PERF_PIPE, p0);
         if (wait_ms && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
     }
@@ -2218,7 +2392,7 @@ static DWORD WINAPI warm_builder(void *arg) {
         K.promoted += j->demanded;
         K.left--;
         if (!--A.inflight) WakeAllConditionVariable(&A.idle);
-        WakeAllConditionVariable(&A.done);
+        WakeAllConditionVariable(&done_cv);
         free(j);
     }
     ReleaseSRWLockExclusive(&P.lock);
@@ -2317,7 +2491,7 @@ void vk_pipeline_prewarm(void) {
     }
     for (int i = 0; i < nt; i++) CloseHandle(t[i]);
     AcquireSRWLockExclusive(&P.lock);
-    while (K.left) SleepConditionVariableSRW(&A.done, &P.lock, INFINITE, 0);   // jobs a pool worker took
+    while (K.left) SleepConditionVariableSRW(&done_cv, &P.lock, INFINITE, 0);   // jobs a pool worker took
     rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u failed, %u already built, %u dropped "
            "(shader neither cached nor stored); shaders %.0f ms, pipelines %.0f ms on %d threads, total %.0f ms",
            n, K.path, K.built, K.failed, known, dropped, t1 - t0, now_ms() - t1, nt, now_ms() - t0);
@@ -2822,6 +2996,11 @@ void vk_pipeline_save(void) {
                P.g.link_max, (unsigned long long)P.g.link_fail, (unsigned long long)P.g.defer,
                (unsigned long long)P.g.swaps, (unsigned long long)P.g.requeued, (unsigned long long)P.g.slow,
                (unsigned long long)P.g.dlinks, P.g.dlinks ? P.g.dlink_ms / P.g.dlinks : 0.0, P.g.dlink_max);
+        if (U.waits || U.queued)
+            rt_log("vk_pipeline: gpl: library jobs for waiting draws: %llu queued, %llu built by a worker, %llu by the "
+                   "thread that needed them (no worker free), %llu waits ended at their limit",
+                   (unsigned long long)U.queued, (unsigned long long)U.by_worker, (unsigned long long)U.stolen,
+                   (unsigned long long)U.timeouts);
         static const char *const kn[4] = {"vertex input", "pre-rasterization", "fragment shader", "fragment output"};
         for (int i = 0; i < 4; i++)
             rt_log("vk_pipeline: gpl: %s libraries %llu (avg %.2f ms, max %.2f ms)", kn[i], (unsigned long long)P.g.lib_n[i],
