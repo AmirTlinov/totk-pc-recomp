@@ -1,5 +1,5 @@
 // Vulkan textures of the M4 graphics layer: a VkImage cache keyed by storage
-// GPU address plus descriptor, uploads through staging buffers with block-linear deswizzle and CPU ASTC decode,
+// GPU address plus descriptor, uploads through staging buffers with block-linear deswizzle and ASTC decode (vk_astc.c),
 // re-uploads when page write generations (vk_memory.c) show the storage written, ReadTexels / WriteTexels, the texture
 // and sampler descriptor slots, and VkSamplers.
 //
@@ -467,9 +467,49 @@ static void shrink_rgb(int format, const uint8_t *src, uint8_t *dst, size_t n) {
     for (size_t i = 0; i < n; i++, src += 4 * e, dst += 3 * e) memcpy(dst, src, 3 * e);
 }
 
+// TOTK_ASTC=check: the compute decoder's texels of n regions (gpu: the regions one after the other) against
+// astc_decode_ldr of the same raw blocks (raw: the staging bytes the regions point into).
+static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar, int n, const uint8_t *gpu) {
+    static volatile long n_bad;
+    static uint64_t n_tex, n_texels, n_diff_tex;
+    uint32_t bw = e->f.astc_bw, bh = e->f.astc_bh;
+    uint64_t diff = 0, first = UINT64_MAX;
+    uint32_t want = 0, got = 0;
+    int first_k = 0;
+    for (int k = 0; k < n; k++) {
+        const VkAstcRegion *r = &ar[k];
+        size_t sb = (size_t)((r->w + bw - 1) / bw) * ((r->h + bh - 1) / bh) * 16, st = (size_t)r->w * r->h * 4;
+        uint8_t *cpu = malloc(st);
+        for (uint32_t z = 0; z < r->slices; z++, gpu += st) {
+            astc_decode_ldr(raw + r->src + z * sb, r->w, r->h, bw, bh, e->f.astc_srgb, cpu);
+            if (!memcmp(cpu, gpu, st)) continue;
+            for (size_t i = 0; i < st / 4; i++)
+                if (memcmp(cpu + 4 * i, gpu + 4 * i, 4)) {
+                    if (first == UINT64_MAX) {
+                        first = i, first_k = k;
+                        memcpy(&want, cpu + 4 * i, 4), memcpy(&got, gpu + 4 * i, 4);
+                    }
+                    diff++;
+                }
+        }
+        free(cpu);
+        n_texels += (uint64_t)r->w * r->h * r->slices;
+    }
+    n_tex++;
+    if (diff) {
+        n_diff_tex++;
+        log_limited(&n_bad, "ASTC check: texture %#llx fmt %#x %ux%u: %llu texels differ, first region %d texel %llu "
+                    "cpu %08x gpu %08x", (unsigned long long)e->pub.addr, e->t.d.format, bw, bh,
+                    (unsigned long long)diff, first_k, (unsigned long long)first, want, got);
+    }
+    if (n_tex == 1 || !(n_tex & 63) || diff)
+        rt_log("vk: ASTC check: %llu textures, %llu texels compared, %llu textures differ", (unsigned long long)n_tex,
+               (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
+}
+
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
-    static volatile long n_bad;
+    static volatile long n_bad, n_undecoded;
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
@@ -478,34 +518,40 @@ static void upload(Tex *e) {
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
+    int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
     uint32_t n = levels * layers, k = 0;
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
-    VkDeviceSize total = 0;
+    VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
+    VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
-            uint64_t out = astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
+            uint64_t out = agpu ? raw : astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
             rg[k++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv, ly, 1},
                                           .imageExtent = {w, h, sl}};
             total += (out + 15) & ~15ull;
+            decoded += texels * 4;
         }
     VkCommandBuffer cb = vk_upload_begin();
-    VkBuffer sb;
-    uint8_t *stg = vk_staging(total, &sb, NULL);
+    VkBuffer sb, rbuf = VK_NULL_HANDLE;
+    VmaAllocation ralloc = NULL;
+    uint8_t *stg = vk_staging(total, &sb, NULL), *rmap = acheck ? vk_staging(decoded, &rbuf, &ralloc) : NULL;
     k = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++, k++) {
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
-            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = astc || rgb ? malloc(raw) : NULL;
+            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
             if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
             }
-            if (astc) {
+            if (agpu) {
+                ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
+            } else if (astc) {
                 uint64_t a0 = perf_begin();
                 for (uint32_t z = 0; z < sl; z++)
                     astc_decode_ldr_mt(tmp + (size_t)z * rb * rows, w, h, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb,
@@ -520,10 +566,33 @@ static void upload(Tex *e) {
             }
             free(tmp);
         }
+    uint8_t *raw_copy = acheck ? malloc(total) : NULL;
+    if (raw_copy) memcpy(raw_copy, stg, total);
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+    int checked = 0;
+    if (agpu) {
+        uint64_t a0 = perf_begin();
+        checked = vk_astc_record(cb, sb, total, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->pub.image,
+                                 e->pub.aspect, rbuf);
+        perf_end(PERF_ASTC, a0);
+        if (!checked)
+            log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
+                        (unsigned long long)e->pub.addr, d->format, d->width, d->height);
+    } else {
+        vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+    }
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_upload_end();
+    if (acheck) {   // waits for the GPU
+        vk_upload_flush(1);
+        if (checked) {
+            vmaInvalidateAllocation(vk_ctx()->vma, ralloc, 0, VK_WHOLE_SIZE);
+            astc_check(e, raw_copy, ar, (int)n, rmap);
+        }
+        vmaDestroyBuffer(vk_ctx()->vma, rbuf, ralloc);
+    }
+    free(raw_copy);
+    free(ar);
     free(rg);
     if (e->uploaded) n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
     else n_uploads++, perf_count(PERF_CNT_TEX_UP);
@@ -973,9 +1042,9 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     }
     if (g->level >= e->pub.levels) return 0;
     uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
-    int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0;
-    size_t texels = (size_t)w * h, ib = astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
-    size_t slice = ib ? texels * ib : g->wb * g->hb;
+    int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0, agpu = astc && write && vk_astc_gpu();
+    size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
+    size_t slice = ib ? texels * ib : g->wb * g->hb;   // agpu: the raw blocks, decoded by vk_astc_record
     VkBuffer sb;
     VmaAllocation sa;
     uint8_t *stg = vk_staging(slice * (size_t)g->nz, &sb, &sa);
@@ -984,7 +1053,9 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         uint8_t *s = stg + slice * (size_t)z;
         const uint8_t *m = mem + (size_t)z * g->img;
         if (write) {
-            if (astc) {
+            if (agpu) {
+                for (size_t y = 0; y < g->hb; y++) memcpy(s + y * g->wb, m + y * g->row, g->wb);
+            } else if (astc) {
                 uint8_t *tight = malloc(g->wb * g->hb);
                 for (size_t y = 0; y < g->hb; y++) memcpy(tight + y * g->wb, m + y * g->row, g->wb);
                 uint64_t a0 = perf_begin();
@@ -1006,7 +1077,21 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     if (write) {
         vmaFlushAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
         barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
+        int done = 0;
+        if (agpu) {
+            VkAstcRegion *ar = calloc((size_t)g->nz, sizeof *ar);
+            for (int z = 0; z < g->nz; z++)
+                ar[z] = (VkAstcRegion){.src = slice * (size_t)z, .w = w, .h = h, .slices = 1, .level = rg[z].imageSubresource.mipLevel,
+                                       .layer = rg[z].imageSubresource.baseArrayLayer, .offset = rg[z].imageOffset};
+            uint64_t a0 = perf_begin();
+            done = vk_astc_record(cb, sb, slice * (size_t)g->nz, ar, g->nz, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb,
+                                  e->pub.image, aspect, VK_NULL_HANDLE);
+            perf_end(PERF_ASTC, a0);
+            free(ar);
+        }
+        if (!agpu) vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
+        else if (!done) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
+                                    (unsigned long long)e->pub.addr);
         barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     } else {
         barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);

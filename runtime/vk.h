@@ -37,7 +37,8 @@ typedef struct VkCtx {
     int validation;                         // layer active
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
-        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock;
+        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock,
+        has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -198,6 +199,27 @@ uint64_t vk_upload_flush(int wait);
 void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
 void vk_defer_view(VkImageView view);
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+// ---- ASTC (vk_astc.c). TOTK_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
+enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
+int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
+int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
+int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
+// One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
+// after the other), w x h texels and slices deep, written at offset of level / layer.
+typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
+// Records into cb, the open upload batch (between vk_upload_begin and vk_upload_end): src (TRANSFER_SRC, src_size
+// bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
+// into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
+// call. readback (optional, host-visible, TRANSFER_DST): also gets the decoded texels, the regions one after the other.
+// 0 when the decoder is unavailable or the scratch buffer cannot be allocated (nothing recorded).
+int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
+                   uint32_t bh, int srgb, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
+void vk_astc_stats(uint64_t *dispatches, uint64_t *texels);   // since start
+// TOTK_ASTC_TIME=1: GPU timestamps around each vk_astc_record's dispatches (logged per footprint and the largest one)
+void vk_astc_time_enable(int on);
+int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us);   // totals so far
+void vk_astc_time_summary(void);        // logs the totals
+void vk_astc_release(void);             // vk_device.c, before the device goes: frees the decoder's objects
 void vk_mem_note_submit(uint64_t timeline_value);  // T6: after each submit that signals ctx->timeline with this value
 void vk_mem_collect(void);                         // frees what has completed
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
