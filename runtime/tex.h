@@ -17,6 +17,11 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
                   size_t dst_pitch);
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch,
                 void *dst_storage);
+// One box of a level and layer, [x, x + wb) bytes by [y, y + h) block rows of slice z (3D textures), between the storage
+// and caller rows of pitch bytes, touching nothing else of the level: ReadTexels / WriteTexels of a region cost the
+// region, not the level. Same textures as nvn_deswizzle; -1 for others and for a box outside the level.
+int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z, uint32_t wb,
+                   uint32_t h, void *storage, void *rows, size_t pitch, int to_linear);
 // Byte offset of (x byte, y block row, z slice) inside one level of block height 2^th and block depth 2^td GOBs.
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td);
 // Geometry of a level as the two functions above use it; -1 for textures they reject.

@@ -932,29 +932,18 @@ static int region_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
     return 1;
 }
 
-// Pool bytes <-> caller rows through a linear copy of the level (MNG nvn_mtl.m:10121-10132, 10158-10170).
+// Pool bytes <-> caller rows of the region alone (nvn_texels_box). MNG nvn_mtl.m:10121-10132, 10158-10170 go through a
+// linear copy of the whole level; for a small region of a large texture that cost tens of milliseconds while the guest
+// thread held its virtual core and the caller the texture lock (monsters2 replay, frames 765-790).
 static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
-    const nvn_texdesc *d = &t->d;
-    uint32_t lw = mip(d->width, g->level), lh = d->target == 0 || d->target == 3 ? 1 : mip(d->height, g->level);
-    uint32_t lz = g->is3d ? mip(d->depth, g->level) : 1;
-    size_t lp = (size_t)((lw + g->bw - 1) / g->bw) * (size_t)g->bpb, lr = (lh + g->bh - 1) / (uint32_t)g->bh;
-    if (g->x0 + g->wb > lp || g->y0 + g->hb > lr || (g->is3d && (uint32_t)(r->zoffset + g->nz) > lz)) return 0;
-    uint8_t *lin = malloc(lp * lr * lz);
-    if (!lin) rt_fatal("vk: out of memory for texels");
-    int ok = 1;
-    for (int z = 0; z < g->nz && ok; z++) {
+    for (int z = 0; z < g->nz; z++) {
         unsigned layer = g->is3d ? 0 : g->layer0 + (unsigned)r->zoffset + (unsigned)z;
-        if ((!g->is3d || z == 0) && nvn_deswizzle(d, g->level, layer, t->mem, lin, lp)) { ok = 0; break; }
-        uint8_t *slice = lin + (g->is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
-        for (size_t y = 0; y < g->hb; y++) {
-            uint8_t *p = slice + (g->y0 + y) * lp + g->x0, *q = mem + (size_t)z * g->img + y * g->row;
-            if (write) memcpy(p, q, g->wb);
-            else memcpy(q, p, g->wb);
-        }
-        if (write && (!g->is3d || z == g->nz - 1) && nvn_swizzle(d, g->level, layer, lin, lp, t->mem)) ok = 0;
+        uint32_t slice = g->is3d ? (uint32_t)(r->zoffset + z) : 0;
+        if (nvn_texels_box(&t->d, g->level, layer, (uint32_t)g->x0, (uint32_t)g->y0, slice, (uint32_t)g->wb,
+                           (uint32_t)g->hb, t->mem, mem + (size_t)z * g->img, g->row, !write))
+            return 0;
     }
-    free(lin);
-    return ok;
+    return 1;
 }
 
 static int read_aspect(const Tex *e, VkImageAspectFlags *a) {

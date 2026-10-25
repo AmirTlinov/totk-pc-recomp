@@ -118,6 +118,65 @@ static int test_deswizzle(void) {
     return 0;
 }
 
+// nvn_texels_box against the whole-level path on random boxes: a box read equals the box cut from the deswizzled level,
+// and a box write leaves the storage as deswizzle, overwrite the box, swizzle does (nothing outside the box changes).
+static int check_box(const nvn_texdesc *d, unsigned lv, unsigned layer) {
+    uint32_t rb, rows, sl, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, lv, layer, &rb, &rows, &sl, &base, &th, &td, &bpb)) { printf("probe-vkmem: FAIL box geometry\n"); return 1; }
+    nvn_texlayout L;
+    nvn_tex_layout(d, &L);
+    uint8_t *store = malloc(L.size), *want = malloc(L.size), *lin = malloc((size_t)rb * rows * sl);
+    for (uint64_t i = 0; i < L.size; i++) store[i] = rnd8();
+    uint32_t cols = rb / bpb;
+    for (int k = 0; k < 8; k++) {
+        uint32_t bx = rnd8() % cols, bn = 1 + rnd8() % (cols - bx), y = rnd8() % rows, h = 1 + rnd8() % (rows - y);
+        uint32_t z = sl > 1 ? rnd8() % sl : 0, x = bx * bpb, wb = bn * bpb;
+        size_t pitch = wb + 8;
+        uint8_t *box = malloc(pitch * h), *ref = malloc(pitch * h);
+        // read
+        if (nvn_deswizzle(d, lv, layer, store, lin, rb)) { printf("probe-vkmem: FAIL box deswizzle\n"); return 1; }
+        memset(box, 0xAB, pitch * h), memset(ref, 0xAB, pitch * h);
+        for (uint32_t r = 0; r < h; r++) memcpy(ref + r * pitch, lin + ((size_t)z * rows + y + r) * rb + x, wb);
+        if (nvn_texels_box(d, lv, layer, x, y, z, wb, h, store, box, pitch, 1) || memcmp(box, ref, pitch * h)) {
+            printf("probe-vkmem: FAIL box read format %#x level %u layer %u box %u,%u,%u %ux%u\n", d->format, lv, layer, x, y, z, wb, h);
+            return 1;
+        }
+        // write
+        for (size_t i = 0; i < pitch * h; i++) box[i] = rnd8();
+        memcpy(want, store, L.size);
+        for (uint32_t r = 0; r < h; r++) memcpy(lin + ((size_t)z * rows + y + r) * rb + x, box + r * pitch, wb);
+        if (nvn_swizzle(d, lv, layer, lin, rb, want)) { printf("probe-vkmem: FAIL box swizzle\n"); return 1; }
+        if (nvn_texels_box(d, lv, layer, x, y, z, wb, h, store, box, pitch, 0) || memcmp(store, want, L.size)) {
+            printf("probe-vkmem: FAIL box write format %#x level %u layer %u box %u,%u,%u %ux%u\n", d->format, lv, layer, x, y, z, wb, h);
+            return 1;
+        }
+        g_cases++;
+        free(box), free(ref);
+    }
+    free(store), free(want), free(lin);
+    return 0;
+}
+
+static int test_box(void) {
+    // one format per block size: 1, 8 and 16 bytes per texel, 8 and 16 bytes per 4x4 block
+    int fmt[5] = {0}, n = 0;
+    static const int want_bpb[5] = {1, 8, 16, 8, 16}, want_bw[5] = {1, 1, 1, 4, 4};
+    for (int f = 1; f < 0x200 && n < 5; f++) {
+        int bw, bh, bpb = nvn_fmt_bpb(f, &bw, &bh);
+        for (int i = 0; i < 5; i++)
+            if (!fmt[i] && bpb == want_bpb[i] && bw == want_bw[i] && bh == bw) fmt[i] = f, n++;
+    }
+    for (int i = 0; i < 5; i++) {
+        if (!fmt[i]) continue;
+        nvn_texdesc d2 = {.target = 1, .format = fmt[i], .width = 300, .height = 170, .depth = 1, .levels = 3};
+        nvn_texdesc da = {.target = 4, .format = fmt[i], .width = 96, .height = 80, .depth = 3, .levels = 2};
+        nvn_texdesc d3 = {.target = 2, .format = fmt[i], .width = 72, .height = 40, .depth = 5, .levels = 2};
+        for (unsigned lv = 0; lv < 2; lv++)
+            if (check_box(&d2, lv, 0) || check_box(&da, lv, 2) || check_box(&d3, lv, 0)) return 1;
+    }
+    return 0;
+}
+
 // ---- ASTC ----
 static void void_block(uint8_t b[16], uint16_t r, uint16_t g, uint16_t bl, uint16_t a, int hdr) {
     uint64_t lo = 0xFFFFFFFFFFFFFDFCull;     // 0x1FC mode, LDR, reserved bits 11, extent all ones
@@ -522,7 +581,7 @@ static int test_gpu(void) {
 }
 
 int probe_vkmem(void) {
-    if (test_deswizzle() || test_astc() || test_formats()) return 1;
+    if (test_deswizzle() || test_box() || test_astc() || test_formats()) return 1;
     printf("probe-vkmem: cpu part passed (%u deswizzle cases, %u astc blocks, formats: %u mapped, %u supported by the GPU, "
            "%u unsupported by the GPU, %u unmapped, %u with a fallback)\n",
            g_cases, g_astc_blocks, n_mapped, n_supported, n_unsupported, n_unmapped, n_fallback);
