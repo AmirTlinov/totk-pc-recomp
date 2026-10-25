@@ -131,6 +131,15 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
                                                            // the same without the reset: the bits stay for the next
                                                            // mem_written_pages (verify checks only)
+int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
+                                                           // committed PAGE_READWRITE) read-only until a write or
+                                                           // mem_thaw thaws it; 1 frozen (or already), 0 refused
+int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
+                                                           // since its freeze
+void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
+                                                           // before a kernel write (file read) into guest memory
+void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
+                                                           // regions frozen now; freezes and thaws since the last call
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
 
 // ---- modules (loader.c, T1)

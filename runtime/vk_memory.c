@@ -22,6 +22,23 @@
 #include "nvn_pool_index.h"
 #include "vk.h"
 
+// Raw performance counter ticks for the tracking cost (no division on the replay's path); qpc_ms converts.
+static uint64_t qpc(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)t.QuadPart;
+}
+
+static double qpc_ms(uint64_t ticks) {
+    static double per_ms;
+    if (!per_ms) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        per_ms = (double)f.QuadPart / 1000.0;
+    }
+    return (double)ticks / per_ms;
+}
+
 // ---------------------------------------------------------------- pools
 enum { POOL_IMPORT = 1, POOL_PHYS, POOL_VIRT };
 enum { MS_NONE, MS_ON, MS_REFUSED };
@@ -242,6 +259,7 @@ int vk_pool_init(pool_t *p) {
         ok = alloc_physical(c, r);
     } else {
         r->kind = POOL_IMPORT;
+        mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
         ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
@@ -288,6 +306,7 @@ void vk_pool_fini(pool_t *p) {
     }
     ReleaseSRWLockExclusive(&pool_lock);
     if (!r) return;
+    if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
     // guest gets the storage back when this returns.
     vk_texture_range_gone(r->lo, r->size, r->alloc);
@@ -439,7 +458,8 @@ static void mirror_log(uint64_t frame);
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
-    if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800) mirror_log(frame);
+    if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800) mirror_log(frame);   // and the
+                                                                                                         // write-watch line
     if (frame == 1200) {   // loading is over: the first window starts here
         for (int c = 0; c < VK_MCLS_N; c++)
             for (int u = 0; u < VK_MUSE_N; u++) InterlockedExchange64(&traffic[c][u], 0);
@@ -525,6 +545,32 @@ static uint64_t gen_pages[1024];
 #define REG_SHIFT 21
 static uint32_t reg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
 
+// Every write-watch query of the generation table (gen_lock held exclusively): calls, bytes and time since the last
+// mirror summary, all consumers together; the queries that found written pages (they also flush TLBs) apart.
+static uint64_t ww_calls, ww_bytes, ww_ticks, ww_dirty_calls, ww_dirty_ticks, ww_pages;
+
+static uint64_t ww_query(uint64_t addr, uint64_t size) {
+    uint64_t t0 = qpc();
+    uint64_t n = mem_written_pages(addr, size, gen_pages, sizeof gen_pages / sizeof *gen_pages);
+    uint64_t dt = qpc() - t0;
+    ww_ticks += dt, ww_calls++, ww_bytes += size;
+    if (n && n != UINT64_MAX) ww_dirty_calls++, ww_dirty_ticks += dt, ww_pages += n;
+    return n;
+}
+
+// Frozen regions (mirror mode): a 2 MiB region whose pages nothing wrote for freeze_idle submissions, and which lies
+// wholly in imported pools, is made read-only (memory.c mem_freeze), and write-watch queries skip it until a write or a
+// file read thaws it. Most of the pool memory the mirror and the texture checks cover is static (meshes, textures), and
+// a query costs about 1 us per MiB, so this keeps the queries to the regions the CPU writes.
+#define FREEZE_PER_SUB 32
+static int freeze_idle;                       // 0: off
+static uint32_t ww_ep = 1;                    // gen_lock: the submission being recorded (vk_mem_mirror_begin)
+static uint32_t reg_last[RT_ADDRESS_LIMIT >> REG_SHIFT];    // gen_lock: ww_ep of the region's last stamp
+static uint32_t reg_tried[RT_ADDRESS_LIMIT >> REG_SHIFT];   // gen_lock: ww_ep of its last freeze candidacy
+static uint32_t *fcand;                       // gen_lock: regions to try at the next freeze pass
+static int nfcand, cfcand;
+static uint64_t n_frz_nopool, n_frz_refused;  // gen_lock: candidates not wholly in pools, refused by mem_freeze
+
 static uint32_t *gen_slot(uint64_t page_addr, int create) {
     uint64_t ci = page_addr >> GEN_CHUNK_SHIFT;
     if (ci >= GEN_CHUNKS) return NULL;
@@ -542,6 +588,7 @@ static void stamp_page(uint64_t a, uint32_t g) {
     if (!s) return;
     *s = g;
     reg_max[a >> REG_SHIFT] = g;
+    reg_last[a >> REG_SHIFT] = ww_ep;
 }
 
 static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
@@ -561,9 +608,10 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     AcquireSRWLockExclusive(&gen_lock);
     uint32_t g = ++gen_now;
-    int tracked = 1;
-    for (;;) {
-        uint64_t n = mem_written_pages(lo, hi - lo, gen_pages, sizeof gen_pages / sizeof *gen_pages);
+    int tracked = 1, frozen = 1;
+    for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
+    while (!frozen) {
+        uint64_t n = ww_query(lo, hi - lo);
         if (n == UINT64_MAX) { tracked = 0; break; }
         for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
         if (n < sizeof gen_pages / sizeof *gen_pages) break;   // a full answer may have left pages for the next call
@@ -596,19 +644,32 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
     uint64_t calls = 0;
     for (uint64_t r = r0; r <= r1;) {
         if (snap_at[r] == epoch) { r++; continue; }
+        if (mem_frozen(r << SNAP_SHIFT)) {   // nothing in it changed since its freeze
+            snap_at[r] = epoch, snap_untracked[r] = 0;
+            r++;
+            continue;
+        }
         uint64_t k = r;   // one query over a run of regions not seen in this epoch
-        while (k + 1 <= r1 && snap_at[k + 1] != epoch) k++;
+        while (k + 1 <= r1 && snap_at[k + 1] != epoch && !mem_frozen((k + 1) << SNAP_SHIFT)) k++;
         uint64_t a = r << SNAP_SHIFT, b = (k + 1) << SNAP_SHIFT;
         int tracked = 1;
         if (!g) g = ++gen_now;
         for (;;) {
-            uint64_t n = mem_written_pages(a, b - a, gen_pages, sizeof gen_pages / sizeof *gen_pages);
+            uint64_t n = ww_query(a, b - a);
             if (n == UINT64_MAX) { tracked = 0; break; }
             for (uint64_t j = 0; j < n; j++) stamp_page(gen_pages[j], g);
             if (n < sizeof gen_pages / sizeof *gen_pages) break;
         }
         calls++;
-        for (uint64_t j = r; j <= k; j++) snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!tracked;
+        for (uint64_t j = r; j <= k; j++) {
+            snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!tracked;
+            if (tracked && freeze_idle && ww_ep - reg_last[j] >= (uint32_t)freeze_idle &&
+                ww_ep - reg_tried[j] >= (uint32_t)freeze_idle) {
+                reg_tried[j] = ww_ep;
+                if (nfcand == cfcand) grow((void **)&fcand, &cfcand, sizeof *fcand);
+                fcand[nfcand++] = (uint32_t)j;
+            }
+        }
         r = k + 1;
     }
     return calls;
@@ -696,7 +757,7 @@ static uint64_t page_hi(const PoolRec *r) { return (r->lo + r->size + 0xfff) & ~
 // gen_lock held exclusively. 0: the range is not write-watched.
 static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
     for (;;) {
-        uint64_t n = mem_written_pages(lo, hi - lo, gen_pages, sizeof gen_pages / sizeof *gen_pages);
+        uint64_t n = ww_query(lo, hi - lo);
         if (n == UINT64_MAX) return 0;
         for (uint64_t k = 0; k < n; k++) stamp_page(gen_pages[k], g);
         if (n < sizeof gen_pages / sizeof *gen_pages) return 1;
@@ -867,7 +928,7 @@ static SRWLOCK flush_lock = SRWLOCK_INIT;
 
 typedef struct {
     uint64_t subs, syncs, upload_bytes, upload_copies, first_n, first_bytes, wb_bytes, wb_copies, wb_ranges;
-    uint64_t presnap_queries, sync_queries, cpu_ns, prologues;
+    uint64_t presnap_queries, sync_queries, presnap_t, sync_t, prologues, presnap_bytes;
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -890,6 +951,9 @@ static void mirror_mode(int discrete) {
     const char *g = cfg_get("TOTK_MIRROR_GAP");
     mirror_gap = g && *g ? atoi(g) : 2;
     if (mirror_gap < 0) mirror_gap = 0;
+    const char *fi = cfg_get("TOTK_FREEZE_IDLE");   // submissions a region stays unwritten before it is frozen
+    freeze_idle = !vk_mirror_on ? 0 : fi && *fi ? atoi(fi) : 300;
+    if (freeze_idle < 0) freeze_idle = 0;
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
            mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
 }
@@ -1051,7 +1115,7 @@ static void mirror_retire(void *arg) {
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
 static void mirror_sync(PoolRec *r) {
-    uint64_t t0 = kern_now_ns();
+    uint64_t t0 = qpc();
     r->acc_sub = msub;
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
@@ -1089,7 +1153,7 @@ static void mirror_sync(PoolRec *r) {
         if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
     }
     mrep.syncs++;
-    mrep.cpu_ns += kern_now_ns() - t0;
+    mrep.sync_t += qpc() - t0;
 }
 
 void vk_mem_use(VkMemSpan *sp) {
@@ -1141,9 +1205,42 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     ReleaseSRWLockShared(&pool_lock);
 }
 
+// pool_lock shared: [a, b) lies wholly in the host ranges of imported pools with a GPU buffer.
+static int pools_cover(uint64_t a, uint64_t b) {
+    uint64_t lo[64], hi[64];
+    int n = 0;
+    for (int i = pidx_upper(&pool_index, b - 1) - 1; i >= 0 && pool_index.maxhi[i] > a; i--) {
+        const PoolRec *r = pool_index.e[i].buf;
+        if (r->kind != POOL_IMPORT || !r->buf || r->import_hi <= a || r->import_lo >= b) continue;
+        if (n == 64) return 0;
+        int at = n++;
+        for (; at > 0 && lo[at - 1] > r->import_lo; at--) lo[at] = lo[at - 1], hi[at] = hi[at - 1];
+        lo[at] = r->import_lo, hi[at] = r->import_hi;
+    }
+    uint64_t end = a;
+    for (int i = 0; i < n && end < b; i++) {
+        if (lo[i] > end) return 0;
+        if (hi[i] > end) end = hi[i];
+    }
+    return end >= b;
+}
+
+// pool_lock shared, gen_lock exclusive: freezes up to FREEZE_PER_SUB candidate regions still idle. The query after the
+// protection collects the writes made before it took effect.
+static void freeze_pass(void) {
+    for (int done = 0; nfcand && done < FREEZE_PER_SUB;) {
+        uint64_t j = fcand[--nfcand], a = j << REG_SHIFT, b = a + (1ull << REG_SHIFT);
+        if (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a)) continue;
+        if (!pools_cover(a, b)) { n_frz_nopool++; continue; }
+        done++;
+        if (!mem_freeze(a)) { n_frz_refused++; continue; }
+        query_stamp(a, b, ++gen_now);
+    }
+}
+
 void vk_mem_mirror_begin(void) {
     if (!vk_mirror_on) return;
-    uint64_t t0 = kern_now_ns();
+    uint64_t t0 = qpc();
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
     mepoch = vk_texture_epoch();
@@ -1151,6 +1248,8 @@ void vk_mem_mirror_begin(void) {
     int have = 0;
     AcquireSRWLockShared(&pool_lock);
     AcquireSRWLockExclusive(&gen_lock);
+    ww_ep++;
+    uint64_t b0 = ww_bytes;
     for (int i = 0; i < nm; i++) {
         const PoolRec *r = mlist[i];
         if (r->acc_sub != prev) continue;
@@ -1163,11 +1262,13 @@ void vk_mem_mirror_begin(void) {
         run0 = a, run1 = b, have = 1;
     }
     if (have) q += snap_regions(run0, run1, mepoch);
+    mrep.presnap_bytes += ww_bytes - b0;
+    if (freeze_idle) freeze_pass();
     ReleaseSRWLockExclusive(&gen_lock);
     ReleaseSRWLockShared(&pool_lock);
     mrep.subs++;
     mrep.presnap_queries += q;
-    mrep.cpu_ns += kern_now_ns() - t0;
+    mrep.presnap_t += qpc() - t0;
 }
 
 int vk_mem_mirror_pending(void) { return npend; }
@@ -1297,7 +1398,24 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
 
 // One summary line: with TOTK_TRACE=perf every 60 frames, else at frames 600 and 1800.
 static void mirror_log(uint64_t frame) {
-    static uint64_t last;
+    static uint64_t last, ww_last;
+    AcquireSRWLockExclusive(&gen_lock);
+    uint64_t wc = ww_calls, wb = ww_bytes, wt = ww_ticks, dc = ww_dirty_calls, dt = ww_dirty_ticks, wp = ww_pages;
+    ww_pages = 0;
+    uint64_t np = n_frz_nopool, nr = n_frz_refused;
+    ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_nopool = n_frz_refused = 0;
+    ReleaseSRWLockExclusive(&gen_lock);
+    double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
+    ww_last = frame;
+    uint64_t fz, ff, ft, fo;
+    mem_freeze_stats(&fz, &ff, &ft, &fo);
+    if (rt_trace & RT_TRACE_PERF)
+        rt_log("mem: write-watch frame %llu: per frame, every consumer: %.1f queries over %.1f MiB, %.3f ms (%.1f found "
+               "%.0f written pages, %.3f ms); frozen %.0f MiB; since the last line: freezes %llu, thaws by a write %llu, by a file read "
+               "or mapping change %llu, candidates not wholly in pools %llu, refused %llu",
+               (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
+               fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)np,
+               (unsigned long long)nr);
     if (!vk_mirror_on) return;
     AcquireSRWLockExclusive(&mirror_stat_lock);
     MirrorAcc a = macc;
@@ -1314,12 +1432,13 @@ static void mirror_log(uint64_t frame) {
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, flush calls %.1f (%.3f MiB), queries "
-           "%.1f pre-snap + %.1f sync, prologues %.2f, tracking cpu %.3f ms%s",
+           "%.1f pre-snap (%.1f MiB) + %.1f sync, prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f)%s",
            (unsigned long long)frame, (long long)m_live_n, m_live_bytes / M, (long long)m_refused_n[MR_BUDGET],
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
            a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, fc / f, fb / f / M,
-           a.presnap_queries / f, a.sync_queries / f, a.prologues / f, a.cpu_ns / f / 1e6, ver);
+           a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
+           qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
 }
 
 // Device class (build/mem-plan.md): INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
