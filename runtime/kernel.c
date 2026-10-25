@@ -1,6 +1,7 @@
 // Adapted from MacNativeGames games/totk/runtime/threads.c @ b75be8c (MIT, Copyright (c) 2026 MacNativeGames
 // contributors; itself from d2r-mobile dm/host/hle_thread.c), d2r-mobile dm/host/thread.c @ 53e7c5b (MIT, Copyright
-// (c) 2026 jhaizhou) and LAS Recomp runtime/kernel.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
+// (c) 2026 jhaizhou) and LAS Recomp runtime/kernel.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai); the preemption of virtual cores from
+// MacNativeGames threads.c @ 33e8fa8 (MIT, as above).
 // Threads, synchronization, virtual cores and fibers of the Horizon kernel.
 //
 // One guest thread = one Windows thread with a 256 MiB reserved host stack (every guest BL is a host call) and its own
