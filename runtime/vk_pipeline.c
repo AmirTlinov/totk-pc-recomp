@@ -242,7 +242,15 @@ static int ensure_init(void) {
     P.f_dual_src = f2.features.dualSrcBlend;
 #define PROC(field, name) (P.field = (void *)vkGetDeviceProcAddr(c->device, name))
     PROC(push, "vkCmdPushDescriptorSetKHR");
-    P.dyn_vi = c->has_vertex_input_dynamic_state && PROC(set_vi, "vkCmdSetVertexInputEXT");
+    // TOTK_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
+    // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it (LAS Recomp
+    // 61fe44ff, its issues #8 and #357).
+    const char *dv = cfg_get("TOTK_VK_DYN_VERTEX");
+    int intel_legacy = c->props.vendorID == 0x8086 && c->props.apiVersion <= VK_MAKE_API_VERSION(0, 1, 3, 215);
+    int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy;
+    P.dyn_vi = dv_on && c->has_vertex_input_dynamic_state && PROC(set_vi, "vkCmdSetVertexInputEXT");
+    if (!dv_on && c->has_vertex_input_dynamic_state)
+        rt_log("vk_pipeline: dynamic vertex input off (%s)", dv && *dv ? "TOTK_VK_DYN_VERTEX=0" : "Intel's older Windows driver draws nothing with it");
     if (c->has_eds3) {
         P.dyn_clamp = e3.extendedDynamicState3DepthClampEnable && P.f_depth_clamp && PROC(set_clamp, "vkCmdSetDepthClampEnableEXT");
         P.dyn_poly = e3.extendedDynamicState3PolygonMode && PROC(set_poly, "vkCmdSetPolygonModeEXT");
