@@ -475,8 +475,13 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
 
 // ---- program to shaders
 
+// (program, stage, answers) -> shader, 4-way set-associative, most recently used first. A miss costs a SHA-256 of the
+// whole shader code (gfx_shader.c req_init), slow on CPUs without SHA instructions: a field frame looks up ~3000 and
+// the 2048-slot direct-mapped table this replaced missed 3% of them on conflicts.
+#define SHADER_SETS 2048
+#define SHADER_WAYS 4
 typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; } ShaderEnt;
-static ShaderEnt shader_tab[2048];
+static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
 static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
@@ -542,11 +547,20 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     GfxShaderAnswers a;
     answers_for(ex, st, ctl, &a);
     uint64_t serial = ex->prog->serial;
-    ShaderEnt *e = NULL;
+    ShaderEnt *set = NULL;
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
-        e = &shader_tab[(h ^ h >> 29) & 2047];
-        if (e->used && e->serial == serial && e->stage == st && !memcmp(&e->a, &a, sizeof a)) return e->s;
+        set = shader_tab[(h ^ h >> 29) & (SHADER_SETS - 1)];
+        for (int w = 0; w < SHADER_WAYS && set[w].used; w++) {
+            ShaderEnt *e = &set[w];
+            if (e->serial != serial || e->stage != st || memcmp(&e->a, &a, sizeof a)) continue;
+            if (w) {   // to the front
+                ShaderEnt hit = *e;
+                memmove(&set[1], &set[0], w * sizeof *set);
+                set[0] = hit;
+            }
+            return set[0].s;
+        }
     }
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : GFX_STAGE_CS;
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
@@ -555,7 +569,10 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (pending && *pending) return NULL;
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
                       (unsigned long long)serial);
-    else if (e) e->used = 1, e->serial = serial, e->stage = st, e->a = a, e->s = s;
+    else if (set) {   // in front, the least recently used way drops out
+        memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
+        set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
+    }
     return s;
 }
 

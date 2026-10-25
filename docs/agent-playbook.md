@@ -35,8 +35,9 @@ other `totk.exe` or `ninja.exe` runs. The log's first and last lines record the 
 - With `perf`, `mem: dirty` every 60 frames: what a VRAM mirror of the buffer-bound pools would upload (pages the CPU
   wrote per frame and per submit, eager and lazy, by pool class), FlushMappedRange calls and bytes, and the mirror
   size. The census costs about 1.1 ms of CPU per frame on the submitting thread; `perf_summary.py` summarises it.
-- `TOTK_PROFILE=1 TOTK_PROFILE_FRAMES=lo-hi`: sampling profiler (`runtime/prof_win.c`). Resolve `exe+0x...` RVAs
-  with the build's `totk.map`.
+- `TOTK_PROFILE=<path> TOTK_PROFILE_FRAMES=lo-hi`: sampling profiler (`runtime/prof_win.c`), read with
+  `tools/prof_report.py <profile> <totk.map>`. With `TOTK_PROFILE_RENDER=1` it samples the render thread only and keeps
+  call chains: the report adds inclusive time per function and the exe callers of the driver and system DLLs.
 - `tools/regress.py <build> --base build/v121-m4 [--routes fight,rock,island,field] [--repeat 3] [--cold] [--validation]
   [--out dir]`: runs the routes through `run_game.py --quiet`, scores logs and `TOTK_SHOTS` frames
   (`tools/regress_score.py`, tested by `tests/regress_score_test.py`) and prints median and worst per metric. Run the candidate alone and judge it against

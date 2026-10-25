@@ -2,7 +2,11 @@
 // A host thread wakes every 1 ms and, for every other thread, suspends it, reads Rip and resumes it. The sampler never
 // allocates or takes a lock between SuspendThread and ResumeThread and never runs guest code. The profile is text:
 //   totk-prof 1 / base <hex> / period_us / samples N / thread <tid> <samples> <in-exe samples> / module <base> <size> <path> /
-//   rip <hex> <count> (the top PROF_TOP Rips)
+//   rip <hex> <count> (the top PROF_TOP Rips) / stack <count> <rip> <caller> ... (TOTK_PROFILE_RENDER only, the top
+//   PROF_STACKS call chains)
+// With TOTK_PROFILE_RENDER the sampler also copies up to STK_COPY bytes of the suspended thread's stack and, after
+// ResumeThread, unwinds the copy with the .pdata tables (RtlVirtualUnwind), so it takes no lock while the thread is
+// suspended. The unwind stops at the first frame outside the copy; deeper callers are cut.
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -18,11 +22,20 @@
 #define PROF_SLOTS (1u << 16)   // Rip hash table, open addressing; a full table drops new Rips
 #define PROF_TOP 4000           // more than the 200 asked for: the report sums per function
 #define PROF_THREADS 512
+#define PROF_DEPTH 24             // frames kept per call chain, the sampled Rip first
+#define STK_SLOTS (1u << 15)      // call-chain hash table, open addressing; a full table drops new chains
+#define PROF_STACKS 6000
+#define STK_COPY (64u << 10)      // stack bytes copied per sample
+#define STK_SLACK (64u << 10)     // zeros after the copy: a frame reaching past it reads zeros, and a zero Rip ends the chain
 
 typedef struct { uint64_t rip, n; } RipCount;
 typedef struct { DWORD tid; HANDLE h; uint64_t n, in_exe; } ThreadSlot;
 
 static RipCount table[PROF_SLOTS];
+typedef struct { uint64_t hash, n; uint32_t depth; uint64_t rip[PROF_DEPTH]; } StackCount;
+static StackCount stacks[STK_SLOTS];
+static uint64_t stacks_dropped;
+static uint8_t stk_buf[STK_COPY + STK_SLACK] __attribute__((aligned(16)));   // the slack is never written
 static ThreadSlot threads[PROF_THREADS];
 static int n_threads;
 static uint64_t total, dropped;
@@ -45,6 +58,50 @@ static void count_rip(uint64_t rip) {
         }
     }
     dropped++;
+}
+
+static void count_stack(const uint64_t *rip, uint32_t depth) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t d = 0; d < depth; d++) h = (h ^ rip[d]) * 0x100000001b3ull;
+    h |= 1;   // 0 marks a free slot
+    uint32_t i = (uint32_t)(h >> 49);
+    for (uint32_t k = 0; k < 64; k++, i = (i + 1) & (STK_SLOTS - 1)) {
+        StackCount *s = &stacks[i];
+        if (!s->hash) {
+            s->hash = h, s->depth = depth;
+            memcpy(s->rip, rip, depth * sizeof *rip);
+        } else if (s->hash != h || s->depth != depth || memcmp(s->rip, rip, depth * sizeof *rip)) {
+            continue;
+        }
+        s->n++;
+        return;
+    }
+    stacks_dropped++;
+}
+
+// Unwinds the stack copied to stk_buf from real address lo (n bytes). Registers that point into the copied range are
+// moved into the copy, so frame-pointer frames read the copy too. Returns the number of frames.
+static uint32_t unwind_copy(CONTEXT *c, uintptr_t lo, size_t n, uint64_t *rip) {
+    uintptr_t buf = (uintptr_t)stk_buf, end = buf + n;
+    DWORD64 *regs[] = {&c->Rbx, &c->Rbp, &c->Rsi, &c->Rdi, &c->R12, &c->R13, &c->R14, &c->R15};
+    for (unsigned i = 0; i < sizeof regs / sizeof *regs; i++)
+        if (*regs[i] >= lo && *regs[i] < lo + n) *regs[i] = *regs[i] - lo + buf;
+    c->Rsp = buf;
+    uint32_t d = 0;
+    while (d < PROF_DEPTH && c->Rip && c->Rsp >= buf && c->Rsp + 8 <= end) {
+        rip[d++] = c->Rip;
+        DWORD64 base;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c->Rip, &base, NULL);
+        if (f) {
+            void *hd;
+            DWORD64 est;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, f, c, &hd, &est, NULL);
+        } else {   // a leaf function: the return address is on top
+            c->Rip = *(DWORD64 *)c->Rsp;
+            c->Rsp += 8;
+        }
+    }
+    return d;
 }
 
 // Re-lists the process's threads: keeps the handle of a thread seen before, opens new ones, closes the gone ones.
@@ -94,12 +151,24 @@ static DWORD WINAPI sampler_main(void *arg) {
         for (int i = 0; i < n_threads; i++) {
             ThreadSlot *t = &threads[i];
             if (only_render && t->tid != render_tid) continue;
-            ctx.ContextFlags = CONTEXT_CONTROL;
+            ctx.ContextFlags = only_render ? CONTEXT_CONTROL | CONTEXT_INTEGER : CONTEXT_CONTROL;
             if (SuspendThread(t->h) == (DWORD)-1) continue;
             BOOL ok = GetThreadContext(t->h, &ctx);
+            size_t n = 0;
+            MEMORY_BASIC_INFORMATION mb;
+            if (ok && only_render && VirtualQuery((void *)ctx.Rsp, &mb, sizeof mb) && mb.State == MEM_COMMIT) {
+                n = (uintptr_t)mb.BaseAddress + mb.RegionSize - ctx.Rsp;   // the committed stack above Rsp
+                if (n > STK_COPY) n = STK_COPY;
+                memcpy(stk_buf, (void *)ctx.Rsp, n);
+            }
             ResumeThread(t->h);
             if (!ok) continue;
             count_rip(ctx.Rip);
+            if (n) {
+                uint64_t chain[PROF_DEPTH];
+                uint32_t d = unwind_copy(&ctx, ctx.Rsp, n, chain);
+                if (d) count_stack(chain, d);
+            }
             total++;
             t->n++;
             if (ctx.Rip >= exe_lo && ctx.Rip < exe_hi) t->in_exe++;
@@ -110,6 +179,11 @@ static DWORD WINAPI sampler_main(void *arg) {
 
 static int cmp_desc(const void *a, const void *b) {
     uint64_t x = ((const RipCount *)a)->n, y = ((const RipCount *)b)->n;
+    return (x < y) - (x > y);
+}
+
+static int cmp_stack_desc(const void *a, const void *b) {
+    uint64_t x = ((const StackCount *)a)->n, y = ((const StackCount *)b)->n;
     return (x < y) - (x > y);
 }
 
@@ -142,6 +216,16 @@ void prof_write(void) {
         if (table[i].rip) table[cnt++] = table[i];
     qsort(table, cnt, sizeof *table, cmp_desc);
     for (int i = 0; i < cnt && i < PROF_TOP; i++) fprintf(f, "rip %llx %llu\n", (unsigned long long)table[i].rip, (unsigned long long)table[i].n);
+    int ns = 0;
+    for (uint32_t i = 0; i < STK_SLOTS; i++)
+        if (stacks[i].hash) stacks[ns++] = stacks[i];
+    qsort(stacks, ns, sizeof *stacks, cmp_stack_desc);
+    for (int i = 0; i < ns && i < PROF_STACKS; i++) {
+        fprintf(f, "stack %llu", (unsigned long long)stacks[i].n);
+        for (uint32_t d = 0; d < stacks[i].depth; d++) fprintf(f, " %llx", (unsigned long long)stacks[i].rip[d]);
+        fputc('\n', f);
+    }
+    if (stacks_dropped) fprintf(f, "stacks_dropped %llu\n", (unsigned long long)stacks_dropped);
     fclose(f);
     rt_log("prof: %llu samples, %d Rips -> %s", (unsigned long long)total, cnt, out_path);
 }
