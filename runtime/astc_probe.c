@@ -194,7 +194,8 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
     return bad;
 }
 
-// One 2048 x 2048 texture of valid blocks: CPU decode time against the GPU batch's wall time.
+// One 2048 x 2048 texture of valid blocks: the CPU worker-pool decode against the GPU time of the dispatches alone
+// (vk_astc.c timestamps, TOTK_ASTC_TIME) and the wall time of the upload batch.
 static void timing(VkCtx *c, uint32_t bw, uint32_t bh) {
     uint32_t w = 2048, h = 2048;
     size_t n = (size_t)((w + bw - 1) / bw) * ((h + bh - 1) / bh);
@@ -206,11 +207,18 @@ static void timing(VkCtx *c, uint32_t bw, uint32_t bh) {
     for (size_t k = 4096; k < n; k++) memcpy(blk + 16 * k, blk + 16 * (k % 4096), 16);
     double a = now_ms();
     astc_decode_ldr_mt(blk, w, h, bw, bh, false, out);
-    double cpu = now_ms() - a, gpu = 0, gpu2 = 0;
-    gpu_decode(c, blk, n, 1, w, h, 1, 1, bw, bh, 0, NULL, NULL, &gpu);   // first run includes the table upload
-    gpu_decode(c, blk, n, 1, w, h, 1, 1, bw, bh, 0, NULL, NULL, &gpu2);
-    printf("probe-astc: 2048x2048 %ux%u: CPU (worker pool) %.1f ms, GPU batch %.1f ms (again %.1f ms; includes the "
-           "staging copy and two readbacks of 16 MiB)\n", bw, bh, cpu, gpu, gpu2);
+    double cpu = now_ms() - a, wall = 0;
+    vk_astc_time_enable(1);
+    uint64_t t0, c0, t1, c1;
+    double u0, u1;
+    vk_astc_time_get(bw, bh, &t0, &c0, &u0);
+    for (int i = 0; i < 4; i++) gpu_decode(c, blk, n, 1, w, h, 1, 1, bw, bh, 0, NULL, NULL, i ? &wall : NULL);
+    vk_astc_time_get(bw, bh, &t1, &c1, &u1);
+    vk_astc_time_enable(0);
+    double mtex = (double)(t1 - t0) / 1e6;
+    printf("probe-astc: 2048x2048 %ux%u: CPU (worker pool) %.1f ms; GPU dispatches %.0f us per M texel (%llu decodes "
+           "timed, %.2f M texels), batch wall %.1f ms\n", bw, bh, cpu, mtex > 0 ? (u1 - u0) / mtex : 0.0,
+           (unsigned long long)(c1 - c0), mtex, wall);
     free(blk), free(out);
 }
 
@@ -230,7 +238,9 @@ int probe_astc(void) {
         if (!g_bucket[b]) { printf("probe-astc: FAIL no valid %s block was generated\n", bucket_name[b]); bad = 1; }
     if (!bad) {
         timing(c, 4, 4);
+        timing(c, 6, 6);
         timing(c, 8, 8);
+        timing(c, 12, 12);
     }
     vk_mem_shutdown();
     vk_shutdown();

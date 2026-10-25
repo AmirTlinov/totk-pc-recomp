@@ -4,12 +4,13 @@
 // texel = (e0 * (64 - w) + e1 * w + 32) >> 6, top 8 bits. Error blocks are magenta; HDR endpoint modes give magenta
 // endpoints for their partition.
 //
-// Every invocation decodes the block header of its texel's block again and reads only the integer-sequence values it
-// needs (four weights per plane, the endpoints of its partition), so there is no shared memory and no barrier.
+// A workgroup of 64 lanes takes up to four blocks of one block row (main below): every lane decodes its block's header,
+// the block's lanes share the integer-sequence decode of its weights and colour values through shared memory, and
+// each lane then interpolates its own texels.
 // Compiled to runtime/astc_decode_spv.h by tools/build_shaders.py; vk_astc.c records the dispatch.
 #version 450
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer Blocks { uvec4 blk[]; };
 layout(std430, set = 0, binding = 1) writeonly buffer Texels { uint px[]; };
@@ -232,14 +233,26 @@ bool unpack_endpoints(int cem, int v[8], out ivec4 e0, out ivec4 e1) {
 
 const uint MAGENTA = 0xFFFF00FFu;
 
-uint decode_texel(uvec4 b, int bw, int bh, int x, int y, bool srgb) {
+// What every texel of a block needs from its header (tex_astc.c astc_decode_block up to the weight infill).
+struct Hdr {
+    uint konst;      // the colour of a void-extent or error block
+    bool solid;      // konst is the whole block
+    int wx, wy, dual, quant, wtotal, pcount, cem0, cem1, cem2, cem3, n0, n1, n2, ccount, cq, ccs;
+};
+
+Hdr header(uvec4 b, int bw, int bh) {
+    Hdr H;
+    H.solid = true; H.konst = MAGENTA;
+    H.wx = 0; H.wy = 0; H.dual = 0; H.quant = 0; H.wtotal = 0; H.pcount = 1;
+    H.cem0 = 0; H.cem1 = 0; H.cem2 = 0; H.cem3 = 0; H.n0 = 0; H.n1 = 0; H.n2 = 0; H.ccount = 0; H.cq = 20; H.ccs = -1;
     uint mode = b.x & 0x7FFu;
     if ((mode & 0x1FFu) == 0x1FCu) {   // void extent
-        if ((mode & 0x200u) != 0u || ((b.x >> 10) & 3u) != 3u) return MAGENTA;
+        if ((mode & 0x200u) != 0u || ((b.x >> 10) & 3u) != 3u) return H;
         uint s0 = rbits(b, 12, 13), s1 = rbits(b, 25, 13), t0 = rbits(b, 38, 13), t1 = rbits(b, 51, 13);
         bool all_ones = s0 == 0x1FFFu && s1 == 0x1FFFu && t0 == 0x1FFFu && t1 == 0x1FFFu;
-        if ((s0 >= s1 || t0 >= t1) && !all_ones) return MAGENTA;
-        return (b.z >> 8 & 0xFFu) | (b.z >> 24) << 8 | (b.w >> 8 & 0xFFu) << 16 | (b.w >> 24) << 24;
+        if ((s0 >= s1 || t0 >= t1) && !all_ones) return H;
+        H.konst = (b.z >> 8 & 0xFFu) | (b.z >> 24) << 8 | (b.w >> 8 & 0xFFu) << 16 | (b.w >> 24) << 24;
+        return H;
     }
 
     // block mode (tex_astc.c block_mode_2d)
@@ -260,7 +273,7 @@ uint decode_texel(uvec4 b, int bw, int bh, int x, int y, bool srgb) {
         }
     } else {
         r |= ((m >> 2) & 3u) << 1;
-        if (((m >> 2) & 3u) == 0u) return MAGENTA;
+        if (((m >> 2) & 3u) == 0u) return H;
         uint bb = (m >> 9) & 3u;
         uint sel = (m >> 7) & 3u;
         if (sel == 0u) { wx = 12; wy = int(a) + 2; }
@@ -269,16 +282,16 @@ uint decode_texel(uvec4 b, int bw, int bh, int x, int y, bool srgb) {
         else {
             if (a == 0u) { wx = 6; wy = 10; }
             else if (a == 1u) { wx = 10; wy = 6; }
-            else return MAGENTA;
+            else return H;
         }
     }
     int dual = int(d);
-    int wcount = wx * wy;
+    int wtotal = (wx * wy) << dual;
     int quant = int(r) - 2 + 6 * int(h);
-    int wbits = ise_bitcount(wcount << dual, quant);
-    if ((wcount << dual) > 64 || wbits < 24 || wbits > 96 || wx > bw || wy > bh) return MAGENTA;
+    int wbits = ise_bitcount(wtotal, quant);
+    if (wtotal > 64 || wbits < 24 || wbits > 96 || wx > bw || wy > bh) return H;
     int pcount = int((b.x >> 11) & 3u) + 1;
-    if (dual != 0 && pcount == 4) return MAGENTA;
+    if (dual != 0 && pcount == 4) return H;
 
     // colour endpoint modes
     int cem0, cem1 = 0, cem2 = 0, cem3 = 0;
@@ -296,84 +309,121 @@ uint decode_texel(uvec4 b, int bw, int bh, int x, int y, bool srgb) {
             high = 0;
         } else {
             base--;
-            uint c0 = (((enc >> 2) & 1u) + base) << 2 | ((enc >> uint(2 + pcount)) & 3u);
-            uint c1 = (((enc >> 3) & 1u) + base) << 2 | ((enc >> uint(4 + pcount)) & 3u);
-            uint c2 = (((enc >> 4) & 1u) + base) << 2 | ((enc >> uint(6 + pcount)) & 3u);
-            uint c3 = (((enc >> 5) & 1u) + base) << 2 | ((enc >> uint(8 + pcount)) & 3u);
-            cem0 = int(c0); cem1 = int(c1); cem2 = int(c2); cem3 = int(c3);
+            cem0 = int((((enc >> 2) & 1u) + base) << 2 | ((enc >> uint(2 + pcount)) & 3u));
+            cem1 = int((((enc >> 3) & 1u) + base) << 2 | ((enc >> uint(4 + pcount)) & 3u));
+            cem2 = int((((enc >> 4) & 1u) + base) << 2 | ((enc >> uint(6 + pcount)) & 3u));
+            cem3 = int((((enc >> 5) & 1u) + base) << 2 | ((enc >> uint(8 + pcount)) & 3u));
         }
     }
     int n0 = ((cem0 >> 2) + 1) * 2, n1 = pcount > 1 ? ((cem1 >> 2) + 1) * 2 : 0;
     int n2 = pcount > 2 ? ((cem2 >> 2) + 1) * 2 : 0, n3 = pcount > 3 ? ((cem3 >> 2) + 1) * 2 : 0;
     int ccount = n0 + n1 + n2 + n3;
-    if (ccount > 18) return MAGENTA;
+    if (ccount > 18) return H;
     int cbits = max((pcount == 1 ? 111 : 99) - wbits - high - (dual != 0 ? 2 : 0), 0);
     int cq = -1;
     for (int q = 20; q >= 0; q--) {
         if (ise_bitcount(ccount, q) <= cbits) { cq = q; break; }
     }
-    if (cq < 4) return MAGENTA;   // QUANT_6
+    if (cq < 4) return H;   // QUANT_6
 
-    // this texel's partition and its endpoints
-    int texels = bw * bh;
-    bool small = texels < 32;
-    int p = pcount > 1 ? part_of(int((b.x >> 13) & 0x3FFu), pcount, small ? x << 1 : x, small ? y << 1 : y) : 0;
-    int cem = p == 0 ? cem0 : p == 1 ? cem1 : p == 2 ? cem2 : cem3;
-    int k = p == 0 ? 0 : p == 1 ? n0 : p == 2 ? n0 + n1 : n0 + n1 + n2;
-    int n = ((cem >> 2) + 1) * 2;
-    int cstart = pcount == 1 ? 17 : 29;
-    uint crow = cq == 20 ? 0u : tab[12 + cq - 4];
-    int v[8];
-    for (int j = 0; j < 8; j++) {
-        v[j] = 0;
-        if (j < n) {
-            uint raw = ise_at(b, cstart, ccount, cq, k + j);
-            v[j] = cq == 20 ? int(raw) : int(tab_byte(crow + raw));
-        }
-    }
-    ivec4 e0, e1;
-    if (!unpack_endpoints(cem, v, e0, e1)) { e0 = ivec4(0xFF, 0, 0xFF, 0xFF); e1 = e0; }
-    if (srgb) { e0 = e0 << 8 | 0x80; e1 = e1 << 8 | 0x80; }
-    else { e0 *= 257; e1 *= 257; }
-
-    // weights: bilinear infill from the grid, read backwards from the top of the block
-    uvec4 rev = uvec4(bitfieldReverse(b.w), bitfieldReverse(b.z), bitfieldReverse(b.y), bitfieldReverse(b.x));
-    int vx = int((uint((1024 + bw / 2) / (bw - 1)) * uint(x) * uint(wx - 1) + 32u) >> 6);
-    int vy = int((uint((1024 + bh / 2) / (bh - 1)) * uint(y) * uint(wy - 1) + 32u) >> 6);
-    int fs = vx & 0xF, ft = vy & 0xF;
-    int i0 = (vy >> 4) * wx + (vx >> 4);
-    int w11 = (fs * ft + 8) >> 4, w10 = fs - w11, w01 = ft - w11, w00 = 16 - fs - ft + w11;
-    uint wrow = tab[quant];
-    int wtotal = wcount << dual;
-    int w[2];
-    for (int pl = 0; pl < 2; pl++) {
-        w[pl] = 0;
-        if (pl > dual) continue;
-        int acc = 0;
-        for (int c = 0; c < 4; c++) {
-            int idx = i0 + (c == 0 ? 0 : c == 1 ? 1 : c == 2 ? wx : wx + 1);
-            int f = c == 0 ? w00 : c == 1 ? w10 : c == 2 ? w01 : w11;
-            if (f == 0 || idx >= wcount) continue;
-            uint raw = ise_at(rev, 0, wtotal, quant, dual != 0 ? 2 * idx + pl : idx);
-            acc += int(tab_byte(wrow + raw)) * f;
-        }
-        w[pl] = (acc + 8) >> 4;
-    }
-    int ccs = dual != 0 ? int(rbits(b, below - 2, 2)) : -1;
-
-    uint o = 0u;
-    for (int c = 0; c < 4; c++) {
-        int wc = c == ccs ? w[1] : w[0];
-        o |= uint((e0[c] * (64 - wc) + e1[c] * wc + 32) >> 14) << uint(8 * c);
-    }
-    return o;
+    H.solid = false;
+    H.wx = wx; H.wy = wy; H.dual = dual; H.quant = quant; H.wtotal = wtotal; H.pcount = pcount;
+    H.cem0 = cem0; H.cem1 = cem1; H.cem2 = cem2; H.cem3 = cem3; H.n0 = n0; H.n1 = n1; H.n2 = n2;
+    H.ccount = ccount; H.cq = cq;
+    H.ccs = dual != 0 ? int(rbits(b, below - 2, 2)) : -1;
+    return H;
 }
 
+// A workgroup decodes BPW blocks of one block row when a block has 64 texels or fewer (64 / texels of them), else one
+// block: S lanes per block (its texels, at most 64). The lanes of a block decode its weights and colour values into
+// shared memory, the first pcount lanes then unpack the endpoints, and each lane writes its texels.
+const int MAXB = 4;   // 4x4: 4 blocks of 16 lanes
+shared uint s_w[MAXB][64];       // unquantized weights 0..64 (dual plane: interleaved as in the bit stream)
+shared int s_cv[MAXB][18];       // unquantized colour values
+shared uvec2 s_e0[MAXB][4], s_e1[MAXB][4];   // 16-bit endpoints, two channels per uint
+
+uvec2 pack16(ivec4 e) { return uvec2(uint(e.x) | uint(e.y) << 16, uint(e.z) | uint(e.w) << 16); }
+int ch16(uvec2 p, int c) { return int(((c < 2 ? p.x : p.y) >> (16 * (c & 1))) & 0xFFFFu); }
+
 void main() {
-    uvec3 g = gl_GlobalInvocationID;
-    if (g.x >= pc.width || g.y >= pc.height) return;
-    uint bxi = g.x / pc.bw, byi = g.y / pc.bh;
-    uvec4 b = blk[pc.in_base + g.z * pc.bslice + byi * pc.bx + bxi];
-    uint t = decode_texel(b, int(pc.bw), int(pc.bh), int(g.x - bxi * pc.bw), int(g.y - byi * pc.bh), pc.srgb != 0u);
-    px[pc.out_base + (g.z * pc.height + g.y) * pc.width + g.x] = t;
+    int bw = int(pc.bw), bh = int(pc.bh), G = bw * bh;
+    int bpw = G <= 64 ? 64 / G : 1, S = G <= 64 ? G : 64;
+    int l = int(gl_LocalInvocationID.x), lb = l / S, lane = l - lb * S;
+    bool live = lb < bpw;
+    int bxi = int(gl_WorkGroupID.x) * bpw + lb, byi = int(gl_WorkGroupID.y);
+    live = live && bxi < int(pc.bx);
+    lb = min(lb, MAXB - 1);
+    uvec4 b = live ? blk[pc.in_base + gl_WorkGroupID.z * pc.bslice + uint(byi) * pc.bx + uint(bxi)] : uvec4(0u);
+    Hdr H = header(b, bw, bh);
+    bool work = live && !H.solid;
+
+    if (work) {
+        uvec4 rev = uvec4(bitfieldReverse(b.w), bitfieldReverse(b.z), bitfieldReverse(b.y), bitfieldReverse(b.x));
+        uint wrow = tab[H.quant];
+        for (int j = lane; j < H.wtotal; j += S) s_w[lb][j] = tab_byte(wrow + ise_at(rev, 0, H.wtotal, H.quant, j));
+        uint crow = H.cq == 20 ? 0u : tab[12 + H.cq - 4];
+        int cstart = H.pcount == 1 ? 17 : 29;
+        for (int j = lane; j < H.ccount; j += S) {
+            uint raw = ise_at(b, cstart, H.ccount, H.cq, j);
+            s_cv[lb][j] = H.cq == 20 ? int(raw) : int(tab_byte(crow + raw));
+        }
+    }
+    barrier();
+    if (work && lane < H.pcount) {
+        int p = lane;
+        int cem = p == 0 ? H.cem0 : p == 1 ? H.cem1 : p == 2 ? H.cem2 : H.cem3;
+        int k = p == 0 ? 0 : p == 1 ? H.n0 : p == 2 ? H.n0 + H.n1 : H.n0 + H.n1 + H.n2;
+        int n = ((cem >> 2) + 1) * 2;
+        int v[8];
+        for (int j = 0; j < 8; j++) {
+            v[j] = 0;
+            if (j < n) v[j] = s_cv[lb][k + j];
+        }
+        ivec4 e0, e1;
+        if (!unpack_endpoints(cem, v, e0, e1)) { e0 = ivec4(0xFF, 0, 0xFF, 0xFF); e1 = e0; }
+        if (pc.srgb != 0u) { e0 = e0 << 8 | 0x80; e1 = e1 << 8 | 0x80; }
+        else { e0 *= 257; e1 *= 257; }
+        s_e0[lb][p] = pack16(e0);
+        s_e1[lb][p] = pack16(e1);
+    }
+    barrier();
+    if (!live) return;
+
+    bool small = G < 32;
+    int seed = int((b.x >> 13) & 0x3FFu);
+    int sx = int((1024 + bw / 2) / (bw - 1)), sy = int((1024 + bh / 2) / (bh - 1));
+    for (int t = lane; t < G; t += S) {
+        int x = t % bw, y = t / bw;
+        uint gx = uint(bxi * bw + x), gy = uint(byi * bh + y);
+        if (gx >= pc.width || gy >= pc.height) continue;
+        uint o = H.konst;
+        if (!H.solid) {
+            int p = H.pcount > 1 ? part_of(seed, H.pcount, small ? x << 1 : x, small ? y << 1 : y) : 0;
+            int vx = (sx * x * (H.wx - 1) + 32) >> 6, vy = (sy * y * (H.wy - 1) + 32) >> 6;
+            int fs = vx & 0xF, ft = vy & 0xF;
+            int i0 = (vy >> 4) * H.wx + (vx >> 4);
+            int w11 = (fs * ft + 8) >> 4, w10 = fs - w11, w01 = ft - w11, w00 = 16 - fs - ft + w11;
+            int wcount = H.wx * H.wy;
+            int w[2];
+            for (int pl = 0; pl < 2; pl++) {
+                w[pl] = 0;
+                if (pl > H.dual) continue;
+                int acc = 0;
+                for (int c = 0; c < 4; c++) {
+                    int idx = i0 + (c == 0 ? 0 : c == 1 ? 1 : c == 2 ? H.wx : H.wx + 1);
+                    int f = c == 0 ? w00 : c == 1 ? w10 : c == 2 ? w01 : w11;
+                    if (f == 0 || idx >= wcount) continue;
+                    acc += int(s_w[lb][H.dual != 0 ? 2 * idx + pl : idx]) * f;
+                }
+                w[pl] = (acc + 8) >> 4;
+            }
+            uvec2 q0 = s_e0[lb][p], q1 = s_e1[lb][p];
+            o = 0u;
+            for (int c = 0; c < 4; c++) {
+                int wc = c == H.ccs ? w[1] : w[0];
+                o |= uint((ch16(q0, c) * (64 - wc) + ch16(q1, c) * wc + 32) >> 14) << uint(8 * c);
+            }
+        }
+        px[pc.out_base + (gl_WorkGroupID.z * pc.height + gy) * pc.width + gx] = o;
+    }
 }

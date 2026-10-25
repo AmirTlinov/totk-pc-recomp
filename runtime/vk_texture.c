@@ -501,7 +501,7 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
                     "cpu %08x gpu %08x", (unsigned long long)e->pub.addr, e->t.d.format, bw, bh,
                     (unsigned long long)diff, first_k, (unsigned long long)first, want, got);
     }
-    if (!(n_tex & 255) || diff)
+    if (n_tex == 1 || !(n_tex & 63) || diff)
         rt_log("vk: ASTC check: %llu textures, %llu texels compared, %llu textures differ", (unsigned long long)n_tex,
                (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
 }

@@ -6,9 +6,10 @@
 // device cannot. cpu: astc_decode_ldr_mt on the uploading thread, as before. check: gpu, and every upload is also
 // decoded on the CPU and compared (waits for the GPU; for testing only).
 //
-// The decode is recorded into the upload batch (vk_memory.c): the raw blocks go from staging to a device-local scratch
-// buffer, the dispatch writes RGBA8 texels behind them, and a buffer-to-image copy puts them into the image. The
-// scratch buffer is freed once the batch completes (vk_defer_buffer).
+// The decode is recorded into the upload batch (vk_memory.c) in chunks of at most 32 MiB of texels: a chunk's raw
+// blocks go from staging to a device-local scratch buffer, its dispatches write RGBA8 texels behind them, and a
+// buffer-to-image copy puts them into the image; the next chunk reuses the scratch after a barrier. The scratch
+// buffer is freed once the batch completes (vk_defer_buffer).
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,137 @@ static struct {
     int tab_uploaded;
 } G = {.mode = -1};
 static uint64_t n_dispatch, n_texels;
+
+// TOTK_ASTC_TIME=1 (or vk_astc_time_enable): timestamps around the dispatches of each scratch chunk (the decode
+// alone) and around a whole vk_astc_record call (one texture upload or WriteTexels: copies and barriers included),
+// read back by later calls. Per footprint: texels and dispatch time; a new largest call is logged with both times.
+// Needs hostQueryReset (a slot is reset on the host after its read).
+#define TQ 256
+static SRWLOCK t_lock = SRWLOCK_INIT;
+static int t_on = -1;                 // -1: knob not read yet
+static VkQueryPool t_pool;
+static VkDevice t_dev;
+static double t_ns_per_tick;
+static uint64_t t_mask;
+static struct { uint64_t texels; uint32_t id; uint8_t fp, busy, whole; } t_slot[TQ];   // whole: the call, else a chunk
+static int t_next;
+static struct { uint64_t texels, chunks; double us; } t_fp[13 * 13];   // [bw * 13 + bh]: dispatch time of the chunks
+#define TA 64   // calls in flight, by id % TA
+typedef struct { uint32_t id, w, h, regions, chunks, done; int complete; uint64_t texels; double us, total; uint8_t fp; } TCall;
+static TCall t_call[TA];
+static uint32_t t_id;
+static uint64_t t_max_texels;
+static double t_max_us, t_max_total;
+static uint8_t t_max_fp;
+
+static void time_init(VkCtx *c) {   // t_lock held
+    if (t_on < 0) {
+        const char *e = cfg_get("TOTK_ASTC_TIME");
+        t_on = e && *e && *e != '0';
+    }
+    if (t_on <= 0 || (t_pool && t_dev == c->device)) return;
+    t_pool = VK_NULL_HANDLE;
+    memset(t_slot, 0, sizeof t_slot);
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12};
+    vkGetPhysicalDeviceFeatures2(c->phys, &f2);
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, NULL);
+    VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, qp);
+    uint32_t bits = c->gfx_family < nq ? qp[c->gfx_family].timestampValidBits : 0;
+    free(qp);
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = 2 * TQ};
+    if (!f12.hostQueryReset || !bits || vkCreateQueryPool(c->device, &qi, NULL, &t_pool) != VK_SUCCESS) {
+        rt_log("vk: TOTK_ASTC_TIME: no hostQueryReset or no timestamps on the queue; ASTC decodes not timed");
+        t_pool = VK_NULL_HANDLE;
+        t_on = 0;
+        return;
+    }
+    vkResetQueryPool(c->device, t_pool, 0, 2 * TQ);
+    t_dev = c->device;
+    t_ns_per_tick = c->props.limits.timestampPeriod;
+    t_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+}
+
+// Takes in the slots whose timestamps are available; t_lock held.
+static void time_poll_locked(VkCtx *c) {
+    if (!t_pool || t_dev != c->device) return;
+    for (int i = 0; i < TQ; i++) {
+        if (!t_slot[i].busy) continue;
+        uint64_t r[4];
+        if (vkGetQueryPoolResults(c->device, t_pool, 2 * (uint32_t)i, 2, sizeof r, r, 16,
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != VK_SUCCESS ||
+            !r[1] || !r[3])
+            continue;
+        double us = (double)((r[2] - r[0]) & t_mask) * t_ns_per_tick / 1e3;
+        int fp = t_slot[i].fp;
+        if (!t_slot[i].whole) t_fp[fp].texels += t_slot[i].texels, t_fp[fp].chunks++, t_fp[fp].us += us;
+        TCall *k = &t_call[t_slot[i].id % TA];
+        if (k->id == t_slot[i].id) {
+            if (t_slot[i].whole) k->total = us;
+            else k->us += us, k->texels += t_slot[i].texels;
+            if (++k->done == k->chunks + 1 && k->complete && k->texels > t_max_texels) {
+                t_max_texels = k->texels, t_max_us = k->us, t_max_total = k->total, t_max_fp = k->fp;
+                rt_log("vk: ASTC time: largest decode so far %.2f M texels (%dx%d; %u regions, the first %ux%u; %u scratch "
+                       "chunks): dispatches %.0f us of GPU time (%.0f us per M texel), %.0f us with the copies",
+                       (double)k->texels / 1e6, k->fp / 13, k->fp % 13, k->regions, k->w, k->h, k->chunks, k->us,
+                       k->us * 1e6 / (double)k->texels, k->total);
+            }
+        }
+        t_slot[i].busy = 0;
+        vkResetQueryPool(c->device, t_pool, 2 * (uint32_t)i, 2);
+    }
+}
+
+// A free slot for a call's id (t_lock held); -1 when the ring is full.
+static int time_slot(uint32_t id, uint8_t fp, uint64_t texels, int whole) {
+    for (int i = 0; i < TQ; i++, t_next = (t_next + 1) % TQ)
+        if (!t_slot[t_next].busy) {
+            int k = t_next;
+            t_slot[k].busy = 1, t_slot[k].id = id, t_slot[k].fp = fp, t_slot[k].texels = texels;
+            t_slot[k].whole = (uint8_t)whole;
+            t_next = (k + 1) % TQ;
+            return k;
+        }
+    return -1;
+}
+
+void vk_astc_time_enable(int on) {
+    AcquireSRWLockExclusive(&t_lock);
+    t_on = on;
+    ReleaseSRWLockExclusive(&t_lock);
+}
+
+int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us) {
+    VkCtx *c = vk_ctx();
+    if (!c || bw > 12 || bh > 12) return 0;
+    AcquireSRWLockExclusive(&t_lock);
+    time_poll_locked(c);
+    int fp = (int)(bw * 13 + bh);
+    *texels = t_fp[fp].texels, *calls = t_fp[fp].chunks, *us = t_fp[fp].us;
+    ReleaseSRWLockExclusive(&t_lock);
+    return 1;
+}
+
+void vk_astc_time_summary(void) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    AcquireSRWLockExclusive(&t_lock);
+    if (t_on > 0) {
+        time_poll_locked(c);
+        for (int fp = 0; fp < 13 * 13; fp++)
+            if (t_fp[fp].chunks)
+                rt_log("vk: ASTC time: %dx%d: %llu dispatch batches, %.2f M texels, %.0f us GPU (%.0f us per M texel)",
+                       fp / 13, fp % 13, (unsigned long long)t_fp[fp].chunks, (double)t_fp[fp].texels / 1e6, t_fp[fp].us,
+                       t_fp[fp].us * 1e6 / (double)t_fp[fp].texels);
+        if (t_max_texels)
+            rt_log("vk: ASTC time: largest decode %.2f M texels (%dx%d): dispatches %.0f us GPU, %.0f us with the copies",
+                   (double)t_max_texels / 1e6, t_max_fp / 13, t_max_fp % 13, t_max_us, t_max_total);
+    }
+    ReleaseSRWLockExclusive(&t_lock);
+}
 
 static void fill_tables(uint8_t *p) {
     uint32_t off[28];
@@ -228,20 +360,38 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+// Scratch per vk_astc_record: texels of at most this many bytes at a time (or one region, when larger), so a large
+// texture array (169 M texels, 677 MB as RGBA8, on monsters2) does not need its whole RGBA8 copy as scratch.
+#define CHUNK_OUT (32ull << 20)
+
+static VkDeviceSize region_out(const VkAstcRegion *r) { return (VkDeviceSize)r->w * r->h * r->slices * 4; }
+static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
+    return (VkDeviceSize)((r->w + bw - 1) / bw) * ((r->h + bh - 1) / bh) * r->slices * 16;
+}
+
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, VkImage img, VkImageAspectFlags aspect, VkBuffer readback) {
     static volatile long n_fail;
+    (void)src_size;
     VkCtx *c = vk_ctx();
     if (!c || !vk_astc_gpu() || bw < 4 || bh < 4 || bw > 12 || bh > 12) return 0;
     AcquireSRWLockShared(&g_lock);
     VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE;
     ReleaseSRWLockShared(&g_lock);
     if (!pipe) return 0;
-    // scratch: the blocks (a copy of src), then the texels of every region
-    VkDeviceSize in_size = (src_size + 15) & ~15ull, out_size = 0;
-    for (int i = 0; i < n; i++) out_size += (VkDeviceSize)rg[i].w * rg[i].h * rg[i].slices * 4;
-    if (!out_size) return 1;
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = in_size + out_size,
+    // chunks of consecutive regions; scratch = the largest chunk's blocks, then its texels
+    VkDeviceSize out_total = 0, cap_in = 0, cap_out = 0, ci = 0, co = 0;
+    for (int i = 0; i < n; i++) {
+        VkDeviceSize o = region_out(&rg[i]), b = region_in(&rg[i], bw, bh);
+        if (co && co + o > CHUNK_OUT) ci = co = 0;
+        ci += b, co += o, out_total += o;
+        if (ci > cap_in) cap_in = ci;
+        if (co > cap_out) cap_out = co;
+    }
+    if (!out_total) return 1;
+    VkDeviceSize al = c->props.limits.minStorageBufferOffsetAlignment;   // the texels bind at cap_in
+    if (al > 1) cap_in = (cap_in + al - 1) / al * al;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap_in + cap_out,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
@@ -250,7 +400,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     if (vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL) != VK_SUCCESS) {
         if (InterlockedIncrement(&n_fail) <= 16)
             rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
-                   (unsigned long long)(in_size + out_size));
+                   (unsigned long long)(cap_in + cap_out));
         return 0;
     }
     AcquireSRWLockExclusive(&g_lock);
@@ -265,51 +415,112 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         VkBufferCopy cp = {0, 0, TAB_SIZE};
         vkCmdCopyBuffer(cb, tb, tab, 1, &cp);
     }
-    VkBufferCopy cp = {0, 0, src_size};
-    vkCmdCopyBuffer(cb, src, sb, 1, &cp);
-    mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    VkDescriptorBufferInfo dbi[3] = {{sb, 0, in_size}, {sb, in_size, out_size}, {tab, 0, TAB_SIZE}};
+    int timed = 0, whole = -1;
+    uint32_t id = 0;
+    uint8_t fp = (uint8_t)(bw * 13 + bh);
+    AcquireSRWLockExclusive(&t_lock);
+    time_init(c);
+    if (t_on > 0 && t_pool) {
+        time_poll_locked(c);
+        timed = 1;
+        id = ++t_id;
+        t_call[id % TA] = (TCall){.id = id, .w = rg[0].w, .h = rg[0].h, .regions = (uint32_t)n, .fp = fp, .complete = 1};
+        whole = time_slot(id, fp, out_total / 4, 1);
+        if (whole < 0) t_call[id % TA].complete = 0;
+    }
+    VkQueryPool tpool = t_pool;
+    ReleaseSRWLockExclusive(&t_lock);
+    if (whole >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)whole);
+    VkDescriptorBufferInfo dbi[3] = {{sb, 0, cap_in}, {sb, cap_in, cap_out}, {tab, 0, TAB_SIZE}};
     VkWriteDescriptorSet w[3];
     for (int i = 0; i < 3; i++)
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,
                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                       .pBufferInfo = &dbi[i]};
-    G.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.layout, 0, 3, w);
     VkBufferImageCopy *copies = calloc((size_t)n, sizeof *copies);
-    if (!copies) rt_fatal("vk: out of memory (ASTC regions)");
-    VkDeviceSize out = 0;
-    for (int i = 0; i < n; i++) {
-        const VkAstcRegion *r = &rg[i];
-        uint32_t bx = (r->w + bw - 1) / bw, by = (r->h + bh - 1) / bh;
-        Push pc = {.in_base = (uint32_t)(r->src / 16), .out_base = (uint32_t)(out / 4), .width = r->w, .height = r->h,
-                   .bw = bw, .bh = bh, .bx = bx, .bslice = bx * by, .srgb = (uint32_t)(srgb != 0)};
-        vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-        vkCmdDispatch(cb, (r->w + 7) / 8, (r->h + 7) / 8, r->slices);
-        copies[i] = (VkBufferImageCopy){.bufferOffset = in_size + out, .bufferRowLength = r->w, .bufferImageHeight = r->h,
-                                        .imageSubresource = {aspect, r->level, r->layer, 1}, .imageOffset = r->offset,
-                                        .imageExtent = {r->w, r->h, r->slices}};
-        out += (VkDeviceSize)r->w * r->h * r->slices * 4;
-        n_texels += (uint64_t)r->w * r->h * r->slices;
+    VkBufferCopy *bcp = calloc((size_t)n, sizeof *bcp);
+    if (!copies || !bcp) rt_fatal("vk: out of memory (ASTC regions)");
+    VkDeviceSize rb_off = 0;
+    int chunks = 0;
+    for (int i0 = 0; i0 < n; chunks++) {
+        int i1 = i0;
+        VkDeviceSize in = 0, out = 0;
+        for (; i1 < n && (i1 == i0 || out + region_out(&rg[i1]) <= CHUNK_OUT); i1++) {
+            bcp[i1 - i0] = (VkBufferCopy){rg[i1].src, in, region_in(&rg[i1], bw, bh)};
+            in += region_in(&rg[i1], bw, bh), out += region_out(&rg[i1]);
+        }
+        if (chunks)   // the previous chunk's dispatches and image copy are done with the scratch
+            mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                        VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        vkCmdCopyBuffer(cb, src, sb, (uint32_t)(i1 - i0), bcp);
+        mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        int slot = -1;   // the timestamps bracket this chunk's dispatches: the first waits for the blocks copy
+        if (timed) {
+            AcquireSRWLockExclusive(&t_lock);
+            slot = time_slot(id, fp, out / 4, 0);
+            if (slot < 0) t_call[id % TA].complete = 0;
+            ReleaseSRWLockExclusive(&t_lock);
+        }
+        if (slot >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)slot);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        G.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.layout, 0, 3, w);
+        VkDeviceSize ib = 0, ob = 0;
+        for (int i = i0; i < i1; i++) {
+            const VkAstcRegion *r = &rg[i];
+            uint32_t bx = (r->w + bw - 1) / bw, by = (r->h + bh - 1) / bh;
+            Push pc = {.in_base = (uint32_t)(ib / 16), .out_base = (uint32_t)(ob / 4), .width = r->w, .height = r->h,
+                       .bw = bw, .bh = bh, .bx = bx, .bslice = bx * by, .srgb = (uint32_t)(srgb != 0)};
+            vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            uint32_t bpw = bw * bh <= 64 ? 64 / (bw * bh) : 1;   // blocks per workgroup, as astc_decode.comp main
+            vkCmdDispatch(cb, (bx + bpw - 1) / bpw, by, r->slices);
+            copies[i - i0] = (VkBufferImageCopy){.bufferOffset = cap_in + ob, .bufferRowLength = r->w,
+                                                 .bufferImageHeight = r->h, .imageSubresource = {aspect, r->level, r->layer, 1},
+                                                 .imageOffset = r->offset, .imageExtent = {r->w, r->h, r->slices}};
+            ib += region_in(r, bw, bh), ob += region_out(r);
+            n_texels += (uint64_t)r->w * r->h * r->slices;
+        }
+        if (slot >= 0)
+            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)slot + 1);
+        mem_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        vkCmdCopyBufferToImage(cb, sb, img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)(i1 - i0), copies);
+        if (readback) {
+            VkBufferCopy rc = {cap_in, rb_off, out};
+            vkCmdCopyBuffer(cb, sb, readback, 1, &rc);
+            rb_off += out;
+        }
+        i0 = i1;
     }
-    n_dispatch += (uint64_t)n;
-    mem_barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-    vkCmdCopyBufferToImage(cb, sb, img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, copies);
-    if (readback) {
-        VkBufferCopy rc = {in_size, 0, out_size};
-        vkCmdCopyBuffer(cb, sb, readback, 1, &rc);
+    if (readback)
         mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
                     VK_ACCESS_2_HOST_READ_BIT);
+    if (whole >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)whole + 1);
+    if (timed) {
+        AcquireSRWLockExclusive(&t_lock);
+        t_call[id % TA].chunks = (uint32_t)chunks;
+        ReleaseSRWLockExclusive(&t_lock);
     }
-    free(copies);
+    if ((n_dispatch + (uint64_t)n) / 1024 != n_dispatch / 1024 || !n_dispatch) {
+        rt_log("vk: ASTC: %llu regions, %.1f M texels decoded on the GPU so far",
+               (unsigned long long)(n_dispatch + (uint64_t)n), (double)n_texels / 1e6);
+        vk_astc_time_summary();
+    }
+    n_dispatch += (uint64_t)n;
+    free(copies), free(bcp);
     vk_defer_buffer(sb, sa);
     return 1;
 }
 
 void vk_astc_release(void) {
     VkCtx *c = vk_ctx();
+    vk_astc_time_summary();
+    AcquireSRWLockExclusive(&t_lock);
+    if (c && t_pool && t_dev == c->device) vkDestroyQueryPool(c->device, t_pool, NULL);
+    t_pool = VK_NULL_HANDLE, t_dev = VK_NULL_HANDLE;
+    ReleaseSRWLockExclusive(&t_lock);
     AcquireSRWLockExclusive(&g_lock);
     if (c && G.dev == c->device) {
         if (G.pipe) vkDestroyPipeline(c->device, G.pipe, NULL);
