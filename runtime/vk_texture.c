@@ -97,6 +97,7 @@ static uint64_t gpu_writes;  // GPU writes into mirrored textures so far: Tex.gp
 static uint32_t tex_gen = 1;
 // Bumped with tex_gen and whenever a slot is registered: what vk_texture_by_id returns for any slot may have changed.
 static uint32_t slots_gen = 1;
+static uint32_t samp_gen = 1;   // bumped whenever a sampler slot is registered: vk_sampler_by_id may answer otherwise
 static uint64_t n_checks;    // draw-binding storage checks (make_fresh_snap) since the last perf line
 
 static void tex_gen_bump(void) {
@@ -840,6 +841,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
+uint32_t vk_sampler_gen(void) { return __atomic_load_n(&samp_gen, __ATOMIC_RELAXED); }
 
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
     lock();
@@ -1316,6 +1318,7 @@ void vk_sampler_register(int id, const samp_par *s) {
     sslots[id].p = *s;
     sslots[id].s = VK_NULL_HANDLE;
     sslots[id].used = 1;
+    samp_gen++;
     unlock();
 }
 

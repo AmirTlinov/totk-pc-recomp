@@ -88,6 +88,11 @@ static struct {
     VkDynamicState dyn[32];
     uint32_t n_dyn;
     PFN_vkCmdPushDescriptorSetKHR push;
+    int tpl;                           // descriptor update templates on (make_tpl)
+    PFN_vkCreateDescriptorUpdateTemplate tpl_create;
+    PFN_vkDestroyDescriptorUpdateTemplate tpl_destroy;
+    PFN_vkUpdateDescriptorSetWithTemplate tpl_update;
+    PFN_vkCmdPushDescriptorSetWithTemplateKHR tpl_push;
     PFN_vkCmdSetVertexInputEXT set_vi;
     PFN_vkCmdSetDepthClampEnableEXT set_clamp;
     PFN_vkCmdSetPolygonModeEXT set_poly;
@@ -110,6 +115,7 @@ typedef struct Layout {
     int push1;                         // set 1 is a push-descriptor set
     uint32_t n0;                       // independent layouts: b[0..n0) are set 0, the rest set 1
     VkPipelineLayout half[2];          // GPL libraries: {set 0, null}, {null, set 1} (made on first use)
+    VkDescriptorUpdateTemplate tpl[2]; // per set (make_tpl); VK_NULL_HANDLE: written with write structs
     VkDescriptorSetLayoutBinding b[];
 } Layout;
 
@@ -242,6 +248,20 @@ static int ensure_init(void) {
     P.f_dual_src = f2.features.dualSrcBlend;
 #define PROC(field, name) (P.field = (void *)vkGetDeviceProcAddr(c->device, name))
     PROC(push, "vkCmdPushDescriptorSetKHR");
+    // Descriptor update templates (core 1.1; the push variant comes with VK_KHR_push_descriptor on 1.1): the driver
+    // walks a layout prepared when the layout is made instead of parsing write structs every draw (DXVK does so for the
+    // same reason). TOTK_DESC_TEMPLATE=0 keeps the write structs.
+    const char *dt = cfg_get("TOTK_DESC_TEMPLATE");
+    if (dt && !strcmp(dt, "0")) {
+        rt_log("vk_pipeline: descriptor update templates off (TOTK_DESC_TEMPLATE=0)");
+    } else if (c->props.apiVersion >= VK_API_VERSION_1_1 && PROC(tpl_create, "vkCreateDescriptorUpdateTemplate") &&
+               PROC(tpl_destroy, "vkDestroyDescriptorUpdateTemplate") && PROC(tpl_update, "vkUpdateDescriptorSetWithTemplate")) {
+        P.tpl = 1;
+        if (!PROC(tpl_push, "vkCmdPushDescriptorSetWithTemplateKHR"))
+            rt_log("vk_pipeline: vkCmdPushDescriptorSetWithTemplateKHR missing: push sets are written with write structs");
+    } else {
+        rt_log("vk_pipeline: descriptor update templates unavailable: sets are written with write structs");
+    }
     // TOTK_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
     // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it (LAS Recomp
     // 61fe44ff, its issues #8 and #357).
@@ -588,6 +608,8 @@ static void vertex_input(const VkPipeState *s, VtxInput *v) {
 int vk_pipeline_vertex_input_dynamic(void) { return ensure_init() && P.dyn_vi; }
 
 PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void) { return ensure_init() ? P.push : NULL; }
+PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_push : NULL; }
+PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void) { return ensure_init() && P.tpl ? P.tpl_update : NULL; }
 
 int vk_pipeline_set_indep(int on) {
     if (!ensure_init()) return 0;
@@ -954,6 +976,37 @@ static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off,
     return m < 0;
 }
 
+// The update template of a set whose bindings are b[0..n): one entry per binding, in order, over the packed array the
+// replay fills from the set's first descriptor, a VkDescSlot per descriptor. The bind point follows the stages (compute
+// layouts hold the compute stage only). VK_NULL_HANDLE when templates are off, for an empty set, for a push set
+// without vkCmdPushDescriptorSetWithTemplateKHR or when creation fails: the replay then writes the set with write
+// structs.
+static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b, uint32_t n, VkDescriptorSetLayout sl,
+                                           int push, VkPipelineLayout pl, uint32_t set) {
+    if (!P.tpl || !n || (push && !P.tpl_push)) return VK_NULL_HANDLE;
+    VkDescriptorUpdateTemplateEntry e[MAX_BINDINGS];
+    size_t off = 0;
+    VkShaderStageFlags stages = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        e[i] = (VkDescriptorUpdateTemplateEntry){b[i].binding, 0, b[i].descriptorCount, b[i].descriptorType, off, sizeof(VkDescSlot)};
+        off += sizeof(VkDescSlot) * b[i].descriptorCount;
+        stages |= b[i].stageFlags;
+    }
+    VkDescriptorUpdateTemplateCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO, .descriptorUpdateEntryCount = n,
+        .pDescriptorUpdateEntries = e,
+        .templateType = push ? VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR : VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+        .descriptorSetLayout = sl,
+        .pipelineBindPoint = stages & VK_SHADER_STAGE_COMPUTE_BIT ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .pipelineLayout = pl, .set = set};
+    VkDescriptorUpdateTemplate t;
+    if (P.tpl_create(P.device, &ci, NULL, &t) != VK_SUCCESS) {
+        LOG_ONCE("vk_pipeline: descriptor update template creation failed: that set is written with write structs");
+        return VK_NULL_HANDLE;
+    }
+    return t;
+}
+
 // Finds or creates the layout of a binding list (sorted here); NULL on failure. Caller holds P.lock.
 // Sorts a binding list by binding and hashes it into *h; the descriptor total, or -1 when a binding repeats.
 static int64_t bindings_sort(Bindings *B, uint64_t *h) {
@@ -998,6 +1051,7 @@ static Layout *layout_get(Bindings *B) {
         free(l);
         return NULL;
     }
+    l->tpl[0] = make_tpl(l->b, l->n, l->set, l->push, l->layout, 0);
     l->next = *head;
     *head = l;
     P.stats.layouts++;
@@ -1055,6 +1109,8 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
         free(l);
         return NULL;
     }
+    l->tpl[0] = make_tpl(l->b, n0, l->set, l->push, l->layout, 0);
+    l->tpl[1] = make_tpl(l->b + n0, n - n0, l->set1, l->push1, l->layout, 1);
     l->next = *head;
     *head = l;
     P.stats.layouts++;
@@ -1127,6 +1183,7 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
     p->info.set_layout1 = l ? l->set1 : VK_NULL_HANDLE;
     p->info.push1 = l ? l->push1 : 0;
     p->info.n_sets = l && l->set1 ? 2 : 1;
+    if (l) p->info.tpl[0] = l->tpl[0], p->info.tpl[1] = l->tpl[1];
     p->lay = l;
     Pipe **head = &pipes[h % PIPE_BUCKETS];
     p->next = *head;
@@ -2823,6 +2880,8 @@ void vk_pipeline_shutdown(void) {
     for (int i = 0; i < LAYOUT_BUCKETS; i++) {
         for (Layout *l = layouts[i], *n; l; l = n) {
             n = l->next;
+            for (int k = 0; k < 2; k++)
+                if (l->tpl[k]) P.tpl_destroy(P.device, l->tpl[k], NULL);
             vkDestroyPipelineLayout(P.device, l->layout, NULL);
             for (int h = 0; h < 2; h++)
                 if (l->half[h]) vkDestroyPipelineLayout(P.device, l->half[h], NULL);

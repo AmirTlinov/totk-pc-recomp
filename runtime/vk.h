@@ -170,6 +170,9 @@ void vk_mem_census(uint64_t frame);               // at each present: pool censu
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
+// mapped, a mirror created, refused or forgotten, a submission started.
+uint64_t vk_mem_gen(void);
 // Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
 // range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
 // *now is the generation to pass next time.
@@ -234,6 +237,7 @@ void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 VkSampler vk_sampler_by_id_locked(int id);
 uint32_t vk_texture_slots_gen(void);
+uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
 void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
@@ -343,7 +347,13 @@ typedef struct {
     VkDescriptorSetLayout set_layout1;
     int push1;
     uint32_t n_sets;
+    // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
+    // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
+    VkDescriptorUpdateTemplate tpl[2];
 } VkPipeInfo;
+// One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
+// bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
+typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBufferView view; uint64_t w[3]; } VkDescSlot;
 // Both return the cached pipeline (created on first use; failures are cached and logged once). info: may be NULL.
 // Valid until vk_pipeline_shutdown; thread-safe.
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
@@ -377,6 +387,10 @@ VkPrimitiveTopology vk_pipeline_topology(int nvn_prim);   // quads -> triangle l
                                                           // rewrites those draws; polygon -> fan
 VkFormat vk_vertex_format(int nvn_format, int *type);     // attribute format (supported fallback), GFX_TYPE_* in *type
 PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void);  // after the first vk_pipeline_* call
+// Descriptor update templates (after the first vk_pipeline_* call): NULL when templates are off (TOTK_DESC_TEMPLATE=0,
+// a device below Vulkan 1.1) or, for the push variant, vkCmdPushDescriptorSetWithTemplateKHR is missing.
+PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void);
+PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void);
 // Probe only: 1 selects stage-independent layouts for pipelines looked up from now on, 0 the shared set 0; returns
 // the previous mode. 1 needs vk_caps.gpl (the independent-sets flag comes with the extension).
 int vk_pipeline_set_indep(int on);
