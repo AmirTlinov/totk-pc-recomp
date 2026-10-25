@@ -17,3 +17,4 @@ WEAK const GfxBackend gfx_null_backend = {.name = "unimplemented"};
 #define STUB_PROBE(fn, name) WEAK int fn(void) { printf(name ": not built yet\n"); return 2; }
 STUB_PROBE(probe_nvn_tex, "probe-nvn-tex")
 STUB_PROBE(probe_vkmem, "probe-vkmem")
+STUB_PROBE(probe_astc, "probe-astc")

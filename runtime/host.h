@@ -235,7 +235,7 @@ int probe_vkdevice(void);                                 // M4 T2: vk_device.c
 int probe_nvn(void), probe_nvn_tex(void);                  // M4 T3: nvn_probe.c
 int probe_window(void);                                    // M4 T2
 int probe_shader(void);                                    // M4 T4
-int probe_vkmem(void), probe_vkexec(void);                 // M4 T5, T6
+int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // M4 T5, T6
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 // gfx_stubs.c defines each of these weakly: prints "probe-x: not built yet", returns 2.

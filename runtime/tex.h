@@ -49,7 +49,8 @@ typedef struct TexVkFormat {
     VkFormatFeatureFlags need;    // optimal-tiling features vk must report for sampling and upload
     uint8_t expand_rgb;           // 3-component format: the upload expands each texel to 4 components (alpha / integer 1)
     uint8_t alpha_one;            // "X" format: sample alpha as 1 (view swizzle)
-    uint8_t astc_bw, astc_bh;     // nonzero: ASTC, decoded on the CPU by astc_decode_ldr into vk (RGBA8, same colour space)
+    uint8_t astc_bw, astc_bh;     // nonzero: ASTC decoded into vk (RGBA8, same colour space) by vk_astc.c or tex_astc.c;
+                                  // zero for native ASTC (vk == ideal, raw blocks as for BC)
     uint8_t astc_srgb;
     uint8_t depth, stencil;       // aspect flags of depth / stencil formats
     const char *note;             // why a fallback or an expansion was chosen; NULL when the mapping is direct
@@ -57,8 +58,8 @@ typedef struct TexVkFormat {
 } TexVkFormat;
 
 // 1 when nvn_format (an NVNformat value) has a Vulkan mapping, 0 otherwise (out->reason says why). The mapping is
-// fixed: ASTC always goes through the CPU decoder, D24S8 is D32S8, DEPTH24 is D32. Whether the GPU reports the
-// features is a separate question (tex_vk_format_supported).
+// fixed per device: ASTC decodes to RGBA8 unless vk_astc_native (TOTK_ASTC) takes the format as it is, D24S8 is
+// D32S8, DEPTH24 is D32. Whether the GPU reports the features is a separate question (tex_vk_format_supported).
 int tex_vk_format(int nvn_format, TexVkFormat *out);
 // 1 when vk_ctx()->phys reports every bit of f->need for f->vk in optimal tiling. Needs vk_init().
 int tex_vk_format_supported(const TexVkFormat *f);
