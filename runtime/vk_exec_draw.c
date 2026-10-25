@@ -16,6 +16,7 @@
 // sampler descriptor lookups and the dispatch flow follow LAS Recomp runtime/nvn/vulkan/exec.c:1851-1908, 2300-2516
 // @ da35b83a (MIT, Copyright (c) 2026 Peiikai). The support buffer layout is Ryujinx's SupportBuffer.cs (MIT).
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,12 +117,18 @@ static struct {
     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
     VkDescriptorSetLayout ds_last_layout[2];
+    int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
 } B;
 
 // Contents of B.ds_last: the writes' bindings, types, counts and descriptor infos. A draw whose allocated set would
-// hold the same reuses the set instead of allocating and writing one (Task 2.2's per-draw cost).
+// hold the same reuses the set instead of allocating and writing one (Task 2.2's per-draw cost). psig: the same for
+// the last push per set number; a push equal to it under the same layout is not recorded again (the descriptors stay
+// bound across pipeline binds of that layout).
 #define DS_SIG_BYTES (MAX_DESC * 24 + MAX_BINDINGS * 12)
-static struct { uint32_t n[2]; uint8_t sig[2][DS_SIG_BYTES], tmp[DS_SIG_BYTES]; } DS;
+static struct { uint32_t n[2], pn[2]; uint8_t sig[2][DS_SIG_BYTES], psig[2][DS_SIG_BYTES], tmp[DS_SIG_BYTES]; } DS;
+
+// TOTK_BIND_STATS counters (bind_stats).
+static struct { int on; uint64_t draws, bind[2], desc[2], push, push_skip, set_new, set_reuse, ac_miss, same_prog, same_all; } BS = {-1};
 
 static uint32_t c0_dim[3], c0_binst;     // the dispatch size and base instance of the draw or dispatch being bound
 
@@ -497,9 +504,10 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
     return 0;
 }
 
-// Texture and image types of a stage's first 32 slots, kept while its handles and every slot's resolution
-// (vk_texture_slots_gen) stay the same: consecutive draws mostly bind the same slots, and each lookup is a hash probe.
+// Texture and image types of a stage's first 32 slots, kept while every slot's resolution (vk_texture_slots_gen)
+// stays the same: only slots whose handle changed are looked up again, each lookup being a hash probe.
 static struct { int valid; uint32_t gen; uint64_t tex[32], img[32]; uint8_t tt[32], it[32]; } AC[6];
+static int shader_memo_on(void);
 
 static void answers_for(VkExec *ex, int st, const uint8_t *ctl, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
@@ -514,21 +522,39 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, GfxShaderAnswers
     typeof(AC[0]) *c = &AC[st];
     vk_texture_lock();
     uint32_t gen = vk_texture_slots_gen();   // before the lookups: one that creates an entry bumps it
-    if (!c->valid || c->gen != gen || memcmp(c->tex, ex->tex[st], sizeof c->tex) || memcmp(c->img, ex->img[st], sizeof c->img)) {
+    int all = !c->valid || c->gen != gen;
+    if (all || memcmp(c->tex, ex->tex[st], sizeof c->tex) || memcmp(c->img, ex->img[st], sizeof c->img)) {
         for (int slot = 0; slot < 32; slot++) {
             view_t v;
             int hv;
             uint64_t h = ex->tex[st][slot];
-            const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-            c->tt[slot] = img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+            if (all || h != c->tex[slot]) {
+                const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
+                c->tt[slot] = img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+            }
             h = ex->img[st][slot];
-            img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-            c->it[slot] = img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+            if (all || h != c->img[slot]) {
+                const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
+                c->it[slot] = img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+            }
         }
         memcpy(c->tex, ex->tex[st], sizeof c->tex);
         memcpy(c->img, ex->img[st], sizeof c->img);
         c->gen = gen, c->valid = 1;
+        BS.ac_miss++;
     }
+    if (shader_memo_on() == 2)   // check mode: every slot looked up again
+        for (int slot = 0; slot < 32; slot++) {
+            view_t v;
+            int hv;
+            uint64_t h = ex->tex[st][slot], hi = ex->img[st][slot];
+            const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
+            int tt = img ? gfx_type_of(img, &v, hv) : 0;
+            img = hi ? vk_texture_by_id_locked((int)(hi & 0xfffff), &v, &hv) : NULL;
+            int it = img ? gfx_type_of(img, &v, hv) : 0;
+            if (tt != c->tt[slot] || it != c->it[slot])
+                rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
+        }
     vk_texture_unlock();
     memcpy(a->tex_type, c->tt, sizeof c->tt);
     memcpy(a->img_type, c->it, sizeof c->it);
@@ -898,30 +924,101 @@ static void support_fill(uint8_t *b, float w, float h, float point_size) {
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
 }
 
-// TOTK_BIND_STATS=1: bindings and descriptors per draw of each stage, logged every 20000 draws (Task 2.2's choice of
-// the pushed stage).
-static struct { int on; uint64_t draws, bind[2], desc[2]; } BS = {-1};
-
-static void bind_stats(const VkPipeInfo *info) {
+// TOTK_BIND_STATS=1: bindings and descriptors per draw of each stage (Task 2.2's choice of the pushed stage), and how
+// often a draw repeats the previous one, logged every 20000 draws: pushes recorded and skipped, allocated sets written
+// and reused, stage texture-type recomputations (answers_for), draws with the previous draw's program, bound state
+// and textures (shaders and pipeline would be the same) and those that also have its buffers and viewport (all
+// descriptors would be the same). BS is declared beside DS.
+static int bind_stats_on(void) {
     if (BS.on < 0) {
         const char *e = cfg_get("TOTK_BIND_STATS");
         BS.on = e && *e && strcmp(e, "0");
     }
-    if (!BS.on || info->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
+    return BS.on;
+}
+
+static void bind_stats(const VkPipeInfo *info) {
+    if (!bind_stats_on() || info->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
         int fs = info->n_sets > 1 ? b->set : !(b->stages & VK_SHADER_STAGE_VERTEX_BIT);
         BS.bind[fs]++, BS.desc[fs] += b->count ? b->count : 1;
     }
-    if (++BS.draws % 20000 == 0)
+    if (++BS.draws % 20000 == 0) {
+        double d = (double)BS.draws;
         rt_log("vk_exec: per draw over %llu draws: vertex %.2f bindings %.2f descriptors, fragment %.2f bindings %.2f descriptors",
-               (unsigned long long)BS.draws, (double)BS.bind[0] / BS.draws, (double)BS.desc[0] / BS.draws,
-               (double)BS.bind[1] / BS.draws, (double)BS.desc[1] / BS.draws);
+               (unsigned long long)BS.draws, BS.bind[0] / d, BS.desc[0] / d, BS.bind[1] / d, BS.desc[1] / d);
+        rt_log("vk_exec: per draw: pushes %.3f skipped %.3f, sets written %.3f reused %.3f, texture types %.3f; "
+               "same program and state as the draw before %.3f, also same buffers %.3f",
+               BS.push / d, BS.push_skip / d, BS.set_new / d, BS.set_reuse / d, BS.ac_miss / d, BS.same_prog / d,
+               BS.same_all / d);
+    }
+}
+
+// The bound state a draw reads, compared with the previous draw's (TOTK_BIND_STATS only).
+static void repeat_stats(const VkExec *ex, const VkPipeInfo *info) {
+    static struct {
+        const prog_t *prog;
+        VkPipeState pipe;
+        uint64_t tex[2][128], img[2][32];
+        const VkPipeInfo *info;
+        p_bind_buf ubo[2][18], ssbo[2][16];
+        float vp[6], point_size;
+    } last, cur;
+    if (!bind_stats_on()) return;
+    memset(&cur, 0, sizeof cur);
+    cur.prog = ex->prog, cur.pipe = ex->pipe, cur.info = info;
+    const int st[2] = {NVN_STAGE_VS, NVN_STAGE_FS};
+    for (int k = 0; k < 2; k++) {
+        memcpy(cur.tex[k], ex->tex[st[k]], sizeof cur.tex[k]), memcpy(cur.img[k], ex->img[st[k]], sizeof cur.img[k]);
+        memcpy(cur.ubo[k], ex->ubo[st[k]], sizeof cur.ubo[k]), memcpy(cur.ssbo[k], ex->ssbo[st[k]], sizeof cur.ssbo[k]);
+    }
+    memcpy(cur.vp, ex->vp[0], sizeof cur.vp), cur.point_size = ex->point_size;
+    size_t prog_part = offsetof(typeof(cur), info);
+    if (!memcmp(&cur, &last, prog_part)) {
+        BS.same_prog++;
+        if (!memcmp((const char *)&cur + prog_part, (const char *)&last + prog_part, sizeof cur - prog_part)) BS.same_all++;
+    }
+    last = cur;
+}
+
+// The signature of a set's writes into out (DS layout): bindings, types, counts and descriptor infos. Returns its size.
+static uint32_t ds_sig(const VkWriteDescriptorSet *w, uint32_t nw, uint8_t *out) {
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < nw; k++) {
+        const VkWriteDescriptorSet *x = &w[k];
+        uint32_t hdr[3] = {x->dstBinding, (uint32_t)x->descriptorType, x->descriptorCount};
+        memcpy(out + n, hdr, sizeof hdr), n += sizeof hdr;
+        if (x->pImageInfo) {   // field by field: the struct's tail padding is not written
+            for (uint32_t d = 0; d < x->descriptorCount; d++) {
+                const VkDescriptorImageInfo *ii1 = &x->pImageInfo[d];
+                memcpy(out + n, &ii1->sampler, 8), memcpy(out + n + 8, &ii1->imageView, 8);
+                memcpy(out + n + 16, &ii1->imageLayout, 4), n += 20;
+            }
+        } else if (x->pBufferInfo) {
+            memcpy(out + n, x->pBufferInfo, sizeof *x->pBufferInfo * x->descriptorCount);
+            n += (uint32_t)(sizeof *x->pBufferInfo * x->descriptorCount);
+        } else {
+            memcpy(out + n, x->pTexelBufferView, sizeof *x->pTexelBufferView * x->descriptorCount);
+            n += (uint32_t)(sizeof *x->pTexelBufferView * x->descriptorCount);
+        }
+    }
+    return n;
+}
+
+static int push_skip_on(void) {   // TOTK_PUSH_SKIP=0: every graphics draw pushes its set again
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_PUSH_SKIP");
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
 }
 
 // Writes the pipeline's sets from the bound state: set 0, and set 1 with independent layouts. Each is pushed into the
 // command buffer, or allocated, written and bound; a graphics set whose contents equal the last one allocated for that
-// set number in this command buffer is reused, and bound again only when another layout or a push came between.
+// set number in this command buffer is reused, and bound again only when another layout or a push came between. A
+// graphics push equal to the last one at its set number, with no other layout or bind between, is not recorded.
 static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     static VkWriteDescriptorSet w[MAX_BINDINGS];
     static VkDescriptorBufferInfo bi[MAX_DESC];
@@ -995,6 +1092,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     if (gfx && info->layout != B.ds_layout) {   // another layout: sets bound before may be disturbed
         B.ds_layout = info->layout;
         B.ds_bound[0] = B.ds_bound[1] = VK_NULL_HANDLE;
+        B.ds_pushed[0] = B.ds_pushed[1] = 0;
         set1_first = n_sets == 2 && vk_ctx()->validation;
     }
     uint32_t lo[2] = {0, 0}, hi[2] = {0, 0};
@@ -1009,13 +1107,22 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             if (set1_first) {              // bound only to drop the layer's push set (comment above)
                 VkDescriptorSet set = alloc_set(ex, info->set_layout1);
                 vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, 1, 1, &set, 0, NULL);
-                B.ds_bound[1] = set;
+                B.ds_bound[1] = set, B.ds_pushed[1] = 0;
             }
             continue;
         }
         if (s ? info->push1 : info->push) {
+            uint32_t n = gfx && push_skip_on() ? ds_sig(w + i0, i1 - i0, DS.tmp) : 0;
+            if (n && B.ds_pushed[s] && DS.pn[s] == n && !memcmp(DS.psig[s], DS.tmp, n)) {
+                BS.push_skip++;
+                continue;
+            }
             vk_pipeline_push_fn()(ex->cb, info->bind_point, info->layout, s, i1 - i0, w + i0);
-            if (gfx) B.ds_bound[s] = VK_NULL_HANDLE;
+            BS.push++;
+            if (gfx) {
+                B.ds_bound[s] = VK_NULL_HANDLE, B.ds_pushed[s] = n != 0;
+                if (n) DS.pn[s] = n, memcpy(DS.psig[s], DS.tmp, n);
+            }
         } else if (!gfx || s > 1) {
             VkDescriptorSet set = alloc_set(ex, s ? info->set_layout1 : info->set_layout);
             for (uint32_t k = i0; k < i1; k++) w[k].dstSet = set;
@@ -1023,25 +1130,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, s, 1, &set, 0, NULL);
         } else {
             VkDescriptorSetLayout sl = s ? info->set_layout1 : info->set_layout;
-            uint32_t n = 0;
-            for (uint32_t k = i0; k < i1; k++) {
-                const VkWriteDescriptorSet *x = &w[k];
-                uint32_t hdr[3] = {x->dstBinding, (uint32_t)x->descriptorType, x->descriptorCount};
-                memcpy(DS.tmp + n, hdr, sizeof hdr), n += sizeof hdr;
-                if (x->pImageInfo) {   // field by field: the struct's tail padding is not written
-                    for (uint32_t d = 0; d < x->descriptorCount; d++) {
-                        const VkDescriptorImageInfo *ii1 = &x->pImageInfo[d];
-                        memcpy(DS.tmp + n, &ii1->sampler, 8), memcpy(DS.tmp + n + 8, &ii1->imageView, 8);
-                        memcpy(DS.tmp + n + 16, &ii1->imageLayout, 4), n += 20;
-                    }
-                } else if (x->pBufferInfo) {
-                    memcpy(DS.tmp + n, x->pBufferInfo, sizeof *x->pBufferInfo * x->descriptorCount);
-                    n += (uint32_t)(sizeof *x->pBufferInfo * x->descriptorCount);
-                } else {
-                    memcpy(DS.tmp + n, x->pTexelBufferView, sizeof *x->pTexelBufferView * x->descriptorCount);
-                    n += (uint32_t)(sizeof *x->pTexelBufferView * x->descriptorCount);
-                }
-            }
+            uint32_t n = ds_sig(w + i0, i1 - i0, DS.tmp);
             VkDescriptorSet set = B.ds_last[s];
             if (!set || B.ds_last_layout[s] != sl || DS.n[s] != n || memcmp(DS.sig[s], DS.tmp, n)) {
                 set = alloc_set(ex, sl);
@@ -1049,10 +1138,13 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 if (i1 > i0) vkUpdateDescriptorSets(vk_ctx()->device, i1 - i0, w + i0, 0, NULL);
                 B.ds_last[s] = set, B.ds_last_layout[s] = sl, DS.n[s] = n;
                 memcpy(DS.sig[s], DS.tmp, n);
+                BS.set_new++;
+            } else {
+                BS.set_reuse++;
             }
             if (B.ds_bound[s] != set) {
                 vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, s, 1, &set, 0, NULL);
-                B.ds_bound[s] = set;
+                B.ds_bound[s] = set, B.ds_pushed[s] = 0;
             }
         }
     }
@@ -1136,6 +1228,43 @@ static void bind_vertex_buffers(VkExec *ex) {
     B.vb_valid = 1;
 }
 
+// The previous draw's shaders, kept while its program, bound pipeline state, the vertex and fragment stages' first 32
+// texture and image handles and every slot's resolution (vk_texture_slots_gen, read unlocked: a registration racing
+// with it is ordered after this draw, as answers_for's own check would order it) stay the same: answers_for reads
+// nothing else, so shader_for would return the same shaders. About 65% of field draws repeat them
+// (TOTK_BIND_STATS). TOTK_SHADER_MEMO=0 turns it off; =check looks the shaders up on every hit too, and every slot's
+// texture type in answers_for, and stops on a difference.
+typedef struct {
+    const prog_t *prog;
+    uint64_t serial;
+    uint32_t gen;
+    uint64_t tex[2][32], img[2][32];
+    VkPipeState pipe;
+} MemoKey;
+static struct { int on, valid, has_fs; MemoKey k; const GfxShader *vs, *fs; } SM = {-1};
+
+static void memo_key(const VkExec *ex, uint32_t gen, MemoKey *k) {
+    k->prog = ex->prog, k->serial = ex->prog->serial, k->gen = gen;
+    memcpy(k->tex[0], ex->tex[NVN_STAGE_VS], sizeof k->tex[0]), memcpy(k->tex[1], ex->tex[NVN_STAGE_FS], sizeof k->tex[1]);
+    memcpy(k->img[0], ex->img[NVN_STAGE_VS], sizeof k->img[0]), memcpy(k->img[1], ex->img[NVN_STAGE_FS], sizeof k->img[1]);
+    memcpy(&k->pipe, &ex->pipe, sizeof k->pipe);
+}
+
+static int memo_match(const VkExec *ex, uint32_t gen, const MemoKey *k) {
+    return k->prog == ex->prog && k->serial == ex->prog->serial && k->gen == gen &&
+           !memcmp(k->tex[0], ex->tex[NVN_STAGE_VS], sizeof k->tex[0]) && !memcmp(k->tex[1], ex->tex[NVN_STAGE_FS], sizeof k->tex[1]) &&
+           !memcmp(k->img[0], ex->img[NVN_STAGE_VS], sizeof k->img[0]) && !memcmp(k->img[1], ex->img[NVN_STAGE_FS], sizeof k->img[1]) &&
+           !memcmp(&k->pipe, &ex->pipe, sizeof k->pipe);
+}
+
+static int shader_memo_on(void) {
+    if (SM.on < 0) {
+        const char *e = cfg_get("TOTK_SHADER_MEMO");
+        SM.on = e && !strcmp(e, "check") ? 2 : !(e && !strcmp(e, "0"));
+    }
+    return SM.on;
+}
+
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
@@ -1146,9 +1275,24 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     VkRect2D sc = vk_exec_scissor(ex);
     if (!sc.extent.width || !sc.extent.height) return 0;
     if (!ex->prog) return warn_once(W_PROGRAM, "a draw without a bound program is skipped"), 0;
-    int has_vs, has_fs, vs_wait, fs_wait;
-    const GfxShader *vs = shader_for(ex, NVN_STAGE_VS, &has_vs, &vs_wait, 0);
-    const GfxShader *fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
+    int has_vs, has_fs, vs_wait = 0, fs_wait = 0, memo = shader_memo_on();
+    const GfxShader *vs, *fs;
+    uint32_t gen = memo ? vk_texture_slots_gen() : 0;   // before shader_for, whose lookups may bump it
+    if (memo && SM.valid && memo_match(ex, gen, &SM.k)) {
+        vs = SM.vs, fs = SM.fs, has_vs = 1, has_fs = SM.has_fs;
+        if (memo == 2) {
+            int hv, hf, wv, wf;
+            const GfxShader *v2 = shader_for(ex, NVN_STAGE_VS, &hv, &wv, 0), *f2 = shader_for(ex, NVN_STAGE_FS, &hf, &wf, 0);
+            if (v2 != vs || f2 != fs || hf != has_fs || wv || wf)
+                rt_fatal("vk_exec: shader memo of program %llu differs from the lookup", (unsigned long long)ex->prog->serial);
+        }
+    } else {
+        SM.valid = 0;
+        vs = shader_for(ex, NVN_STAGE_VS, &has_vs, &vs_wait, 0);
+        fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
+        if (memo && vs && !vs_wait && !fs_wait && (!has_fs || fs))
+            memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.has_fs = has_fs, SM.valid = 1;
+    }
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
@@ -1204,6 +1348,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         B.st = s, B.st_valid = 1;
     }
     record_fixed(ex);
+    repeat_stats(ex, info);
     bind_resources(ex, info);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s);
