@@ -2,9 +2,11 @@
 // A host thread wakes every 1 ms and, for every other thread, suspends it, reads Rip and resumes it. The sampler never
 // allocates or takes a lock between SuspendThread and ResumeThread and never runs guest code. The profile is text:
 //   totk-prof 1 / base <hex> / period_us / samples N / thread <tid> <samples> <in-exe samples> / module <base> <size> <path> /
-//   rip <hex> <count> (the top PROF_TOP Rips) / stack <count> <rip> <caller> ... (TOTK_PROFILE_RENDER only, the top
-//   PROF_STACKS call chains)
-// With TOTK_PROFILE_RENDER the sampler also copies up to STK_COPY bytes of the suspended thread's stack and, after
+//   rip <hex> <count> (the top PROF_TOP Rips) / stack <count> <rip> <caller> ... (TOTK_PROFILE_RENDER or
+//   TOTK_PROFILE_CHAINS only, the top PROF_STACKS call chains)
+// With TOTK_PROFILE_RENDER (the render thread) or TOTK_PROFILE_CHAINS=1 (every thread, chains of all threads summed: for
+// short frame ranges, as each sample copies a stack) the sampler also copies up to STK_COPY bytes of the suspended
+// thread's stack and, after
 // ResumeThread, unwinds the copy with the .pdata tables (RtlVirtualUnwind), so it takes no lock while the thread is
 // suspended. The unwind stops at the first frame outside the copy; deeper callers are cut.
 #include <windows.h>
@@ -45,6 +47,7 @@ static volatile LONG stop, written;
 static uintptr_t exe_lo, exe_hi;
 static volatile DWORD render_tid;   // the thread that presents (perf_present)
 static int only_render;             // TOTK_PROFILE_RENDER=1: sample the render thread only
+static int chains;                  // call chains are kept: TOTK_PROFILE_RENDER or TOTK_PROFILE_CHAINS
 static volatile uint64_t cur_frame; // last presented frame
 static uint64_t frame_lo, frame_hi; // TOTK_PROFILE_FRAMES=<lo>-<hi>: sample only while presents lo..hi-1 are pending
 
@@ -151,12 +154,12 @@ static DWORD WINAPI sampler_main(void *arg) {
         for (int i = 0; i < n_threads; i++) {
             ThreadSlot *t = &threads[i];
             if (only_render && t->tid != render_tid) continue;
-            ctx.ContextFlags = only_render ? CONTEXT_CONTROL | CONTEXT_INTEGER : CONTEXT_CONTROL;
+            ctx.ContextFlags = chains ? CONTEXT_CONTROL | CONTEXT_INTEGER : CONTEXT_CONTROL;
             if (SuspendThread(t->h) == (DWORD)-1) continue;
             BOOL ok = GetThreadContext(t->h, &ctx);
             size_t n = 0;
             MEMORY_BASIC_INFORMATION mb;
-            if (ok && only_render && VirtualQuery((void *)ctx.Rsp, &mb, sizeof mb) && mb.State == MEM_COMMIT) {
+            if (ok && chains && VirtualQuery((void *)ctx.Rsp, &mb, sizeof mb) && mb.State == MEM_COMMIT) {
                 n = (uintptr_t)mb.BaseAddress + mb.RegionSize - ctx.Rsp;   // the committed stack above Rsp
                 if (n > STK_COPY) n = STK_COPY;
                 memcpy(stk_buf, (void *)ctx.Rsp, n);
@@ -242,6 +245,8 @@ void prof_start(void) {
         return;
     }
     only_render = cfg_get("TOTK_PROFILE_RENDER") != NULL;
+    const char *ch = cfg_get("TOTK_PROFILE_CHAINS");
+    chains = only_render || (ch && *ch && strcmp(ch, "0"));
     const char *fr = cfg_get("TOTK_PROFILE_FRAMES");
     if (fr && sscanf(fr, "%llu-%llu", (unsigned long long *)&frame_lo, (unsigned long long *)&frame_hi) != 2) frame_hi = 0;
     MODULEINFO mi;
