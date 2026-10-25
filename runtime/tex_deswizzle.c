@@ -80,6 +80,38 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     return 0;
 }
 
+int nvn_texels_box(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x, uint32_t y, uint32_t z, uint32_t wb,
+                   uint32_t h, void *storage, void *rows, size_t pitch, int to_linear) {
+    uint8_t *st = storage, *ln = rows;
+    if (nvn_tex_is_linear(d)) {
+        if (level || layer || z || d->samples > 1 || (d->target != 0 && d->target != 1 && d->target != 7)) return -1;
+        int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+        if (!bpb) return -1;
+        size_t row = (size_t)((d->width + bw - 1) / bw) * bpb;
+        uint32_t nrows = d->target == 0 ? 1 : (d->height + bh - 1) / bh, stride = nvn_tex_linear_stride(d);
+        if (stride < row || x + (size_t)wb > row || y + (uint64_t)h > nrows) return -1;
+        for (uint32_t r = 0; r < h; r++) {
+            uint8_t *p = st + (size_t)(y + r) * stride + x, *q = ln + r * pitch;
+            if (to_linear) memcpy(q, p, wb); else memcpy(p, q, wb);
+        }
+        return 0;
+    }
+    uint32_t row_bytes, nrows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &nrows, &slices, &base, &th, &td, &bpb)) return -1;
+    if (x + (uint64_t)wb > row_bytes || y + (uint64_t)h > nrows || z >= slices) return -1;
+    for (uint32_t r = 0; r < h; r++) {
+        uint8_t *q = ln + r * pitch;
+        for (uint32_t i = 0; i < wb;) {
+            uint32_t xb = x + i, n = 16 - xb % 16;   // contiguous up to the end of its 16-byte segment
+            if (n > wb - i) n = wb - i;
+            uint8_t *p = st + base + nvn_bl_offset(xb, y + r, z, row_bytes, nrows, th, td);
+            if (to_linear) memcpy(q + i, p, n); else memcpy(p, q + i, n);
+            i += n;
+        }
+    }
+    return 0;
+}
+
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
     return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1);
 }
