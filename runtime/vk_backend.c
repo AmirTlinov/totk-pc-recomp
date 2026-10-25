@@ -150,9 +150,10 @@ typedef struct {
 } ReplayItem;
 #define RQ_CAP 64
 enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
-       DR_GUEST_READ, DR_FRAME, DR_FULL, DR_N };
+       DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
 static const char *const dr_name[DR_N] = {"pool_fini", "map_virtual", "texture_release", "program_release", "finish",
-                                          "read_texels", "write_texels", "guest_read", "frame bound", "queue full"};
+                                          "read_texels (writer fence)", "write_texels", "guest_read", "frame bound", "queue full",
+                                          "check drain"};
 
 static SRWLOCK rl = SRWLOCK_INIT;
 static CONDITION_VARIABLE rcv = CONDITION_VARIABLE_INIT;   // item queued, item taken, item done
@@ -161,6 +162,9 @@ static int rq_head, rq_n, r_busy, r_started;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
 // Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
 static uint64_t dr_calls[DR_N], dr_waits[DR_N], dr_ns[DR_N], dr_tcalls[DR_N], dr_twaits[DR_N], dr_tns[DR_N];
+// TOTK_REPLAY_CHECK: ReadTexels compared with a read after a full drain (under rl): checked, differing, differing
+// although no submission recorded a write to the texture in between, differing with the queue idle at the first read.
+static uint64_t ck_reads, ck_diff, ck_diff_unexplained, ck_diff_idle;
 
 int vk_replay_async(void) {
     static int on = -1;
@@ -276,6 +280,10 @@ static void replay_log(uint64_t frame, int total) {
         if (c[i] || w[i])
             k += snprintf(buf + k, sizeof buf - (size_t)k, "%s %s %llu calls, %llu waited %.1f ms", k ? ";" : "", dr_name[i],
                           (unsigned long long)c[i], (unsigned long long)w[i], t[i] / 1e6);
+    if (ck_reads && k < (int)sizeof buf - 128)
+        k += snprintf(buf + k, sizeof buf - (size_t)k, "; check (run): %llu reads, %llu differ, %llu without a recorded write, %llu with the queue idle",
+                      (unsigned long long)ck_reads, (unsigned long long)ck_diff, (unsigned long long)ck_diff_unexplained,
+                      (unsigned long long)ck_diff_idle);
     memset(dr_calls, 0, sizeof dr_calls);
     memset(dr_waits, 0, sizeof dr_waits);
     memset(dr_ns, 0, sizeof dr_ns);
@@ -354,11 +362,71 @@ static uint64_t vk_be_submit(const uint64_t *handles, int n) {
     return replay_enqueue(&it);
 }
 static void vk_be_finish(void) { vk_sync_start(); replay_drain(DR_FINISH); vk_present_drain(); vk_sync_finish(); }
+static int replay_check(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_REPLAY_CHECK");
+        on = e && strcmp(e, "0");
+        if (on) rt_log("vk: TOTK_REPLAY_CHECK: every ReadTexels is read again after a full replay drain and compared");
+    }
+    return on;
+}
+
+// ReadTexels with the replay queued: waits for the newest submission recorded to write the texture (replayed and
+// completed), not for the whole queue. The readback copy goes through the upload batch on the same queue, after every
+// submission the replay has submitted. Submissions still queued or being recorded run after the copy, as on hardware
+// when the GPU has not reached them yet: the game only sees their texels after waiting on a sync, and every sync
+// value covers replay and GPU, so a read the game synchronised sees them. TOTK_REPLAY_CHECK compares with a full drain.
 static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                               uint64_t img) {
     vk_sync_start();
-    replay_drain(DR_READ_TEXELS);
+    if (!gfx_replay_async()) {
+        vk_read_texels(t, v, r, dst, row, img);
+        return;
+    }
+    uint64_t f = vk_texture_last_write(t);
+    AcquireSRWLockExclusive(&rl);
+    dr_calls[DR_READ_TEXELS]++, dr_tcalls[DR_READ_TEXELS]++;
+    int idle = !rq_n && !r_busy;
+    ReleaseSRWLockExclusive(&rl);
+    if (f && vk_sync_fence_done() < f) {
+        uint64_t t0 = kern_now_ns();
+        vk_sync_fence_wait(f, UINT64_MAX);   // counts as a fence wait in perf
+        uint64_t d = kern_now_ns() - t0;
+        AcquireSRWLockExclusive(&rl);
+        dr_waits[DR_READ_TEXELS]++, dr_twaits[DR_READ_TEXELS]++;
+        dr_ns[DR_READ_TEXELS] += d, dr_tns[DR_READ_TEXELS] += d;
+        ReleaseSRWLockExclusive(&rl);
+    }
     vk_read_texels(t, v, r, dst, row, img);
+    if (!replay_check()) return;
+    size_t n = vk_texture_texel_span(t, v, r, row, img);
+    uint8_t *again = n ? malloc(n) : NULL;
+    if (!again) return;
+    memcpy(again, dst, n);   // bytes between the rows stay the caller's
+    uint64_t f0 = vk_texture_last_write(t);
+    replay_drain(DR_CHECK);
+    uint64_t f1 = vk_texture_last_write(t);
+    vk_read_texels(t, v, r, again, row, img);
+    int differ = memcmp(again, dst, n) != 0;
+    static volatile long n_logged;
+    if (differ && InterlockedIncrement(&n_logged) <= 40) {
+        size_t at = 0;
+        while (at < n && again[at] == dst[at]) at++;
+        rt_log("vk: replay check: ReadTexels of %p (format %#x, %dx%dx%d at %d,%d,%d) differs at byte %zu of %zu; writer "
+               "fence %llu at the read, %llu after the drain, done %llu; queue %s at the read",
+               (void *)t->mem, t->d.format, r->width, r->height, r->depth, r->xoffset, r->yoffset, r->zoffset, at, n,
+               (unsigned long long)f0, (unsigned long long)f1, (unsigned long long)vk_sync_fence_done(), idle ? "idle" : "busy");
+    }
+    AcquireSRWLockExclusive(&rl);
+    ck_reads++;
+    if (differ) {
+        ck_diff++;
+        if (f1 == f0) ck_diff_unexplained++;
+        if (idle) ck_diff_idle++;
+    }
+    ReleaseSRWLockExclusive(&rl);
+    free(again);
 }
 static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
                                uint64_t img) {

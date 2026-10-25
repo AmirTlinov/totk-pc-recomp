@@ -52,6 +52,8 @@ typedef struct Tex {
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
+    uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
+                                  // storage binding); ReadTexels waits for it instead of draining the replay queue
     uint8_t listed;               // in owned[]
 } Tex;
 
@@ -803,6 +805,8 @@ void vk_texture_gpu_written(const tex_t *t) {
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
         e->pub.gpu_owned = 1;
+        uint64_t f = vk_exec_recording_fence();
+        if (f > e->wr_fence) e->wr_fence = f;
         if (e->pub.mirrored) {
             e->gpu_dirty = 1;
             storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
@@ -1217,6 +1221,28 @@ static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
         }
     }
     return n;
+}
+
+// A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
+// tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
+void vk_texture_storage_bound_locked(const VkTexImage *img) {
+    Tex *e = (Tex *)img;   // pub is the first member
+    uint64_t f = vk_exec_recording_fence();
+    if (f > e->wr_fence) e->wr_fence = f;
+}
+
+uint64_t vk_texture_last_write(const tex_t *t) {
+    lock();
+    Tex *e = entry_of(t);
+    uint64_t f = e ? e->wr_fence : 0;
+    unlock();
+    return f;
+}
+
+size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img) {
+    Region g;
+    if (!region_of(t, v, r, row, img, &g)) return 0;
+    return (size_t)(g.nz - 1) * g.img + (g.hb - 1) * g.row + g.wb;
 }
 
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size) {
