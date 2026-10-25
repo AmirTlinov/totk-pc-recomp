@@ -347,7 +347,13 @@ typedef struct {
     VkDescriptorSetLayout set_layout1;
     int push1;
     uint32_t n_sets;
+    // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
+    // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
+    VkDescriptorUpdateTemplate tpl[2];
 } VkPipeInfo;
+// One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
+// bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
+typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBufferView view; uint64_t w[3]; } VkDescSlot;
 // Both return the cached pipeline (created on first use; failures are cached and logged once). info: may be NULL.
 // Valid until vk_pipeline_shutdown; thread-safe.
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
@@ -381,6 +387,10 @@ VkPrimitiveTopology vk_pipeline_topology(int nvn_prim);   // quads -> triangle l
                                                           // rewrites those draws; polygon -> fan
 VkFormat vk_vertex_format(int nvn_format, int *type);     // attribute format (supported fallback), GFX_TYPE_* in *type
 PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void);  // after the first vk_pipeline_* call
+// Descriptor update templates (after the first vk_pipeline_* call): NULL when templates are off (TOTK_DESC_TEMPLATE=0,
+// a device below Vulkan 1.1) or, for the push variant, vkCmdPushDescriptorSetWithTemplateKHR is missing.
+PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void);
+PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void);
 // Probe only: 1 selects stage-independent layouts for pipelines looked up from now on, 0 the shared set 0; returns
 // the previous mode. 1 needs vk_caps.gpl (the independent-sets flag comes with the extension).
 int vk_pipeline_set_indep(int on);

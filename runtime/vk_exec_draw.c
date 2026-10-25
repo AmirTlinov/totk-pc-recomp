@@ -121,12 +121,12 @@ static struct {
     int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
 } B;
 
-// Contents of B.ds_last: the writes' bindings, types, counts and descriptor infos. A draw whose allocated set would
-// hold the same reuses the set instead of allocating and writing one (Task 2.2's per-draw cost). psig: the same for
-// the last push per set number; a push equal to it under the same layout is not recorded again (the descriptors stay
-// bound across pipeline binds of that layout).
-#define DS_SIG_BYTES (MAX_DESC * 24 + MAX_BINDINGS * 12)
-static struct { uint32_t n[2], pn[2]; uint8_t sig[2][DS_SIG_BYTES], psig[2][DS_SIG_BYTES], tmp[DS_SIG_BYTES]; } DS;
+// Contents of B.ds_last: the set's packed descriptors (VkDescSlot), which with its layout determine every write. A draw
+// whose allocated set would hold the same reuses the set instead of allocating and writing one (Task 2.2's per-draw
+// cost). psig: the same for the last push per set number; a push equal to it under the same layout is not recorded
+// again (the descriptors stay bound across pipeline binds of that layout).
+#define DS_SIG_BYTES (MAX_DESC * sizeof(VkDescSlot))
+static struct { uint32_t n[2], pn[2]; uint8_t sig[2][DS_SIG_BYTES], psig[2][DS_SIG_BYTES]; } DS;
 
 // TOTK_BIND_STATS counters (bind_stats).
 static struct {
@@ -151,7 +151,7 @@ static struct {
     RsCount cnt[2 * VK_MCLS_N], pcnt[2 * VK_MCLS_N];
     int ncnt, pncnt, cnt_over;
     int cmds;                            // check mode: pushes, binds and set writes the build recorded
-    uint32_t ckn;                        // check mode: ds_sig of the last build's writes
+    uint32_t ckn;                        // check mode: the last build's packed descriptors (bytes in ck)
     uint8_t ck[DS_SIG_BYTES];
 } RS = {-1};
 
@@ -1039,30 +1039,6 @@ static void repeat_stats(const VkExec *ex, const VkPipeInfo *info) {
     last = cur;
 }
 
-// The signature of a set's writes into out (DS layout): bindings, types, counts and descriptor infos. Returns its size.
-static uint32_t ds_sig(const VkWriteDescriptorSet *w, uint32_t nw, uint8_t *out) {
-    uint32_t n = 0;
-    for (uint32_t k = 0; k < nw; k++) {
-        const VkWriteDescriptorSet *x = &w[k];
-        uint32_t hdr[3] = {x->dstBinding, (uint32_t)x->descriptorType, x->descriptorCount};
-        memcpy(out + n, hdr, sizeof hdr), n += sizeof hdr;
-        if (x->pImageInfo) {   // field by field: the struct's tail padding is not written
-            for (uint32_t d = 0; d < x->descriptorCount; d++) {
-                const VkDescriptorImageInfo *ii1 = &x->pImageInfo[d];
-                memcpy(out + n, &ii1->sampler, 8), memcpy(out + n + 8, &ii1->imageView, 8);
-                memcpy(out + n + 16, &ii1->imageLayout, 4), n += 20;
-            }
-        } else if (x->pBufferInfo) {
-            memcpy(out + n, x->pBufferInfo, sizeof *x->pBufferInfo * x->descriptorCount);
-            n += (uint32_t)(sizeof *x->pBufferInfo * x->descriptorCount);
-        } else {
-            memcpy(out + n, x->pTexelBufferView, sizeof *x->pTexelBufferView * x->descriptorCount);
-            n += (uint32_t)(sizeof *x->pTexelBufferView * x->descriptorCount);
-        }
-    }
-    return n;
-}
-
 static int push_skip_on(void) {   // TOTK_PUSH_SKIP=0: every graphics draw pushes its set again
     static int on = -1;
     if (on < 0) {
@@ -1196,14 +1172,28 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     return !diff && !bd;
 }
 
+// Writes allocated set s from its packed descriptors d: through the layout's update template, or with the write
+// structs w[i0..i1) when it has none.
+static void write_set(const VkPipeInfo *info, uint32_t s, VkDescriptorSet set, const VkDescSlot *d, VkWriteDescriptorSet *w,
+                      uint32_t i0, uint32_t i1) {
+    if (i1 == i0) return;
+    if (info->tpl[s]) {
+        vk_pipeline_update_tpl_fn()(vk_ctx()->device, set, info->tpl[s], d);
+        return;
+    }
+    for (uint32_t k = i0; k < i1; k++) w[k].dstSet = set;
+    vkUpdateDescriptorSets(vk_ctx()->device, i1 - i0, w + i0, 0, NULL);
+}
+
 // Writes the pipeline's sets from the bound state: set 0, and set 1 with independent layouts. Each is pushed into the
 // command buffer, or allocated, written and bound; a graphics set whose contents equal the last one allocated for that
 // set number in this command buffer is reused, and bound again only when another layout or a push came between. A
 // graphics push equal to the last one at its set number, with no other layout or bind between, is not recorded.
+// The descriptors go into one packed array d, a VkDescSlot per descriptor in binding order, which a set's update
+// template reads directly (VkPipeInfo.tpl); write structs are filled only when a set has no template.
 static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     static VkWriteDescriptorSet w[MAX_BINDINGS];
-    static VkDescriptorBufferInfo bi[MAX_DESC];
-    static VkDescriptorImageInfo ii[MAX_DESC];
+    static VkDescSlot d[MAX_DESC];
     static VkBufferView bv[MAX_DESC];
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
     bind_stats(info);
@@ -1221,15 +1211,24 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (skip == 2) memcpy(RS.pcnt, RS.cnt, sizeof RS.cnt), RS.pncnt = RS.ncnt;
         RS.rec = 1, RS.ncnt = 0, RS.cnt_over = 0, RS.volatile_ = 0, RS.cmds = 0;
     }
+    uint32_t n_sets = info->n_sets ? info->n_sets : 1;
+    uint32_t lo[2] = {0, 0}, hi[2] = {0, 0}, d0[2] = {0, 0};   // bindings [lo, hi) and first descriptor per set
+    int need_w = 0;                                             // a set without a template: fill the write structs
+    for (uint32_t s = 0, i0 = 0; s < n_sets; s++) {
+        uint32_t i1 = i0;
+        while (i1 < info->n_bindings && (n_sets == 1 || info->bindings[i1].set == s)) i1++;
+        lo[s] = i0, hi[s] = i1, i0 = i1;
+        if (i1 > lo[s] && !info->tpl[s]) need_w = 1;
+    }
     uint32_t nd = 0;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
         const GfxShaderRes *r = b->res;
         uint32_t cnt = b->count ? b->count : 1;
         if (nd + cnt > MAX_DESC) rt_fatal("vk: %u descriptors exceed the replay's %d", nd + cnt, MAX_DESC);
-        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                      .dstBinding = b->binding, .descriptorCount = cnt, .descriptorType = b->type};
-        int st = nvn_stage_of(b->stage);
+        if (n_sets == 2 && i == lo[1]) d0[1] = nd;
+        VkDescSlot *o = &d[nd];
+        int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
         if (b->kind == VK_PIPE_SUPPORT) {
             float in[3];
             support_in(ex, in);
@@ -1245,37 +1244,45 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     B.sup_buf = sb, B.sup_off = so, B.sup_valid = 1;
                 }
             }
-            bi[nd] = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
-            w[i].pBufferInfo = &bi[nd];
+            o->buffer = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt; k++) bi[nd + k] = ubo_info(ex, st, r->slot + (int)k);
-            w[i].pBufferInfo = &bi[nd];
+            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
         } else if (b->kind == GFX_RES_SSBO) {
-            for (uint32_t k = 0; k < cnt; k++) bi[nd + k] = ssbo_info(ex, st, r, r->flags & 1);
-            w[i].pBufferInfo = &bi[nd];
+            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
-                for (uint32_t k = 0; k < cnt; k++) bv[nd + k] = Z.zview;   // buffer textures are not replayed yet
-                w[i].pTexelBufferView = &bv[nd];
+                kind = 2;
+                for (uint32_t k = 0; k < cnt; k++) {   // buffer textures are not replayed yet
+                    o[k].w[0] = 0, o[k].w[1] = 0, o[k].w[2] = 0;
+                    o[k].view = Z.zview;
+                    if (need_w) bv[nd + k] = Z.zview;
+                }
             } else {
+                kind = 1;
                 vk_texture_lock();   // tex_info looks up with the texture lock held
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
-                    tex_info(ex, r, h, img, r->separate, &ii[nd + k]);
+                    tex_info(ex, r, h, img, r->separate, &o[k].image);
+                    o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                 }
                 vk_texture_unlock();
-                w[i].pImageInfo = &ii[nd];
             }
         } else {
             rt_fatal("vk: binding %u has an unknown kind %d", (unsigned)b->binding, (int)b->kind);
         }
+        if (need_w) {
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                          .dstBinding = b->binding, .descriptorCount = cnt, .descriptorType = b->type};
+            if (kind == 0) w[i].pBufferInfo = &o->buffer;   // a VkDescSlot is as large as either info struct
+            else if (kind == 1) w[i].pImageInfo = &o->image;
+            else w[i].pTexelBufferView = &bv[nd];
+        }
         nd += cnt;
     }
-    uint32_t n_sets = info->n_sets ? info->n_sets : 1;
     // Under the validation layer, a new graphics layout binds set 1 before set 0 is pushed or bound. The layer (SDK
     // 1.4.363, PipelineLayoutCompatDef::operator==) takes any two INDEPENDENT_SETS layouts as compatible, so
     // vkCmdPushDescriptorSetKHR keeps the push set it made for an earlier layout and drops writes to bindings that
@@ -1288,14 +1295,10 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         B.ds_pushed[0] = B.ds_pushed[1] = 0;
         set1_first = n_sets == 2 && vk_ctx()->validation;
     }
-    uint32_t lo[2] = {0, 0}, hi[2] = {0, 0};
-    for (uint32_t s = 0, i0 = 0; s < n_sets; s++) {
-        uint32_t i1 = i0;
-        while (i1 < info->n_bindings && (n_sets == 1 || info->bindings[i1].set == s)) i1++;
-        lo[s] = i0, hi[s] = i1, i0 = i1;
-    }
     for (uint32_t k = 0; k < n_sets; k++) {
         uint32_t s = set1_first ? 1 - k : k, i0 = lo[s], i1 = hi[s];
+        const VkDescSlot *ds = &d[d0[s]];
+        uint32_t dbytes = (uint32_t)(((s + 1 < n_sets ? d0[s + 1] : nd) - d0[s]) * sizeof *d);
         if (s && i1 == i0) {               // no fragment stage: set 1 is empty and unused
             if (set1_first) {              // bound only to drop the layer's push set (comment above)
                 VkDescriptorSet set = alloc_set(ex, info->set_layout1);
@@ -1306,33 +1309,31 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             continue;
         }
         if (s ? info->push1 : info->push) {
-            uint32_t n = gfx && push_skip_on() ? ds_sig(w + i0, i1 - i0, DS.tmp) : 0;
-            if (n && B.ds_pushed[s] && DS.pn[s] == n && !memcmp(DS.psig[s], DS.tmp, n)) {
+            uint32_t n = gfx && push_skip_on() ? dbytes : 0;
+            if (n && B.ds_pushed[s] && DS.pn[s] == n && !memcmp(DS.psig[s], ds, n)) {
                 BS.push_skip++;
                 continue;
             }
-            vk_pipeline_push_fn()(ex->cb, info->bind_point, info->layout, s, i1 - i0, w + i0);
+            if (info->tpl[s]) vk_pipeline_push_tpl_fn()(ex->cb, info->tpl[s], info->layout, s, ds);
+            else vk_pipeline_push_fn()(ex->cb, info->bind_point, info->layout, s, i1 - i0, w + i0);
             BS.push++;
             RS.cmds++;
             if (gfx) {
                 B.ds_bound[s] = VK_NULL_HANDLE, B.ds_pushed[s] = n != 0;
-                if (n) DS.pn[s] = n, memcpy(DS.psig[s], DS.tmp, n);
+                if (n) DS.pn[s] = n, memcpy(DS.psig[s], ds, n);
             }
         } else if (!gfx || s > 1) {
             VkDescriptorSet set = alloc_set(ex, s ? info->set_layout1 : info->set_layout);
-            for (uint32_t k = i0; k < i1; k++) w[k].dstSet = set;
-            if (i1 > i0) vkUpdateDescriptorSets(vk_ctx()->device, i1 - i0, w + i0, 0, NULL);
+            write_set(info, s, set, ds, w, i0, i1);
             vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, s, 1, &set, 0, NULL);
         } else {
             VkDescriptorSetLayout sl = s ? info->set_layout1 : info->set_layout;
-            uint32_t n = ds_sig(w + i0, i1 - i0, DS.tmp);
             VkDescriptorSet set = B.ds_last[s];
-            if (!set || B.ds_last_layout[s] != sl || DS.n[s] != n || memcmp(DS.sig[s], DS.tmp, n)) {
+            if (!set || B.ds_last_layout[s] != sl || DS.n[s] != dbytes || memcmp(DS.sig[s], ds, dbytes)) {
                 set = alloc_set(ex, sl);
-                for (uint32_t k = i0; k < i1; k++) w[k].dstSet = set;
-                if (i1 > i0) vkUpdateDescriptorSets(vk_ctx()->device, i1 - i0, w + i0, 0, NULL);
-                B.ds_last[s] = set, B.ds_last_layout[s] = sl, DS.n[s] = n;
-                memcpy(DS.sig[s], DS.tmp, n);
+                write_set(info, s, set, ds, w, i0, i1);
+                B.ds_last[s] = set, B.ds_last_layout[s] = sl, DS.n[s] = dbytes;
+                memcpy(DS.sig[s], ds, dbytes);
                 BS.set_new++;
                 RS.cmds++;
             } else {
@@ -1352,9 +1353,9 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         int valid = !RS.volatile_ && !RS.cnt_over && RS.hn;
         for (uint32_t s = 0; s < n_sets; s++)
             if (hi[s] > lo[s] && (s ? info->push1 : info->push) && !B.ds_pushed[s]) valid = 0;
-        if (skip == 2) {
-            uint32_t n = ds_sig(w, info->n_bindings, DS.tmp);
-            int wr = n != RS.ckn || memcmp(RS.ck, DS.tmp, n);
+        if (skip == 2) {   // with the pipeline info equal (bind_sig), the packed descriptors determine every write
+            uint32_t n = (uint32_t)(nd * sizeof *d);
+            int wr = n != RS.ckn || memcmp(RS.ck, d, n);
             int cn = RS.ncnt != RS.pncnt || memcmp(RS.cnt, RS.pcnt, sizeof RS.cnt[0] * (size_t)RS.ncnt);
             if (same && was_valid && (wr || cn || RS.cmds))
                 rt_fatal("vk_exec: descriptor build skip check: a draw of program %llu with the inputs of the previous one "
@@ -1362,7 +1363,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                          RS.cmds ? "descriptor commands" : wr ? "other writes" : "other census counts");
             if (same && was_valid) BS.bind_skip++;   // the draws a skip would have spared, compared instead
             RS.ckn = n;
-            memcpy(RS.ck, DS.tmp, n);
+            memcpy(RS.ck, d, n);
         }
         B.res_valid = valid;
     }
