@@ -46,15 +46,25 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
     return 0;
 }
 
+// nvn_bl_offset per row instead of per 16 bytes: within a row, GOB column k starts k blocks further, and the four
+// 16-byte segments of a GOB row (x % 64 = 0, 16, 32, 48) sit at 0, 32, 256 and 288 of it.
 void tex_bl_copy(uint8_t *bl, uint8_t *lin, size_t pitch, uint32_t row_bytes, uint32_t rows, uint32_t slices,
                  unsigned th, unsigned td, int to_linear) {
+    static const uint32_t seg[4] = {0, 32, 256, 288};
+    uint64_t block = 512ull << th << td;
     for (uint32_t z = 0; z < slices; z++)
         for (uint32_t y = 0; y < rows; y++) {
-            uint8_t *row = lin + ((size_t)z * rows + y) * pitch;
-            for (uint32_t x = 0; x < row_bytes; x += 16) {             // 16-byte segments: contiguous within a GOB, and 16 divides every block width
+            uint8_t *row = lin + ((size_t)z * rows + y) * pitch, *g = bl + nvn_bl_offset(0, y, z, row_bytes, rows, th, td);
+            uint32_t x = 0;
+            if (to_linear)
+                for (; x + 64 <= row_bytes; x += 64, g += block)
+                    for (int s = 0; s < 4; s++) memcpy(row + x + 16 * s, g + seg[s], 16);
+            else
+                for (; x + 64 <= row_bytes; x += 64, g += block)
+                    for (int s = 0; s < 4; s++) memcpy(g + seg[s], row + x + 16 * s, 16);
+            for (int s = 0; x < row_bytes; s++, x += 16) {   // a partial GOB at the row's end
                 uint32_t n = row_bytes - x < 16 ? row_bytes - x : 16;
-                uint8_t *p = bl + nvn_bl_offset(x, y, z, row_bytes, rows, th, td);
-                if (to_linear) memcpy(row + x, p, n); else memcpy(p, row + x, n);
+                if (to_linear) memcpy(row + x, g + seg[s], n); else memcpy(g + seg[s], row + x, n);
             }
         }
 }
