@@ -350,7 +350,10 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
 }
 
 // Per-thread copies of resolved import and physical pools that overlap no other index entry (so pidx_find picks them for
-// any range inside), valid while pool_gen is unchanged: the replay resolves a few pools thousands of times per frame.
+// any range inside), valid while pool_gen is unchanged: the replay resolves a few dozen pools thousands of times per
+// frame (16 vertex streams and every buffer binding of each draw). Direct-mapped by the 4 KiB page of the address, so
+// a hit is one compare however many pools a frame touches. TOTK_RESOLVE_CHECK=1 compares every hit with the locked
+// lookup and stops on a difference.
 static int rec_class(const PoolRec *r) {
     if (r->kind != POOL_IMPORT) return VK_MCLS_DEVICE;
     return r->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? VK_MCLS_HOST_NOACC
@@ -358,25 +361,47 @@ static int rec_class(const PoolRec *r) {
 }
 
 typedef struct { uint64_t gen, lo, hi, base, end; VkBuffer buf; VmaAllocation alloc; int cls; void *pool; } ResolveHit;
-static _Thread_local ResolveHit rhit[4];
-static _Thread_local unsigned rhit_next;
+#define RHIT_SLOTS 512
+static _Thread_local ResolveHit rhit[RHIT_SLOTS];
+
+static ResolveHit *rhit_slot(uint64_t addr) { return &rhit[(addr >> 12 ^ addr >> 21) & (RHIT_SLOTS - 1)]; }
+
+static int resolve_check_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_RESOLVE_CHECK");
+        on = e && *e && strcmp(e, "0");
+    }
+    return on;
+}
+
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out);
 
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
-    if (end >= addr)
-        for (int i = 0; i < 4; i++) {
-            const ResolveHit *h = &rhit[i];
-            if (h->gen != g || addr < h->lo || end > h->hi) continue;
-            out->buffer = h->buf;
-            out->offset = addr - h->base;
-            out->avail = h->end - addr;
-            out->alloc = h->alloc;
-            out->cls = h->cls;
-            out->pool = h->pool;
-            if (h->alloc) out->alloc_offset = out->offset;
-            return 1;
+    const ResolveHit *h = rhit_slot(addr);
+    if (end >= addr && h->gen == g && addr >= h->lo && end <= h->hi) {
+        out->buffer = h->buf;
+        out->offset = addr - h->base;
+        out->avail = h->end - addr;
+        out->alloc = h->alloc;
+        out->cls = h->cls;
+        out->pool = h->pool;
+        if (h->alloc) out->alloc_offset = out->offset;
+        if (resolve_check_on()) {
+            VkMemSpan s;
+            if (!resolve_locked(addr, size, &s) || memcmp(&s, out, sizeof s))
+                rt_fatal("vk: resolve cache of 0x%llx differs from the pool index", (unsigned long long)addr);
         }
+        return 1;
+    }
+    return resolve_locked(addr, size, out);
+}
+
+// The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
+    memset(out, 0, sizeof *out);
     AcquireSRWLockShared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
@@ -384,7 +409,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
         if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
-            ResolveHit *h = &rhit[rhit_next++ & 3];
+            ResolveHit *h = rhit_slot(addr);
             h->gen = __atomic_load_n(&pool_gen, __ATOMIC_RELAXED);   // stable: changed only under the exclusive lock
             h->lo = e->lo, h->hi = e->hi, h->buf = r->buf, h->cls = rec_class(r);
             if (r->kind == POOL_IMPORT) h->base = r->import_lo, h->end = r->import_hi, h->alloc = NULL, h->pool = r;
