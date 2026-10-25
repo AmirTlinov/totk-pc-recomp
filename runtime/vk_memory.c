@@ -82,6 +82,9 @@ static SRWLOCK pool_lock = SRWLOCK_INIT;
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
 // stay valid while it is unchanged.
 static uint64_t pool_gen = 1;
+// Bumped when a buffer use may get another buffer for the same span (a mirror created, refused or forgotten) and at
+// every submission's start (mirror syncs are per submission). vk_mem_gen: both together.
+static uint64_t mirror_gen;
 static pidx pool_index;                // POOL_IMPORT, POOL_PHYS and POOL_VIRT records by GPU address
 static PoolRec **phys_list;            // physical pools by key, for MapVirtual requests
 static int nphys, cap_phys;
@@ -449,6 +452,10 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     ReleaseSRWLockShared(&pool_lock);
     if (!ok) memset(out, 0, sizeof *out);
     return ok;
+}
+
+uint64_t vk_mem_gen(void) {
+    return __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE) + __atomic_load_n(&mirror_gen, __ATOMIC_ACQUIRE);
 }
 
 int vk_mem_class_of(uint64_t addr) {
@@ -1054,6 +1061,7 @@ static void mirror_create(PoolRec *r) {
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo;
     r->mstate = MS_REFUSED;
+    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
     AcquireSRWLockShared(&pool_lock);
     int i = pidx_upper(&pool_index, r->lo) - 1;
@@ -1108,6 +1116,7 @@ static void mirror_create(PoolRec *r) {
 }
 
 static void mirror_forget(PoolRec *r) {
+    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < nm; i++)
         if (mlist[i] == r) {
             memmove(mlist + i, mlist + i + 1, (size_t)(nm - i - 1) * sizeof *mlist);
@@ -1268,6 +1277,7 @@ void vk_mem_mirror_begin(void) {
     uint64_t t0 = qpc();
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
+    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
     int have = 0;

@@ -118,6 +118,7 @@ static struct {
     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
     VkDescriptorSetLayout ds_last_layout[2];
     int ds_pushed[2];                    // set number holds the push of DS.psig under ds_layout
+    int res_valid;                       // the graphics sets bound hold what the inputs in RS give (bind_resources)
 } B;
 
 // Contents of B.ds_last: the writes' bindings, types, counts and descriptor infos. A draw whose allocated set would
@@ -128,9 +129,43 @@ static struct {
 static struct { uint32_t n[2], pn[2]; uint8_t sig[2][DS_SIG_BYTES], psig[2][DS_SIG_BYTES], tmp[DS_SIG_BYTES]; } DS;
 
 // TOTK_BIND_STATS counters (bind_stats).
-static struct { int on; uint64_t draws, bind[2], desc[2], push, push_skip, set_new, set_reuse, ac_miss, same_prog, same_all; } BS = {-1};
+static struct {
+    int on;
+    uint64_t draws, bind[2], desc[2], push, push_skip, set_new, set_reuse, ac_miss, same_prog, same_all, bind_skip;
+} BS = {-1};
+
+// The inputs of the last graphics bind_resources (bind_sig) and what its build counted for the traffic census, which a
+// skipped build counts again. RS_BYTES bounds the bound-slot bytes a pipeline reads (RsList): per binding at most one
+// c0 storage table, otherwise one bound range or handle per descriptor.
+#define RS_BYTES (MAX_BINDINGS * sizeof(((VkExec *)0)->ssbo[0]) + MAX_DESC * sizeof(p_bind_buf))
+typedef struct { int cls, use; uint64_t bytes; } RsCount;
+static struct {
+    int on;                              // TOTK_BIND_SKIP: 1 skip (default), 2 check, 0 off
+    uint32_t hn;                         // words of h the last signature filled; 0: none
+    uint64_t h[24];                      // generations, feedback images, support inputs, base instance
+    const VkPipeInfo *info;              // the pipeline whose RsList ranges body holds, as of bind op generation gen
+    uint64_t gen;
+    uint8_t body[RS_BYTES];
+    int rec;                             // a graphics build is running: count_use records, scratch copies mark volatile
+    int volatile_;                       // the build copied guest bytes into transient memory: a rebuild differs
+    RsCount cnt[2 * VK_MCLS_N], pcnt[2 * VK_MCLS_N];
+    int ncnt, pncnt, cnt_over;
+    int cmds;                            // check mode: pushes, binds and set writes the build recorded
+    uint32_t ckn;                        // check mode: ds_sig of the last build's writes
+    uint8_t ck[DS_SIG_BYTES];
+} RS = {-1};
+
+// The bound-slot bytes of VkExec a pipeline's descriptors read, as ranges merged where they touch, built once per
+// pipeline info: c0's storage table, the uniform and storage ranges of the bound slots and the texture and image
+// handles. sup and c0: the support inputs and the base instance count too. ok 0: never skipped (too many descriptors).
+typedef struct { uint32_t off, len; } RsRange;
+typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok; RsRange r[]; } RsList;
+static nvn_hmap rs_lists;                // VkPipeInfo pointer -> RsList, until shutdown
+static const VkPipeInfo *rs_last;        // the last lookup
+static const RsList *rs_last_l;
 
 static uint32_t c0_dim[3], c0_binst;     // the dispatch size and base instance of the draw or dispatch being bound
+static uint64_t bind_gen = 1;            // bumped by every bind op that writes ex->prog, ubo, ssbo, tex or img
 
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
@@ -345,6 +380,8 @@ void vk_exec_draw_shutdown(void) {
         vmaDestroyImage(c->vma, SD[i].image, SD[i].alloc);
     }
     memset(SD, 0, sizeof SD);
+    nvn_hm_clear(&rs_lists, free);
+    rs_last = NULL, rs_last_l = NULL;
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL);
     for (int i = 0; i < nspare_chunk; i++) vmaDestroyBuffer(c->vma, spare_chunk[i].buf, spare_chunk[i].alloc);
     nspare_pool = nspare_chunk = 0;
@@ -612,6 +649,19 @@ static VkDescriptorBufferInfo zero_info(uint64_t max) {
     return (VkDescriptorBufferInfo){Z.zbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES};
 }
 
+// vk_mem_count, also kept per (class, use) while a graphics build runs (RS).
+static void count_use(int cls, int use, uint64_t n) {
+    vk_mem_count(cls, use, n);
+    if (!RS.rec) return;
+    for (int i = 0; i < RS.ncnt; i++)
+        if (RS.cnt[i].cls == cls && RS.cnt[i].use == use) {
+            RS.cnt[i].bytes += n;
+            return;
+        }
+    if (RS.ncnt < (int)(sizeof RS.cnt / sizeof RS.cnt[0])) RS.cnt[RS.ncnt++] = (RsCount){cls, use, n};
+    else RS.cnt_over = 1;
+}
+
 // A buffer descriptor for [addr, addr+size) of guest memory: its backing (a pool's VRAM mirror when it has one) when
 // aligned, a copy in transient memory when the backing is host memory with an unaligned offset. 0 when neither works.
 // written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
@@ -626,13 +676,14 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
         VK_MEM_USE(sp);
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
         if (written) vk_mem_gpu_wrote(&sp, n);
-        vk_mem_count(sp.cls, use, n);
+        count_use(sp.cls, use, n);
         VK_MEM_BOUND(sp);
         return 1;
     }
     if (sp.alloc) return 0;
     VkBuffer b;
     VkDeviceSize o;
+    RS.volatile_ = 1;
     memcpy(scratch(ex, n, &b, &o), (const void *)(uintptr_t)addr, n);
     vk_mem_count(sp.cls, VK_MUSE_CPU_READ, n);
     vk_mem_count(VK_MCLS_SCRATCH, use, n);
@@ -914,6 +965,12 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
     return VK_NULL_HANDLE;
 }
 
+static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
+    in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] : (float)ex->pass_w;
+    in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] : (float)ex->pass_h;
+    in[2] = ex->point_size > 0 ? ex->point_size : 1.0f;
+}
+
 static void support_fill(uint8_t *b, float w, float h, float point_size) {
     memset(b, 0, SUPPORT_BYTES);
     float inv[4] = {w > 0 ? 2.0f / w : 0, h > 0 ? 2.0f / h : 0, 0, 0}, size[4] = {w, h, 0, 0};
@@ -949,9 +1006,9 @@ static void bind_stats(const VkPipeInfo *info) {
         rt_log("vk_exec: per draw over %llu draws: vertex %.2f bindings %.2f descriptors, fragment %.2f bindings %.2f descriptors",
                (unsigned long long)BS.draws, BS.bind[0] / d, BS.desc[0] / d, BS.bind[1] / d, BS.desc[1] / d);
         rt_log("vk_exec: per draw: pushes %.3f skipped %.3f, sets written %.3f reused %.3f, texture types %.3f; "
-               "same program and state as the draw before %.3f, also same buffers %.3f",
+               "same program and state as the draw before %.3f, also same buffers %.3f; descriptor builds skipped %.3f",
                BS.push / d, BS.push_skip / d, BS.set_new / d, BS.set_reuse / d, BS.ac_miss / d, BS.same_prog / d,
-               BS.same_all / d);
+               BS.same_all / d, BS.bind_skip / d);
     }
 }
 
@@ -1015,6 +1072,130 @@ static int push_skip_on(void) {   // TOTK_PUSH_SKIP=0: every graphics draw pushe
     return on;
 }
 
+// A graphics draw whose descriptor inputs equal the previous graphics draw's in this command buffer skips building its
+// sets: every write would be the same, the push would be skipped and the allocated set reused without a bind (about a
+// quarter of field and monsters2 draws, TOTK_BIND_STATS). The inputs, compared and stored in place, are what
+// bind_resources and its helpers read beyond the pipeline info's fixed bindings and Z's stand-ins:
+// - the info (bindings, layouts), the program and its serial (the compiler-constant range of UBO slot 1);
+// - vk_texture_slots_gen, vk_texture_epoch (a slot's image, view and once-per-submit storage check), vk_sampler_gen;
+// - vk_mem_gen (buffer and offset of a span, mirror creation and per-submission sync);
+// - the images in the feedback layout (the sampled layout);
+// - per binding: the support inputs, c0's storage table and base instance, the bound uniform and storage ranges, the
+//   texture and image handles (RsList; compared only when a bind op ran since the last draw, bind_gen).
+// The side effects of a build repeat as no-ops in the same command buffer and submission: c0 and support buffers kept
+// in B, note_written's ranges, vk_mem_gpu_wrote's write-backs, the per-submission mirror sync and dirty census note,
+// the views cached per submission. The census counts are added again. A build that copied guest bytes into transient
+// memory (an unaligned host range) is never skipped after: the copy may differ. B.res_valid says the sets bound hold
+// the last build; vk_exec_draw_new_cb's memset clears it, and every build clears it until it ends.
+// TOTK_BIND_SKIP=0 builds every draw; =check builds every draw and stops when a draw with equal inputs gets other
+// writes, census counts or descriptor commands.
+static int bind_skip_on(void) {
+    if (RS.on < 0) {
+        const char *e = cfg_get("TOTK_BIND_SKIP");
+        RS.on = e && !strcmp(e, "check") ? 2 : !(e && !strcmp(e, "0"));
+        if (RS.on != 1) rt_log("vk_exec: descriptor build skip %s", RS.on ? "check" : "off");
+    }
+    return RS.on;
+}
+
+static void rs_add(RsRange *r, uint32_t *n, const VkExec *ex, const void *at, size_t len) {
+    uint32_t off = (uint32_t)((const uint8_t *)at - (const uint8_t *)ex);
+    if (*n && r[*n - 1].off + r[*n - 1].len == off) r[*n - 1].len += (uint32_t)len;
+    else r[(*n)++] = (RsRange){off, (uint32_t)len};
+}
+
+static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
+    if (info == rs_last) return rs_last_l;
+    if (!rs_lists.klen) nvn_hm_init(&rs_lists, sizeof info);
+    RsList *l = nvn_hm_get(&rs_lists, &info);
+    if (!l) {
+        static RsRange tmp[MAX_DESC];
+        uint32_t n = 0, nd = 0;
+        int sup = 0, c0 = 0, ok = 1;
+        for (uint32_t i = 0; i < info->n_bindings && ok; i++) {
+            const VkPipeBinding *b = &info->bindings[i];
+            const GfxShaderRes *r = b->res;
+            uint32_t cnt = b->count ? b->count : 1;
+            if ((nd += cnt) > MAX_DESC) { ok = 0; break; }   // the build stops on it
+            int st = nvn_stage_of(b->stage);
+            if (b->kind == VK_PIPE_SUPPORT) {
+                sup = 1;
+            } else if (b->kind == GFX_RES_UBO) {
+                for (uint32_t k = 0; k < cnt; k++) {
+                    int slot = r->slot + (int)k;
+                    if (slot == 0 && c0_on()) c0 = 1, rs_add(tmp, &n, ex, ex->ssbo[st], sizeof ex->ssbo[st]);
+                    else if (slot >= 3 && slot - 3 < 18) rs_add(tmp, &n, ex, &ex->ubo[st][slot - 3], sizeof(p_bind_buf));
+                }   // slot 1: the program (bind_sig); others: the zero buffer
+            } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
+                int ubo, slot = ssbo_slot(r, st, &ubo);
+                if (slot >= 0 && slot < 16) rs_add(tmp, &n, ex, ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot], sizeof(p_bind_buf));
+            } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
+                       b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+                int img = b->kind == GFX_RES_IMG, cap = img ? 32 : 128;
+                for (uint32_t k = 0; k < cnt; k++) {
+                    int slot = r->slot + (int)k;
+                    if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
+                }
+            }
+        }
+        uint64_t bytes = 0;
+        for (uint32_t i = 0; i < n; i++) bytes += tmp[i].len;
+        if (bytes > RS_BYTES) ok = 0;
+        l = malloc(sizeof *l + sizeof *tmp * n);
+        if (!l) rt_fatal("vk: out of memory");
+        l->n = n, l->bytes = (uint32_t)bytes, l->sup = (uint8_t)sup, l->c0 = (uint8_t)c0, l->ok = (uint8_t)ok;
+        memcpy(l->r, tmp, sizeof *tmp * n);
+        nvn_hm_put(&rs_lists, &info, l);
+    }
+    rs_last = info, rs_last_l = l;
+    return l;
+}
+
+// The signature of a graphics draw's descriptor inputs into RS; 1 when it equals the stored one. The bound-slot bytes
+// are compared only when a bind op ran since they were stored or the pipeline changed: otherwise they are the same.
+// Check mode compares them anyway and stops when the bind op generation said they could not differ but they do.
+static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
+    const RsList *l = rs_list(ex, info);
+    if (!l->ok) return RS.hn = 0, RS.info = NULL, 0;
+    uint64_t *h = RS.h, diff = 0;
+    uint32_t n = 0;
+#define PUT(v) do { uint64_t v_ = (uint64_t)(v); diff |= h[n] ^ v_; h[n++] = v_; } while (0)
+    PUT((uintptr_t)info);
+    PUT((uintptr_t)ex->prog);
+    PUT(ex->prog->serial);
+    PUT((uint64_t)vk_texture_slots_gen() << 32 | vk_texture_epoch());
+    PUT((uint64_t)vk_sampler_gen() << 32 | (uint32_t)ex->nfbl);
+    PUT(vk_mem_gen());
+    for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
+    if (l->sup) {
+        float in[3];
+        support_in(ex, in);
+        uint64_t a;
+        uint32_t ps;
+        memcpy(&a, in, 8), memcpy(&ps, &in[2], 4);
+        PUT(a);
+        PUT(ps);
+    }
+    if (l->c0) PUT(c0_binst);
+#undef PUT
+    diff |= n != RS.hn;
+    RS.hn = n;
+    int fast = RS.info == info && RS.gen == bind_gen;
+    if (fast && RS.on != 2) return !diff;
+    const uint8_t *e = (const uint8_t *)ex;
+    uint8_t *d = RS.body;
+    int bd = 0;
+    for (uint32_t i = 0; i < l->n; i++) {
+        const RsRange *r = &l->r[i];
+        if (!bd && memcmp(d, e + r->off, r->len)) bd = 1;
+        if (bd) memcpy(d, e + r->off, r->len);
+        d += r->len;
+    }
+    if (fast && bd) rt_fatal("vk_exec: descriptor build skip check: bound slots changed without a bind op");
+    RS.info = info, RS.gen = bind_gen;
+    return !diff && !bd;
+}
+
 // Writes the pipeline's sets from the bound state: set 0, and set 1 with independent layouts. Each is pushed into the
 // command buffer, or allocated, written and bound; a graphics set whose contents equal the last one allocated for that
 // set number in this command buffer is reused, and bound again only when another layout or a push came between. A
@@ -1026,6 +1207,20 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
     static VkBufferView bv[MAX_DESC];
     if (info->n_bindings > MAX_BINDINGS) rt_fatal("vk: %u descriptor bindings exceed the replay's %d", info->n_bindings, MAX_BINDINGS);
     bind_stats(info);
+    int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
+    int skip = gfx ? bind_skip_on() : 0, same = 0, was_valid = B.res_valid;
+    if (skip) {
+        same = bind_sig(ex, info);
+        if (same && was_valid && skip == 1) {
+            for (int i = 0; i < RS.ncnt; i++) vk_mem_count(RS.cnt[i].cls, RS.cnt[i].use, RS.cnt[i].bytes);
+            BS.bind_skip++;
+            ex->recorded++;
+            return;
+        }
+        B.res_valid = 0;   // until the build below ends
+        if (skip == 2) memcpy(RS.pcnt, RS.cnt, sizeof RS.cnt), RS.pncnt = RS.ncnt;
+        RS.rec = 1, RS.ncnt = 0, RS.cnt_over = 0, RS.volatile_ = 0, RS.cmds = 0;
+    }
     uint32_t nd = 0;
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *b = &info->bindings[i];
@@ -1036,9 +1231,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                                       .dstBinding = b->binding, .descriptorCount = cnt, .descriptorType = b->type};
         int st = nvn_stage_of(b->stage);
         if (b->kind == VK_PIPE_SUPPORT) {
-            float vw = ex->in_pass && ex->has_vp ? ex->vp[0][2] : (float)ex->pass_w;
-            float vh = ex->in_pass && ex->has_vp ? ex->vp[0][3] : (float)ex->pass_h;
-            float in[3] = {vw, vh, ex->point_size > 0 ? ex->point_size : 1.0f};
+            float in[3];
+            support_in(ex, in);
             if (!B.sup_valid || memcmp(in, B.sup_in, sizeof in)) {   // support_fill reads only these
                 uint8_t tmp[SUPPORT_BYTES];
                 support_fill(tmp, in[0], in[1], in[2]);
@@ -1082,7 +1276,6 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         nd += cnt;
     }
     uint32_t n_sets = info->n_sets ? info->n_sets : 1;
-    int gfx = info->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS;
     // Under the validation layer, a new graphics layout binds set 1 before set 0 is pushed or bound. The layer (SDK
     // 1.4.363, PipelineLayoutCompatDef::operator==) takes any two INDEPENDENT_SETS layouts as compatible, so
     // vkCmdPushDescriptorSetKHR keeps the push set it made for an earlier layout and drops writes to bindings that
@@ -1108,6 +1301,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 VkDescriptorSet set = alloc_set(ex, info->set_layout1);
                 vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, 1, 1, &set, 0, NULL);
                 B.ds_bound[1] = set, B.ds_pushed[1] = 0;
+                RS.cmds++;
             }
             continue;
         }
@@ -1119,6 +1313,7 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             vk_pipeline_push_fn()(ex->cb, info->bind_point, info->layout, s, i1 - i0, w + i0);
             BS.push++;
+            RS.cmds++;
             if (gfx) {
                 B.ds_bound[s] = VK_NULL_HANDLE, B.ds_pushed[s] = n != 0;
                 if (n) DS.pn[s] = n, memcpy(DS.psig[s], DS.tmp, n);
@@ -1139,14 +1334,37 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 B.ds_last[s] = set, B.ds_last_layout[s] = sl, DS.n[s] = n;
                 memcpy(DS.sig[s], DS.tmp, n);
                 BS.set_new++;
+                RS.cmds++;
             } else {
                 BS.set_reuse++;
             }
             if (B.ds_bound[s] != set) {
                 vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, s, 1, &set, 0, NULL);
                 B.ds_bound[s] = set, B.ds_pushed[s] = 0;
+                RS.cmds++;
             }
         }
+    }
+    if (skip) {
+        RS.rec = 0;
+        // An equal next draw records nothing when every push set holds its push (TOTK_PUSH_SKIP on) and nothing made
+        // the build unrepeatable; allocated sets are always bound to the one written last.
+        int valid = !RS.volatile_ && !RS.cnt_over && RS.hn;
+        for (uint32_t s = 0; s < n_sets; s++)
+            if (hi[s] > lo[s] && (s ? info->push1 : info->push) && !B.ds_pushed[s]) valid = 0;
+        if (skip == 2) {
+            uint32_t n = ds_sig(w, info->n_bindings, DS.tmp);
+            int wr = n != RS.ckn || memcmp(RS.ck, DS.tmp, n);
+            int cn = RS.ncnt != RS.pncnt || memcmp(RS.cnt, RS.pcnt, sizeof RS.cnt[0] * (size_t)RS.ncnt);
+            if (same && was_valid && (wr || cn || RS.cmds))
+                rt_fatal("vk_exec: descriptor build skip check: a draw of program %llu with the inputs of the previous one "
+                         "gets %s", (unsigned long long)ex->prog->serial,
+                         RS.cmds ? "descriptor commands" : wr ? "other writes" : "other census counts");
+            if (same && was_valid) BS.bind_skip++;   // the draws a skip would have spared, compared instead
+            RS.ckn = n;
+            memcpy(RS.ck, DS.tmp, n);
+        }
+        B.res_valid = valid;
     }
     ex->recorded++;
 }
@@ -1565,6 +1783,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = payload;
         ex->prog = b->prog, ex->prog_stages = b->stages;
+        bind_gen++;
         break;
     }
     case OP_BIND_STATE: {
@@ -1607,17 +1826,20 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_BIND_UBO: {
         const p_bind_buf *b = payload;
         if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 18) ex->ubo[b->stage][b->index] = *b;
+        bind_gen++;
         break;
     }
     case OP_BIND_SSBO: {
         const p_bind_buf *b = payload;
         if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) ex->ssbo[b->stage][b->index] = *b;
+        bind_gen++;
         break;
     }
     case OP_BIND_TEX: {
         const p_bind_handles *b = payload;
         bind_handles(b->stage >= 0 && b->stage < 6 ? ex->tex[b->stage] : NULL, 128, b);
         ex->tex_serial++;
+        bind_gen++;
         break;
     }
     case OP_BIND_SAMP: {
@@ -1628,6 +1850,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_BIND_IMG: {
         const p_bind_handles *b = payload;
         bind_handles(b->stage >= 0 && b->stage < 6 ? ex->img[b->stage] : NULL, 32, b);
+        bind_gen++;
         break;
     }
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
