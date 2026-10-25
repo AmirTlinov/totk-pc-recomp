@@ -53,6 +53,7 @@ typedef struct Fiber Fiber;
 
 struct RtThread {
     int preempt;               // first member: rt_dispatch reads it (host.h kern_preempt_pending)
+    int host_depth;            // second member: host calls and SVCs in progress, while kern_host_track (host.h)
     uint32_t handle;
     uint64_t id;
     Cpu *cpu;                  // the thread's own context
@@ -86,12 +87,23 @@ struct RtThread {
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
+    // TOTK_CORE_DIAG (holding G, except dg_host_end, which only the thread itself writes)
+    uint64_t dg_since;         // as a waiter: core wait start
+    int dg_cls;                // as a waiter: DG_* class at the start of the wait
+    RtThread *dg_target;       // as a waiter: the owner asked to give its core up for it
+    uint64_t dg_kick;          // as an owner: the preempt request
+    uint64_t dg_host_end;      // as an owner: the return from the host call or SVC it was in at the request
+    uint64_t dg_pc, dg_lr;     // as an owner: guest pc and lr at the checkpoint that gave the core up
+    int dg_host_kick;          // as an owner: in a host call or SVC at the request
+    struct DgRel { uint64_t kick, host_end, pc, lr; int host, pre, prio; uint32_t h; } dg_rel;   // as a waiter: the
+                                                                                                 // owner that released
 };
 
 static SRWLOCK G = SRWLOCK_INIT;
 static struct { int type; void *obj; } g_h[MAX_H];
 static _Thread_local RtThread *tcur;
 _Static_assert(offsetof(RtThread, preempt) == 0, "host.h kern_preempt_pending reads the first int");
+_Static_assert(offsetof(RtThread, host_depth) == sizeof(int), "host.h kern_host_depth reads the second int");
 static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
 static uint64_t g_main_stack;
@@ -103,7 +115,7 @@ uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
 // ---- TOTK_TRACE=sched accounting (holding G)
 #define RW_N 32
-static RtThread *g_render;                               // the thread that presents
+static RtThread *g_render;                               // the thread that presents (sched trace, core diag)
 static struct { int st; uint64_t obj, ns; } g_rw[RW_N];   // the render thread's waits by object
 static uint64_t g_pre_req, g_pre_n, g_pre_ns, g_pre_max, g_pre_stale;  // preempt requests; releases after one and their latency
 static uint64_t g_sync_calls, g_sync_blocks;              // WaitSynchronization calls and the blocks inside them
@@ -243,18 +255,217 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
 static RtThread *g_core_owner[NCORE], *g_core_wait;
 static int g_cores_on = -1, g_held_max;
 
+static void diag_init(void);
+
 static int cores_enabled(void) {
-    if (g_cores_on < 0) g_cores_on = cfg_get("TOTK_FREE_CORES") ? 0 : 1;
+    if (g_cores_on < 0) {
+        g_cores_on = cfg_get("TOTK_FREE_CORES") ? 0 : 1;
+        diag_init();
+    }
     return g_cores_on;
 }
 
 static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) & 1); }
+
+// ---- TOTK_CORE_DIAG=1: why ready threads wait for a virtual core, and for how long
+// Each core wait is split into classes: the owner asked to give the core up ran game code (DG_GAME, the part an
+// asynchronous preemption would remove), was in a host call or SVC that kept the core (DG_HOST), every owner the waiter
+// may displace was of better or equal priority (DG_EQ: Horizon waits too), or the worse owners were claimed by better
+// waiters (DG_NOCORE). Per 60 presents: time per frame and a wait-length histogram per class, the owners that cost
+// most; a line per present over 25 ms; a line per wait with over 2 ms of DG_GAME (where the owner reached its
+// checkpoint), and one host RIP sample of the owner per such wait (exe RVA, for totk.map).
+enum { DG_GAME, DG_HOST, DG_EQ, DG_NOCORE, DG_N };
+static const char *const dg_name[DG_N] = {"game", "host", "eq", "nocore"};
+#define DG_NB 8   // wait lengths: < 0.05, 0.25, 1, 2, 4, 8, 16 ms, longer
+static const uint64_t dg_edge[DG_NB - 1] = {50000, 250000, 1000000, 2000000, 4000000, 8000000, 16000000};
+#define DG_LONG_LINES 400
+#define DG_SAMPLES 600
+#define DG_OWN 32
+int kern_host_track;
+static int g_diag = -1;
+typedef struct {
+    uint64_t ns[DG_N], n[DG_N], hist[DG_N][DG_NB];                    // this window
+    struct { uint32_t h; int prio, cls; uint64_t ns; } own[DG_OWN];   // this window: owners by class
+    uint64_t long_frames, long_game_frames;
+} DgWindow;
+static DgWindow g_dgw;
+static uint64_t g_dgf[DG_N], g_dgfr[DG_N];   // this frame: all threads, the render thread
+static uint64_t g_dg_samples, g_dg_lines, g_sync36, g_sync36_flag;
+
+static void diag_init(void) {
+    if (g_diag >= 0) return;
+    const char *e = cfg_get("TOTK_CORE_DIAG");
+    g_diag = e && *e && strcmp(e, "0");
+    if (g_diag) {
+        kern_host_track = 1;
+        rt_log("core-diag: on (TOTK_CORE_DIAG)");
+    }
+}
+
+int kern_core_diag_on(void) { return g_diag > 0; }
+
+// A tracked host call or SVC returned to depth 0 with a preempt request pending (host.h); on the thread itself.
+void kern_host_left(void *thread) {
+    RtThread *t = thread;
+    if (g_diag > 0 && t->dg_kick && t->dg_host_kick && !t->dg_host_end) t->dg_host_end = kern_now_ns();
+}
+
+static int dg_in_host(const RtThread *o) { return __atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0; }
+
+static void dg_add(const RtThread *w, int cls, uint64_t ns, uint32_t oh, int oprio) {
+    if (!ns) return;
+    g_dgw.ns[cls] += ns;
+    g_dgf[cls] += ns;
+    if (w == g_render) g_dgfr[cls] += ns;
+    if (!oh) return;
+    int i = 0;
+    for (; i < DG_OWN && g_dgw.own[i].ns; i++)
+        if (g_dgw.own[i].h == oh && g_dgw.own[i].cls == cls) break;
+    if (i == DG_OWN) return;
+    g_dgw.own[i].h = oh;
+    g_dgw.own[i].prio = oprio;
+    g_dgw.own[i].cls = cls;
+    g_dgw.own[i].ns += ns;
+}
+
+// The waiter's class at the start of its wait, after core_kick claimed (or did not claim) an owner for it.
+static int dg_class0(const RtThread *t) {
+    if (t->dg_target) return dg_in_host(t->dg_target) ? DG_HOST : DG_GAME;
+    for (int i = 0; i < NCORE; i++)
+        if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) return DG_NOCORE;
+    return DG_EQ;
+}
+
+// The waiter got a core: split [dg_since, now] by what the owner that released it did after its preempt request.
+static void dg_done(RtThread *t) {
+    uint64_t now = kern_now_ns(), t0 = t->dg_since, w = now - t0;
+    t->dg_since = 0;
+    if (!t0) return;
+    const struct DgRel *r = &t->dg_rel;
+    uint64_t part[DG_N] = {0};
+    uint32_t oh = t->dg_target ? t->dg_target->handle : r->h;
+    int oprio = t->dg_target ? t->dg_target->prio : r->prio;
+    if (r->pre && r->kick) {
+        uint64_t k = r->kick > t0 ? (r->kick < now ? r->kick : now) : t0;
+        part[t->dg_cls] += k - t0;
+        if (r->host) {
+            uint64_t he = r->host_end > k && r->host_end < now ? r->host_end : now;
+            part[DG_HOST] += he - k;
+            part[DG_GAME] += now - he;
+        } else
+            part[DG_GAME] += now - k;
+        oh = r->h;
+        oprio = r->prio;
+    } else
+        part[t->dg_cls] += w;
+    int top = 0;
+    for (int c = 0; c < DG_N; c++) {
+        dg_add(t, c, part[c], oh, oprio);
+        if (part[c] > part[top]) top = c;
+    }
+    int b = 0;
+    while (b < DG_NB - 1 && w >= dg_edge[b]) b++;
+    g_dgw.n[top]++;
+    g_dgw.hist[top][b]++;
+    if (part[DG_GAME] >= 2000000 && g_dg_lines < DG_LONG_LINES) {
+        g_dg_lines++;
+        char a[128], l[128];
+        rt_log("core-diag: wait %.2f ms (game %.2f host %.2f): %#x p%d mask %llx; released by %#x p%d%s at %s lr %s",
+               w / 1e6, part[DG_GAME] / 1e6, part[DG_HOST] / 1e6, t->handle, t->prio, (unsigned long long)t->mask, r->h,
+               r->prio, r->pre ? " (preempted)" : "", r->pc ? ldr_describe(r->pc, a, sizeof a) : "-",
+               r->lr ? ldr_describe(r->lr, l, sizeof l) : "-");
+    }
+    t->dg_target = NULL;
+    memset(&t->dg_rel, 0, sizeof t->dg_rel);
+}
+
+// Once per long DG_GAME wait: where the owner's host thread runs (exe RVA). Holding G; the owner is resumed before
+// anything that could take a lock it holds.
+static void dg_sample(RtThread *t) {
+    RtThread *o = t->dg_target;
+    if (!o || o->cur_core < 0 || !o->tid || g_dg_samples >= DG_SAMPLES) return;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, o->tid);
+    if (!h) return;
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    int depth = 0, ok = 0;
+    if (SuspendThread(h) != (DWORD)-1) {
+        ok = GetThreadContext(h, &ctx);
+        depth = __atomic_load_n(&o->host_depth, __ATOMIC_RELAXED);
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    if (!ok) return;
+    g_dg_samples++;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+    rt_log("core-diag: sample owner %#x p%d depth %d rip exe+%#llx (waiter %#x p%d, %.2f ms)", o->handle, o->prio, depth,
+           (unsigned long long)(ctx.Rip - base), t->handle, t->prio, (kern_now_ns() - t->dg_since) / 1e6);
+}
+
+
+// perf_present, every present: a line for a present over 25 ms, the 60-present summary.
+void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns) {
+    if (g_diag <= 0) return;
+    DgWindow w;
+    uint64_t f[DG_N], fr[DG_N], s36, s36f;
+    lock();
+    g_render = tcur;
+    memcpy(f, g_dgf, sizeof f);
+    memcpy(fr, g_dgfr, sizeof fr);
+    memset(g_dgf, 0, sizeof g_dgf);
+    memset(g_dgfr, 0, sizeof g_dgfr);
+    int lng = interval_ns > 25000000ull;
+    if (lng) {
+        g_dgw.long_frames++;
+        if (f[DG_GAME] > 1000000) g_dgw.long_game_frames++;
+    }
+    int rep = frame && frame % 60 == 0;
+    if (rep) {
+        w = g_dgw;
+        memset(&g_dgw, 0, sizeof g_dgw);
+    }
+    s36 = g_sync36;
+    s36f = g_sync36_flag;
+    unlock();
+    if (lng)
+        rt_log("core-diag: frame %llu: %.1f ms; core wait game %.2f host %.2f eq %.2f nocore %.2f ms; render thread game "
+               "%.2f host %.2f eq %.2f nocore %.2f ms",
+               (unsigned long long)frame, interval_ns / 1e6, f[0] / 1e6, f[1] / 1e6, f[2] / 1e6, f[3] / 1e6,
+               fr[0] / 1e6, fr[1] / 1e6, fr[2] / 1e6, fr[3] / 1e6);
+    if (!rep) return;
+    char s[1024];
+    int o = 0;
+    for (int c = 0; c < DG_N; c++) {
+        o += snprintf(s + o, sizeof s - o, "%s %.3f ms/frame %llu waits [", dg_name[c], w.ns[c] / 60e6,
+                      (unsigned long long)w.n[c]);
+        for (int b = 0; b < DG_NB; b++)
+            o += snprintf(s + o, sizeof s - o, "%s%llu", b ? " " : "", (unsigned long long)w.hist[c][b]);
+        o += snprintf(s + o, sizeof s - o, "]%s", c < DG_N - 1 ? "; " : "");
+    }
+    rt_log("core-diag: frames %llu-%llu: %s; long frames %llu (game wait > 1 ms in %llu); SVC 0x36 %llu (flag set %llu)",
+           (unsigned long long)frame - 59, (unsigned long long)frame, s, (unsigned long long)w.long_frames,
+           (unsigned long long)w.long_game_frames, (unsigned long long)s36, (unsigned long long)s36f);
+    o = 0;
+    for (int k = 0; k < 6; k++) {
+        int bi = -1;
+        for (int i = 0; i < DG_OWN; i++)
+            if (w.own[i].ns && (bi < 0 || w.own[i].ns > w.own[bi].ns)) bi = i;
+        if (bi < 0) break;
+        o += snprintf(s + o, sizeof s - o, " %#x p%d %s %.3f;", w.own[bi].h, w.own[bi].prio, dg_name[w.own[bi].cls],
+                      w.own[bi].ns / 60e6);
+        w.own[bi].ns = 0;
+    }
+    if (o) rt_log("core-diag: owners (ms/frame):%s", s);
+}
 
 static void core_count(void) {
     int n = 0;
     for (int i = 0; i < NCORE; i++) n += g_core_owner[i] != NULL;
     if (n > g_held_max) g_held_max = n;
 }
+
+static struct DgRel g_dg_rel;   // TOTK_CORE_DIAG: the owner core_put is releasing, for core_grant
 
 static void core_grant(int c) {
     RtThread *b = NULL, **bp = NULL;
@@ -269,6 +480,7 @@ static void core_grant(int c) {
     b->cur_core = c;
     g_core_owner[c] = b;
     core_count();
+    if (g_diag > 0) b->dg_rel = g_dg_rel;
     WakeConditionVariable(&b->cv);
 }
 
@@ -283,6 +495,12 @@ static void core_put(RtThread *t) {
         t->npre++;
     }
     t->pre_since = 0;
+    if (g_diag > 0) {
+        g_dg_rel = (struct DgRel){.kick = t->dg_kick, .host_end = t->dg_host_end, .pc = t->dg_pc, .lr = t->dg_lr,
+                                  .host = t->dg_host_kick, .pre = t->preempt, .prio = t->prio, .h = t->handle};
+        t->dg_kick = t->dg_host_end = t->dg_pc = t->dg_lr = 0;
+        t->dg_host_kick = 0;
+    }
     t->cur_core = -1;
     t->preempt = 0;
     g_core_owner[c] = NULL;
@@ -320,12 +538,18 @@ static void core_kick(void) {
         if (v < 0) continue;
         claimed |= 1 << v;
         RtThread *o = g_core_owner[v];
+        w[k]->dg_target = o;
         if (o->preempt) continue;
         if (rt_trace & RT_TRACE_SCHED) {
             o->pre_since = kern_now_ns();
             g_pre_req++;
         }
-        __atomic_store_n(&o->preempt, 1, __ATOMIC_RELAXED);
+        if (g_diag > 0) {
+            o->dg_kick = kern_now_ns();
+            o->dg_host_kick = dg_in_host(o);
+            o->dg_host_end = 0;
+        }
+        __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -351,7 +575,28 @@ static void core_take(RtThread *t) {
     t->cseq = ++g_wseq;
     t->cnext = g_core_wait;
     g_core_wait = t;
+    if (g_diag > 0) {
+        t->dg_since = kern_now_ns();
+        t->dg_target = NULL;
+        memset(&t->dg_rel, 0, sizeof t->dg_rel);
+    }
     core_kick();
+    if (g_diag > 0) {
+        t->dg_cls = dg_class0(t);
+        int sampled = 0;
+        while (t->cur_core < 0) {
+            if (sampled || t->dg_cls != DG_GAME) {
+                SleepConditionVariableSRW(&t->cv, &G, INFINITE, 0);
+                continue;
+            }
+            SleepConditionVariableSRW(&t->cv, &G, 2, 0);
+            if (t->cur_core < 0 && kern_now_ns() - t->dg_since >= 2000000) {
+                sampled = 1;
+                dg_sample(t);
+            }
+        }
+        dg_done(t);
+    }
     while (t->cur_core < 0) SleepConditionVariableSRW(&t->cv, &G, INFINITE, 0);
     acct(t, S_RUN);
 }
@@ -393,12 +638,18 @@ void kern_checkpoint(void) {
     RtThread *t = tcur;
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_RELAXED)) return;
     lock();
+    if (g_diag > 0 && t->cur) {
+        t->dg_pc = t->cur->pc;
+        t->dg_lr = t->cur->x[30];
+    }
     if (t->cur_core >= 0 && core_better_waiter(t, t->cur_core)) {
         core_put(t);   // clears preempt (after the sched trace reads it)
         core_take(t);
     } else {
         t->preempt = 0;
         t->pre_since = 0;
+        t->dg_kick = t->dg_host_end = 0;
+        t->dg_host_kick = 0;
         g_pre_stale++;
     }
     unlock();
@@ -932,6 +1183,16 @@ int kern_svc(Cpu *c, uint32_t imm) {
         x[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core);
         return 1;
     }
+    case 0x36: {   // SynchronizePreemptionState: the SDK's spin locks call it after clearing TLR+0x100 (disable_count)
+                   // when TLR+0x102 (interrupt_flag) is set; rt_svc's checkpoint has already honoured a pending preempt
+        RtThread *t = cur(imm);
+        volatile uint16_t *flag = (volatile uint16_t *)(t->tlr + 0x102);
+        __atomic_fetch_add(&g_sync36, 1, __ATOMIC_RELAXED);
+        if (*flag) __atomic_fetch_add(&g_sync36_flag, 1, __ATOMIC_RELAXED);
+        *flag = 0;
+        x[0] = R_OK;
+        return 1;
+    }
     case 0x25: {   // GetThreadId(w1 handle -> x1)
         lock();
         RtThread *t = h_get((uint32_t)x[1], O_THREAD);
@@ -1299,6 +1560,7 @@ static void WINAPI fiber_main(void *p) {
     Fiber *f = p;
     fiber_resumed();
     Cpu *c = f->cpu;
+    tcur->host_depth = 0;   // a new fiber starts at the top level; each context restores its own depth on resume
     uint64_t next = rt_call(c, f->func, 1, f->arg);
     f->state = F_DONE;
     Fiber *n = NULL;
@@ -1335,7 +1597,9 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     t->leaving = t->fiber;
     t->fiber = to;
     t->cur = dst;
+    int depth = t->host_depth;
     SwitchToFiber(to ? to->host : t->base_fiber);
+    t->host_depth = depth;
     fiber_resumed();
 }
 
