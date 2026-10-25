@@ -238,6 +238,22 @@ static void wait_counted(int why, uint64_t t0) {   // rl held
     perf_end(PERF_DRAIN, t0);
 }
 
+// A guest thread waiting for the replay gives its virtual core up, as around any blocking host wait (NVN_BLOCKING):
+// guest_read (memcpy, pool invalidate), pool and texture finalize run without it, and a drain lasts up to a replay.
+// Called and returning with rl held; rl is not held while the core is taken back.
+static int core_away_unlocked(void) {
+    ReleaseSRWLockExclusive(&rl);
+    int away = kern_core_away();
+    AcquireSRWLockExclusive(&rl);
+    return away;
+}
+static void core_back_unlocked(int *away) {
+    if (!*away) return;
+    ReleaseSRWLockExclusive(&rl);
+    kern_core_back(away);
+    AcquireSRWLockExclusive(&rl);
+}
+
 // Queues an item (waits while the queue is full) and returns its value, reserved under rl so values follow queue order.
 static uint64_t replay_enqueue(ReplayItem *it) {
     AcquireSRWLockExclusive(&rl);
@@ -250,8 +266,10 @@ static uint64_t replay_enqueue(ReplayItem *it) {
     if (rq_n == RQ_CAP) {
         uint64_t p0 = perf_begin();
         dr_calls[DR_FULL]++, dr_tcalls[DR_FULL]++;
+        int away = core_away_unlocked();
         while (rq_n == RQ_CAP) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
         wait_counted(DR_FULL, p0);
+        core_back_unlocked(&away);
     }
     it->value = it->kind == RI_RELEASE ? 0 : vk_sync_reserve();   // a release signals nothing
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
@@ -268,8 +286,10 @@ static void replay_drain(int why) {
     dr_calls[why]++, dr_tcalls[why]++;
     if (rq_n || r_busy) {
         uint64_t p0 = perf_begin();
+        int away = core_away_unlocked();
         while (rq_n || r_busy) SleepConditionVariableSRW(&rcv, &rl, INFINITE, 0);
         wait_counted(why, p0);
+        core_back_unlocked(&away);
     }
     ReleaseSRWLockExclusive(&rl);
 }
