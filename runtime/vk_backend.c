@@ -284,6 +284,13 @@ static void replay_log(uint64_t frame, int total) {
            k ? buf : " no waits");
 }
 
+// The run total, once: the game exits through prof_write (boot.c _exit, the window close), probes through
+// vk_backend_shutdown.
+void gfx_exit_log(void) {
+    static LONG done;
+    if (gfx_replay_async() && r_started && !InterlockedExchange(&done, 1)) replay_log(game_frames, 1);
+}
+
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     vk_sync_start();
     if (!gfx_replay_async()) {
@@ -400,7 +407,7 @@ const GfxBackend gfx_vulkan_backend = {
 
 void vk_backend_shutdown(void) {
     replay_drain(DR_FINISH);
-    if (gfx_replay_async() && r_started) replay_log(game_frames, 1);
+    gfx_exit_log();
     vk_present_drain();
     vk_sync_shutdown();
     vk_mem_shutdown();

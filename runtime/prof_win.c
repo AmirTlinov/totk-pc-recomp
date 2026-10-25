@@ -350,8 +350,13 @@ static void ft_report(uint64_t now, const char *tag) {
     ft.t0 = now;
 }
 
+__attribute__((weak)) void gfx_exit_log(void) {}
+
 void perf_summary_flush(void) {   // at exit (prof_write)
-    if (summary_t0) ft_report(kern_now_ns(), "exit");
+    if (summary_t0) {
+        ft_report(kern_now_ns(), "exit");
+        gfx_exit_log();
+    }
     summary_t0 = 0;
 }
 
