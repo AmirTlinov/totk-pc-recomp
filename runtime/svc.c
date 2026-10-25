@@ -200,11 +200,12 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
         return;
     }
     case 0x29: get_info(c, pc); return;
-    case 0x07: {   // ExitProcess, as closing the window (gfx_window.c WM_CLOSE): pipeline cache and shader records
-                   // saved, logs flushed, exit code 0
+    case 0x07: {   // ExitProcess, as closing the window (gfx_window.c WM_CLOSE): pipeline cache, shader records and
+                   // profile saved, logs flushed, exit code 0
         char at[160];
         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
         vk_pipeline_save();
+        prof_write();
         fflush(NULL);
         if (svc_test_exit_hook) return svc_test_exit_hook(0);
         ExitProcess(0);
