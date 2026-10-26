@@ -47,7 +47,7 @@ void rt_log(const char *fmt, ...) {
 }
 
 static void parse_trace(void) {
-    const char *e = cfg_get("TOTK_TRACE");
+    const char *e = cfg_get("TOTK_TRACE");   // no default: nothing is traced when unset
     if (!e) return;
     static const struct { const char *name; unsigned bit; } names[] = {
         {"svc", RT_TRACE_SVC}, {"host", RT_TRACE_HOSTCALL}, {"ipc", RT_TRACE_IPC}, {"fs", RT_TRACE_FS},
@@ -433,8 +433,7 @@ int main(int argc, char **argv) {
     prof_start();
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
     // costs a full tick. TOTK_TIMER_1MS=0 keeps the default for comparison.
-    const char *tick = cfg_get("TOTK_TIMER_1MS");
-    if (!tick || strcmp(tick, "0")) timeBeginPeriod(1);
+    if (cfg_bool("TOTK_TIMER_1MS")) timeBeginPeriod(1);
     cfg = (RtConfig){.exefs = rt_default_exefs, .romfs = rt_default_romfs, .profile = rt_default_profile,
                      .gpu = cfg_get("TOTK_GPU")};
     portable_paths(&cfg);   // command-line paths below still win

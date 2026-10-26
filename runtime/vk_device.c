@@ -45,8 +45,7 @@ static int create_instance(void) {
     const char *ext[4] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     uint32_t n_ext = 2;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
-    const char *v = cfg_get("TOTK_VK_VALIDATION");
-    int validate = v && *v && *v != '0';
+    int validate = cfg_bool("TOTK_VK_VALIDATION");
     if (validate && !layer_present(layers[0])) {
         rt_log("vk: TOTK_VK_VALIDATION set but %s is not installed; continuing without", layers[0]);
         validate = 0;
@@ -115,7 +114,7 @@ static int pick_device(void) {
     if (!n) { rt_log("vk: no Vulkan device"); return 0; }
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.instance, &n, pd);
-    const char *e = cfg_get("TOTK_GPU_INDEX");
+    const char *e = cfg_get("TOTK_GPU_INDEX");   // no fixed default: the best device when unset
     int want = e && *e ? atoi(e) : -1;
     const char *name = cfg_get("TOTK_GPU_NAME");
     int best = -1, best_score = -1;

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 #include "platform.h"
@@ -236,6 +237,21 @@ int plat_file_truncate(const char *path, uint64_t size) {
     return ok;
 }
 
+int64_t plat_file_size(const char *path) {
+    wchar_t w[WPATH];
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!widen(path, w, WPATH) || !GetFileAttributesExW(w, GetFileExInfoStandard, &d)) return -1;
+    return (int64_t)(((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow);
+}
+
+int plat_file_set_readonly(const char *path, int on) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    DWORD a = GetFileAttributesW(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return 0;
+    return SetFileAttributesW(w, on ? a | FILE_ATTRIBUTE_READONLY : a & ~(DWORD)FILE_ATTRIBUTE_READONLY) != 0;
+}
+
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx) {
     wchar_t wd[WPATH], we[64], pat[WPATH + 64];
     if (!widen(dir, wd, WPATH) || !widen(ext, we, 64)) return 0;
@@ -278,6 +294,41 @@ size_t plat_getenv(const char *name, char *out, size_t cap) {
 }
 
 uint32_t plat_thread_id(void) { return GetCurrentThreadId(); }
+
+const char *plat_ui_language(void) {
+    static char tag[LOCALE_NAME_MAX_LENGTH];
+    static int done;
+    if (!done) {
+        wchar_t w[LOCALE_NAME_MAX_LENGTH];
+        LCID lcid = GetUserDefaultUILanguage();
+        int n = LCIDToLocaleName(lcid, w, LOCALE_NAME_MAX_LENGTH, 0);
+        if (n <= 0 || !WideCharToMultiByte(CP_UTF8, 0, w, -1, tag, sizeof tag, NULL, NULL)) tag[0] = 0;
+        done = 1;
+    }
+    return tag;
+}
+
+int plat_font_path(const char *lang, char *out, size_t cap) {
+    static const struct { const char *lang; const wchar_t *files[3]; } fonts[] = {
+        {"ja", {L"YuGothM.ttc", L"meiryo.ttc", L"msgothic.ttc"}},
+        {"ko", {L"malgun.ttf", L"gulim.ttc", NULL}},
+        {"zh-Hans", {L"msyh.ttc", L"simsun.ttc", NULL}},
+        {"zh-Hant", {L"msjh.ttc", L"mingliu.ttc", NULL}},
+    };
+    wchar_t dir[MAX_PATH], w[WPATH];
+    UINT n = GetWindowsDirectoryW(dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return 0;
+    for (size_t i = 0; i < sizeof fonts / sizeof *fonts; i++) {
+        if (strcmp(fonts[i].lang, lang)) continue;
+        for (int k = 0; k < 3 && fonts[i].files[k]; k++) {
+            swprintf(w, WPATH, L"%ls\\Fonts\\%ls", dir, fonts[i].files[k]);
+            DWORD a = GetFileAttributesW(w);
+            if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY))
+                return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) != 0;
+        }
+    }
+    return 0;
+}
 
 // ---- child processes
 

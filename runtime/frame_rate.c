@@ -72,6 +72,28 @@ void frame_step_init(void) {
 
 int frame_step_realtime(void) { return step_word != NULL; }
 
+// The frame limit (menu: 30 or 60): TOTK_FPS60 switches the set fps60 while the game runs; the controller reads its
+// minimum interval from the patched sites each frame. With the real-time step the pacer holds frames to the cap.
+static int fps60_set = -2;
+static unsigned fps60_seen;
+
+static void frame_limit_live(void) {
+    unsigned v = cfg_version();
+    if (v == fps60_seen) return;
+    fps60_seen = v;
+    if (fps60_set == -2) fps60_set = rt_patch_set("fps60");
+    if (fps60_set < 0) return;
+    int on = cfg_bool("TOTK_FPS60");
+    if (on == rt_patch_enabled(fps60_set)) return;
+    rt_patch_switch(fps60_set, on);
+    rt_log("frame rate: limit %d fps (TOTK_FPS60=%d)", on ? 60 : 30, on);
+}
+
+int frame_step_cap_ticks(void) {
+    if (fps60_set == -2) fps60_set = rt_patch_set("fps60");
+    return fps60_set < 0 || rt_patch_enabled(fps60_set) ? 1 : 2;
+}
+
 // ---- TOTK_TRACE=perf speed lines
 static uint64_t win_t0, win_frames, win_hist[4];   // win_hist: frames by present interval 1, 2, 3+ ([0] unused)
 static double win_game;
@@ -142,6 +164,7 @@ static void speed_report(uint64_t now, double step, int interval) {
 }
 
 void frame_step_present(uint64_t display_ns, int interval) {
+    frame_limit_live();
     double step = 0;
     if (step_word && last_ns) {
         double dt = (double)(display_ns - last_ns) * 1e-9;

@@ -741,8 +741,7 @@ static Tex *entry_of(const tex_t *t) {
     Tex *e = nvn_hm_get(&by_key, &k);
     if (!e) {
         if (tex_alias < 0) {
-            const char *v = cfg_get("TOTK_TEX_ALIAS");
-            tex_alias = !(v && !strcmp(v, "0"));
+            tex_alias = cfg_bool("TOTK_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
         if (!(e = create_tex(t, &k, tex_alias))) return NULL;

@@ -43,8 +43,8 @@ int ov_handheld(void) {
     static volatile LONG v = -1;
     LONG h = v;
     if (h < 0) {
-        const char *e = cfg_get("TOTK_OPERATION_MODE");
-        if (!e || !strcmp(e, "docked")) h = 0;
+        const char *e = cfg_value("TOTK_OPERATION_MODE");
+        if (!strcmp(e, "docked")) h = 0;
         else if (!strcmp(e, "handheld")) h = 1;
         else rt_fatal("TOTK_OPERATION_MODE must be docked or handheld, not '%s'", e);
         if (InterlockedCompareExchange(&v, h, -1) == -1)
@@ -92,7 +92,7 @@ static const char *switch_language(const char *tag) {
 const char *ov_language(void) {
     static const char *const codes[] = {"ja", "en-US", "fr", "de", "it", "es", "zh-CN", "ko", "nl", "pt", "ru",
                                         "zh-TW", "en-GB", "fr-CA", "es-419", "zh-Hans", "zh-Hant", "pt-BR"};
-    const char *code = cfg_get("TOTK_LANG");
+    const char *code = cfg_get("TOTK_LANG");   // no fixed default: TOTK_LOCALE or the Windows user locale decides when unset
     if (code && *code) {
         for (size_t i = 0; i < sizeof codes / sizeof *codes; i++)
             if (!strcmp(code, codes[i])) return codes[i];

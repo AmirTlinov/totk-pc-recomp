@@ -599,8 +599,7 @@ static uint64_t n_parts, n_subs;
 
 static void maybe_split(VkExec *ex) {
     if (split_n < 0) {
-        const char *e = cfg_get("TOTK_SPLIT_DRAWS");
-        split_n = e ? atoi(e) : 64;
+        split_n = cfg_int("TOTK_SPLIT_DRAWS");
         if (split_n < 0) split_n = 0;
         rt_log("vk: replay command buffer split every %d draws between passes%s", split_n, split_n ? "" : " (off)");
     }

@@ -58,13 +58,20 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n);
 int plat_file_flush(const char *path);                   // flushes a written file's data to the disk; 1 on success
 void plat_file_delete(const char *path);
 int plat_file_truncate(const char *path, uint64_t size);  // 1 on success
+int64_t plat_file_size(const char *path);                 // bytes of a file, -1 when missing or unreadable
+int plat_file_set_readonly(const char *path, int on);     // sets or clears the read-only attribute; 1 on success
 // Calls cb(name, ctx) for each file in dir whose name ends in ext (".in"); name has no directory part. cb returns 0 to
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);
 int plat_exe_path(char *out, size_t cap);                 // path of the running executable; 0 on failure
 // Environment variable as UTF-8 into out; its length, or 0 when unset, empty or too long for cap.
 size_t plat_getenv(const char *name, char *out, size_t cap);
+// The user's UI language as a BCP-47 tag ("ru-RU", "en-US"); "" when the system gives none. Valid for the process.
+const char *plat_ui_language(void);
 uint32_t plat_thread_id(void);                            // id of the calling thread, for unique file names
+// A system font file with the glyphs of a catalog language ("ja", "ko", "zh-Hans", "zh-Hant"): the menu shows each
+// language's name in its own script. Copies the UTF-8 path into out; 0 when the system has none.
+int plat_font_path(const char *lang, char *out, size_t cap);
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;

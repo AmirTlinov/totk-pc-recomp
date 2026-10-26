@@ -908,7 +908,7 @@ int probe_vkexec(void) {
            nvnx_bytes);
     printf("probe-vkexec: c0 and zero parts passed (c0 tables, dispatch size, point size and base instance at their offsets, "
            "unbound slots zero; %d bytes of an unwritten physical-pool texture read zero, TOTK_FIX_ZERO=%s)\n",
-           zero_bytes, cfg_get("TOTK_FIX_ZERO") ? cfg_get("TOTK_FIX_ZERO") : "1");
+           zero_bytes, cfg_value("TOTK_FIX_ZERO"));
     if (vk_mirror_on)
         printf("probe-vkexec: mirror part passed (B2B and fill in a VRAM mirror written back by the fence, a CPU write "
                "between submissions mirrored, CPU bytes beside a fill kept, %d bytes compared)\n", mirror_bytes);

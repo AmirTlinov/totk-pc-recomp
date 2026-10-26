@@ -1,7 +1,8 @@
 // Code patch sets (recomp/patches.py, gen.py --patches). The generator lifts both the original and the replacement
 // instructions of every patched site, and rt_patch_on[set] picks one when the site runs, so a set is switched at start
-// without touching code. The sets, their environment switches and defaults, and the patch page come from the generated
-// patches.h; without it (C generated without --patches) there are no sets and every site runs the original.
+// without touching code, and also while the game runs (rt_patch_switch: the frame-limit setting of the menu). The sets,
+// their environment switches and defaults, and the patch page come from the generated patches.h; without it (C
+// generated without --patches) there are no sets and every site runs the original.
 //
 // The patch page is the first 4 KiB page after main's image, inside the module window memory.c reserved: replacement
 // code reaches it with one adrp, as MacNativeGames' data page after main (games/totk/runtime/game_patches.c). Its
@@ -44,7 +45,8 @@ void rt_patches_init(void) {
     list[0] = 0;
     for (int i = 0; i < RT_PATCH_COUNT; i++) {
         const char *e = cfg_get(sets[i].env);
-        rt_patch_on[i] = (uint8_t)(e && *e ? strcmp(e, "0") != 0 : sets[i].on);
+        // a set with a row in the settings table takes its default from there; the generated default serves the rest
+        rt_patch_on[i] = (uint8_t)(cfg_meta(sets[i].env) ? cfg_bool(sets[i].env) : e && *e ? strcmp(e, "0") != 0 : sets[i].on);
         n += (size_t)snprintf(list + n, sizeof list - n, "%s%s %s", i ? ", " : "", sets[i].name,
                               rt_patch_on[i] ? "on" : "off");
         if (n >= sizeof list) n = sizeof list - 1;
@@ -66,6 +68,10 @@ int rt_patch_enabled(int set) { return set >= 0 && set < RT_PATCH_COUNT && rt_pa
 
 void rt_patch_disable(int set) {
     if (set >= 0 && set < RT_PATCH_COUNT) rt_patch_on[set] = 0;
+}
+
+void rt_patch_switch(int set, int on) {
+    if (set >= 0 && set < RT_PATCH_COUNT) __atomic_store_n(&rt_patch_on[set], (uint8_t)(on != 0), __ATOMIC_RELAXED);
 }
 
 void *rt_patch_page(void) {

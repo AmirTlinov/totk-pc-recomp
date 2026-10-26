@@ -55,6 +55,19 @@ typedef struct Mixer {
 } Mixer;
 
 static _Atomic float device_volume = 1.0f;
+
+// TOTK_VOLUME: the player's volume in percent (0..100) on top of the game's own; a live setting (the
+// menu), parsed again when cfg_version changes. Render thread only.
+static float host_volume(void) {
+    static float v = 1.0f;
+    static unsigned seen = ~0u;
+    unsigned ver = cfg_version();
+    if (ver == seen) return v;
+    seen = ver;
+    double pct = cfg_double("TOTK_VOLUME");
+    v = (float)((pct < 0 ? 0 : pct > 100 ? 100 : pct) / 100);
+    return v;
+}
 static unsigned audio_revision(const AudioRenderer *r) { unsigned byte = r->revision >> 24; return byte >= '0' ? byte - '0' : 0; }
 static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
     if (m->reported & (1u << bit)) return;
@@ -741,7 +754,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
     float *lr=m->output_scratch;
     memset(lr, 0, sizeof(float) * 2 * (size_t)frames);
     if (sink && sink->input_count >= 1 && sink->input_count <= 6) {
-        const float gain = atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
+        const float gain = host_volume() * atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
         const float *ch[6] = {0};
         for (uint32_t c = 0; c < sink->input_count; c++) if (sink->inputs[c] >= 0 && sink->inputs[c] < m->nbuf) ch[c] = mixbuf(m, sink->inputs[c]);
         for (int k = 0; k < frames; k++) {

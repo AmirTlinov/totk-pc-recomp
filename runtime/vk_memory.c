@@ -213,8 +213,7 @@ static int alloc_physical(VkCtx *c, PoolRec *r) {
 int vk_fix_zero(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = cfg_get("TOTK_FIX_ZERO");
-        on = !(e && !strcmp(e, "0"));
+        on = cfg_bool("TOTK_FIX_ZERO");
     }
     return on;
 }
@@ -969,10 +968,10 @@ static volatile LONG64 m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_byte
 static volatile LONG64 m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
 static void mirror_mode(int discrete) {
-    const char *e = cfg_get("TOTK_MEMORY");
+    const char *e = cfg_value("TOTK_MEMORY");
     int mode = discrete ? 1 : 0;   // 0 import, 1 mirror, 2 verify
     const char *why = discrete ? "auto, discrete gpu" : "auto, uma";
-    if (e && *e && strcmp(e, "auto")) {
+    if (strcmp(e, "auto")) {
         if (!strcmp(e, "import")) mode = 0, why = "TOTK_MEMORY=import";
         else if (!strcmp(e, "mirror")) mode = 1, why = "TOTK_MEMORY=mirror";
         else if (!strcmp(e, "verify")) mode = 2, why = "TOTK_MEMORY=verify";

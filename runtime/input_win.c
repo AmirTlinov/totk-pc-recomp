@@ -16,6 +16,7 @@
 #include "input.h"
 #include "input_map.h"
 #include "nvn_api.h"
+#include "ui/menu.h"
 #include "vk.h"
 
 enum { STICK_MAX = 32767, STICK_DEAD = 2500, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
@@ -133,7 +134,7 @@ static void rec_flush_all(void) {
 
 static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
     if (!rec_state) {
-        const char *path = cfg_get("TOTK_INPUT_RECORD");
+        const char *path = cfg_get("TOTK_INPUT_RECORD");   // no default: not recording when unset
         rec = path && *path ? fopen(path, "w") : NULL;
         rec_state = rec ? 1 : -1;
         if (path && *path && !rec) rt_log("input: cannot open TOTK_INPUT_RECORD %s", path);
@@ -190,29 +191,41 @@ static int key_vk(int key) {
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
-static volatile LONG cur_released;         // Esc, or activation by a click on the title bar or border: until a client click
+// Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
+// by Esc (not when it was already set): closing the menu gives the capture back. One word, changed by one CAS.
+enum { CUR_REL = 1, CUR_ESC = 2 };
+static volatile LONG cur_rel;
+static void cur_rel_update(LONG (*f)(LONG)) {
+    LONG o, n;
+    do { o = cur_rel; n = f(o); } while (n != o && InterlockedCompareExchange(&cur_rel, n, o) != o);
+}
+static LONG rel_esc(LONG o) { return o & CUR_REL ? o : CUR_REL | CUR_ESC; }
+static LONG rel_title(LONG o) { (void)o; return CUR_REL; }
+static LONG rel_clear(LONG o) { (void)o; return 0; }
+static LONG rel_menu_closed(LONG o) { return o & CUR_ESC ? 0 : o; }
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
-static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off, read once
+static volatile LONG g_menu;               // in-game menu state, see input_menu
+static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off; live (cfg_version)
+static unsigned mouse_sens_seen;
 
 static float mouse_sens_get(void) {
-    if (mouse_sens >= 0) return mouse_sens;
-    const char *e = cfg_get("TOTK_MOUSE_SENS");
-    char *end;
-    double v = e ? strtod(e, &end) : 1;
-    if (!e || end == e || *end || v != v) v = 1;
+    unsigned ver = cfg_version();
+    if (mouse_sens >= 0 && ver == mouse_sens_seen) return mouse_sens;
+    mouse_sens_seen = ver;
+    double v = cfg_double("TOTK_MOUSE_SENS");
     mouse_sens = (float)(v < 0 ? 0 : v > 10 ? 10 : v);
     return mouse_sens;
 }
 
 // Hide the cursor and confine it to the client area while the window is focused, not suspended, not behind a text entry
-// and the mouse camera is on; release it otherwise. Safe from any thread.
+// or the menu, and the mouse camera is on; release it otherwise. Safe from any thread.
 static void cursor_update(HWND h) {
     const char *in = cfg_get("TOTK_INPUT");
     AcquireSRWLockExclusive(&cur_lock);
-    int want = h && cur_active && !cur_released && !cur_suspend && g_block != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) &&
-               GetForegroundWindow() == h && !IsIconic(h);
+    int want = h && cur_active && !(cur_rel & CUR_REL) && !cur_suspend && g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 &&
+               !(in && !strcmp(in, "none")) && GetForegroundWindow() == h && !IsIconic(h);
     RECT r;
     POINT tl = {0, 0};
     if (want && GetClientRect(h, &r) && ClientToScreen(h, &tl)) {
@@ -227,7 +240,7 @@ static void cursor_update(HWND h) {
     ReleaseSRWLockExclusive(&cur_lock);
 }
 
-int input_cursor_released(void) { return cur_released != 0; }
+int input_cursor_released(void) { return (cur_rel & CUR_REL) != 0; }
 
 void input_cursor_suspend(int on) {
     InterlockedExchange(&cur_suspend, on != 0);
@@ -255,17 +268,17 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_SETCURSOR:
         if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
         break;
-    case WM_KEYDOWN:   // Esc is unbound in the game layout, so it only releases the cursor
-        if (w == VK_ESCAPE) { InterlockedExchange(&cur_released, 1); cursor_update(h); }
+    case WM_KEYDOWN:   // Esc is unbound in the game layout: it releases the cursor and opens the menu (menu_window_msg)
+        if (w == VK_ESCAPE && !(cur_rel & CUR_REL)) { cur_rel_update(rel_esc); cursor_update(h); }
         break;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
-        if (cur_released) { InterlockedExchange(&cur_released, 0); cursor_update(h); }
+        if (cur_rel & CUR_REL) { cur_rel_update(rel_clear); cursor_update(h); }
         break;
     case WM_MOUSEACTIVATE:   // sent before WM_ACTIVATEAPP: a title bar or border click must not capture
-        if (LOWORD(l) != HTCLIENT) InterlockedExchange(&cur_released, 1);
+        if (LOWORD(l) != HTCLIENT) cur_rel_update(rel_title);
         break;
     case WM_ACTIVATEAPP:
-        if (!w) InterlockedExchange(&cur_released, 0);   // Alt+Tab back in captures again
+        if (!w) cur_rel_update(rel_clear);   // Alt+Tab back in captures again
         InterlockedExchange(&cur_active, w != 0);
         cursor_update(h);
         break;
@@ -362,27 +375,30 @@ static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     if (b > a) { *x = kx; *y = ky; }
 }
 
+// Under lock, state 1: the open gamepad's buttons (Switch bits after the TOTK_BIND_* layout) and sticks; 0 without a
+// connected gamepad.
+static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+    if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
+    SDL_UpdateGamepads();
+    if (!pad || !SDL_GamepadConnected(pad)) return 0;
+    uint8_t pd[PAD_COUNT] = {0};
+    for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
+    pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    *b |= input_map_pad_buttons(pd);
+    sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
+    sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
+    sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
+    sr[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+    return 1;
+}
+
 static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (state > 0) {
-        if (state == 1) {
-            if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
-            SDL_UpdateGamepads();
-            if (pad && SDL_GamepadConnected(pad)) {
-                uint8_t pd[PAD_COUNT] = {0};
-                for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
-                pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
-                pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
-                b |= input_map_pad_buttons(pd);
-                sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
-                sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
-                sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
-                sr[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
-            }
-        }
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
             uint8_t down[KEY_COUNT] = {0};
@@ -412,7 +428,13 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     }
     script_apply(&b, sl, sr);
     rec_apply(b, sl, sr);
+    // Minus and Plus held together (gamepad or keys) open or close the menu and never reach the game
+    static int combo_held;
+    int32_t st[4] = {sl[0], sl[1], sr[0], sr[1]};
+    int toggle = input_menu_gate(&combo_held, menu_is_open(), &b, st);
+    sl[0] = st[0], sl[1] = st[1], sr[0] = st[2], sr[1] = st[3];
     ReleaseSRWLockExclusive(&lock);
+    if (toggle) menu_toggle();
     stick_bits(&b, sl[0], sl[1], B_SL_LEFT);
     stick_bits(&b, sr[0], sr[1], B_SR_LEFT);
     *buttons = b; *lx = sl[0]; *ly = sl[1]; *rx = sr[0]; *ry = sr[1];
@@ -426,15 +448,42 @@ void input_block(int on) {
     cursor_update(gfx_window_handle());
 }
 
+// The in-game menu (ui/menu.cpp) blocks the game's input the same way: g_menu 0 closed, 1 open, 2 closed, waiting for
+// the release. The cursor is released while it is open, for the menu's mouse.
+void input_menu(int open) {
+    InterlockedExchange(&g_menu, open ? 1 : 2);
+    if (!open) cur_rel_update(rel_menu_closed);   // the capture before Esc comes back
+    cursor_update(gfx_window_handle());
+}
+
+// 1 while flag (g_block, g_menu) blocks the game's input; state 2 ends at the first poll with nothing held.
+static int blocked(volatile LONG *flag, uint64_t buttons) {
+    LONG k = *flag;
+    return k && !(k == 2 && !buttons && InterlockedCompareExchange(flag, 0, 2) == 2);
+}
+
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
-    LONG k = g_block;
-    if (!k || (k == 2 && !*buttons && InterlockedCompareExchange(&g_block, 0, 2) == 2)) return;
+    int text = blocked(&g_block, *buttons), menu = blocked(&g_menu, *buttons);
+    if (!text && !menu) return;
     *buttons = 0; *lx = *ly = *rx = *ry = 0;
 }
 
 void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
+}
+
+int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    uint64_t b = 0;
+    int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
+    AcquireSRWLockExclusive(&lock);
+    if (!state) start();
+    int ok = state == 1 && pad_read(&b, sl, sr);
+    ReleaseSRWLockExclusive(&lock);
+    *buttons = b;
+    *lx = sl[0];
+    *ly = sl[1];
+    return ok;
 }
 
 uint16_t rumble_motor(float a, float curve, float strength) {
@@ -444,14 +493,14 @@ uint16_t rumble_motor(float a, float curve, float strength) {
 }
 
 int input_rumble_triggers_enabled(void) {
-    const char *e = cfg_get("TOTK_RUMBLE_TRIGGERS");
-    return e && !strcmp(e, "1");
+    return cfg_bool("TOTK_RUMBLE_TRIGGERS");
 }
 
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     int ok = 0;
     static int triggers = -1;
-    if (triggers < 0) triggers = input_rumble_triggers_enabled();
+    static unsigned seen;
+    if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
     AcquireSRWLockExclusive(&lock);
     if (state == 1 && pad && pad_rumble) {
         ok = SDL_RumbleGamepad(pad, low, high, ms);
@@ -495,8 +544,20 @@ static int sensors_ready(void) {
     return sensor_ok;
 }
 
+int input_motion_enabled(void) {
+    static int on = -1;
+    static unsigned seen;
+    unsigned v = cfg_version();
+    if (on < 0 || v != seen) {
+        seen = v;
+        on = cfg_bool("TOTK_MOTION");
+    }
+    return on;
+}
+
 // 250 Hz: the gamepads update (reports read, rumble expiry) and the newest gyro and accelerometer sample goes into the
-// fusion. Without a gamepad with sensors nothing is fed and the six-axis sensor reads at rest.
+// fusion. Without a gamepad with sensors, or with motion off (TOTK_MOTION=0, live), nothing is fed and the six-axis
+// sensor reads at rest.
 static DWORD WINAPI motion_main(void *arg) {
     (void)arg;
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -515,7 +576,7 @@ static DWORD WINAPI motion_main(void *arg) {
                    SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
         }
         ReleaseSRWLockExclusive(&lock);
-        if (!have) continue;
+        if (!have || !input_motion_enabled()) continue;
         double acc[3], gyro[3];
         input_motion_axes(a, g, acc, gyro);
         motion_feed(motion_global(), acc, gyro, kern_now_ns());
@@ -527,9 +588,8 @@ void input_motion_start(void) {
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (!motion_thread) {
-        const char *e = cfg_get("TOTK_MOTION");
-        if (e && !strcmp(e, "0")) { motion_thread = -1; rt_log("input: motion off (TOTK_MOTION=0)"); }
-        else if (state != 1) motion_thread = -1;
+        if (!input_motion_enabled()) rt_log("input: motion off (TOTK_MOTION=0); it can be turned on while the game runs");
+        if (state != 1) motion_thread = -1;
         else {
             HANDLE h = CreateThread(NULL, 0, motion_main, NULL, 0, NULL);
             if (!h) rt_fatal("input: motion thread CreateThread failed (error %lu)", GetLastError());

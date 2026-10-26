@@ -8,6 +8,10 @@
 // bound system events. Presents come from any host thread (the back end's present worker) and take g_pl; every queue
 // submission takes the recursive queue lock (vk_queue_lock). The swapchain is rebuilt lazily: WM_SIZE only marks it
 // dirty, the next present (or gfx_window_resize) rebuilds it.
+//
+// The in-game menu (ui/menu.h) draws over the game image in the present's command buffer, after the blit; its keyboard
+// and mouse come from the window procedure (ui/menu_win.cpp). The window's size and fullscreen state are the settings
+// TOTK_WINDOW_SIZE and TOTK_FULLSCREEN, applied at start and whenever a cfg_set changes them (window_settings_live).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +21,8 @@
 #include "flight.h"
 #include "gfx.h"
 #include "input.h"
+#include "nvn_api.h"
+#include "ui/menu.h"
 #include "vk.h"
 
 #define FRAMES 2
@@ -39,6 +45,7 @@ static volatile LONG g_focused = 1;
 static volatile LONG g_focus_msgs;
 static CRITICAL_SECTION g_start_lock;       // gfx_window_start / vsync start
 static int g_started, g_wnd_failed;
+static int g_background;                   // TOTK_BACKGROUND_WINDOW: the window stays behind the user's windows
 
 // ---- swapchain and present state (g_pl)
 static CRITICAL_SECTION g_pl;
@@ -47,6 +54,7 @@ static VkFormat g_sc_fmt;
 static VkExtent2D g_sc_ext;
 static uint32_t g_sc_n;
 static VkImage g_sc_img[MAX_IMAGES];
+static VkImageView g_sc_view[MAX_IMAGES];   // colour attachment views for the menu overlay
 static VkSemaphore g_render_done[MAX_IMAGES];
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cb[FRAMES];
@@ -171,37 +179,141 @@ HWND gfx_window_handle(void) { return g_hwnd; }
 
 // ---- window thread
 #define WND_STYLE WS_OVERLAPPEDWINDOW
+#define WM_APP_SETTINGS (WM_APP + 1)
+
+static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
+
+static int is_fullscreen(HWND h) { return !(GetWindowLongW(h, GWL_STYLE) & WS_OVERLAPPEDWINDOW); }
+
+// TOTK_FULLSCREEN=1: borderless window over the monitor. TOTK_WINDOW_SIZE=<w>x<h>: client area of the window (the
+// swapchain follows the window; the game image is scaled to it).
+static int cfg_fullscreen(void) {
+    return cfg_bool("TOTK_FULLSCREEN");
+}
+
+static void cfg_window_size(int *w, int *h) {
+    int x = 0, y = 0;
+    if (sscanf(cfg_value("TOTK_WINDOW_SIZE"), "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320)
+        sscanf(cfg_meta("WINDOW_SIZE")->def, "%dx%d", &x, &y);   // unparsable or out of range: the default
+    *w = x;
+    *h = y;
+}
 
 // F11: borderless window over the whole monitor, and back to the saved window. The swapchain follows through WM_SIZE.
-// Not Alt+Enter: Enter is the Plus button (input_win.c).
+// Not Alt+Enter: Enter is the Plus button (input_win.c). A background window (test runs) keeps its place behind the
+// user's windows and takes no focus.
 static void toggle_fullscreen(HWND h) {
-    static WINDOWPLACEMENT saved = {sizeof saved};
     LONG style = GetWindowLongW(h, GWL_STYLE);
     if (style & WS_OVERLAPPEDWINDOW) {
         MONITORINFO mi = {sizeof mi};
-        if (!GetWindowPlacement(h, &saved) || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
+        if (!GetWindowPlacement(h, &g_saved_place) || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
             return;
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
     } else {
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WND_STYLE);
-        SetWindowPlacement(h, &saved);
-        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        if (g_background) g_saved_place.showCmd = SW_SHOWNOACTIVATE;
+        SetWindowPlacement(h, &g_saved_place);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
+                         (g_background ? SWP_NOACTIVATE : 0));
     }
+}
+
+// The window size and fullscreen state last taken from the settings (window thread). apply_settings acts on a change of
+// either value only, so a window resized by hand keeps its size when another setting changes.
+static char g_applied_size[32];
+static int g_applied_fs;
+
+static void note_applied(void) {
+    snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("TOTK_WINDOW_SIZE"));
+    g_applied_fs = cfg_fullscreen();
+}
+
+// Window thread: the window takes the size and fullscreen state of the settings when they changed. In fullscreen the
+// size goes into the placement restored when fullscreen ends.
+static void apply_settings(HWND h) {
+    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
+    note_applied();
+    if (size_changed) {
+        int cw, ch;
+        cfg_window_size(&cw, &ch);
+        RECT r = {0, 0, cw, ch};
+        AdjustWindowRect(&r, WND_STYLE, FALSE);
+        if (is_fullscreen(h)) {
+            RECT *n = &g_saved_place.rcNormalPosition;
+            n->right = n->left + (r.right - r.left);
+            n->bottom = n->top + (r.bottom - r.top);
+        } else {
+            RECT have;
+            if (GetClientRect(h, &have) && (have.right != cw || have.bottom != ch)) {
+                if (IsZoomed(h)) ShowWindow(h, SW_RESTORE);
+                SetWindowPos(h, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    }
+    if (fs_changed && fs != is_fullscreen(h)) {
+        input_cursor_suspend(1);
+        toggle_fullscreen(h);
+        input_cursor_suspend(0);
+    }
+}
+
+void gfx_window_apply_settings(void) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_SETTINGS, 0, 0);
+}
+
+// Present path (g_pl held): a settings change (cfg_version) reaches the window thread, which applies a changed size or
+// fullscreen; a changed TOTK_VK_PRESENT rebuilds the swapchain at this present.
+static void window_settings_live(void) {
+    static unsigned seen;
+    static int started;
+    static char present[16];   // the TOTK_VK_PRESENT the swapchain was made with
+    unsigned v = cfg_version();
+    if (started && v == seen) return;
+    seen = v;
+    const char *e = cfg_value("TOTK_VK_PRESENT");
+    if (!started || strncmp(e, present, sizeof present - 1)) {
+        snprintf(present, sizeof present, "%s", e);
+        if (started) InterlockedExchange(&g_dirty, 1);
+    }
+    if (started) gfx_window_apply_settings();
+    started = 1;
+}
+
+void gfx_window_request_close(void) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+}
+
+int gfx_window_monitor_size(int *w, int *h) {
+    MONITORINFO mi = {sizeof mi};
+    if (!g_hwnd || !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return 0;
+    *w = mi.rcMonitor.right - mi.rcMonitor.left;
+    *h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    return 1;
 }
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
+    if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
             input_cursor_suspend(1);
             toggle_fullscreen(h);
             input_cursor_suspend(0);
+            cfg_set("TOTK_FULLSCREEN", is_fullscreen(h) ? "1" : "0");   // the menu shows it; the next start keeps it
+            cfg_save();
+            note_applied();   // what cfg_get reads now (the environment may still override it)
         }
         break;
+    case WM_APP_SETTINGS:
+        apply_settings(h);
+        return 0;
     case WM_SIZE:
         if (w != SIZE_MINIMIZED) InterlockedExchange(&g_dirty, 1);
         return 0;
@@ -231,11 +343,13 @@ static DWORD WINAPI window_main(void *arg) {
     WNDCLASSEXW wc = {.cbSize = sizeof wc, .lpfnWndProc = wnd_proc, .hInstance = inst,
                       .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
     RegisterClassExW(&wc);
-    RECT r = {0, 0, 1920, 1080};
+    int cw, ch;
+    cfg_window_size(&cw, &ch);
+    RECT r = {0, 0, cw, ch};
     AdjustWindowRect(&r, WND_STYLE, FALSE);
     // TOTK_BACKGROUND_WINDOW=1 (test runs): the window opens behind the user's windows without taking focus; it keeps its
-    // taskbar button and can be brought up by hand.
-    int background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
+    // taskbar button and can be brought up by hand. It never goes fullscreen at start.
+    int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT,
                              r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!g_hwnd) {
@@ -246,6 +360,8 @@ static DWORD WINAPI window_main(void *arg) {
             SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         else
             ShowWindow(g_hwnd, cfg_get("TOTK_ASSUME_FOCUS") ? SW_SHOWNOACTIVATE : SW_SHOW);   // scripted runs leave focus alone
+        if (!background && cfg_fullscreen()) toggle_fullscreen(g_hwnd);
+        note_applied();
     }
     SetEvent(g_wnd_ready);
     if (g_wnd_failed) return 1;
@@ -259,16 +375,23 @@ static DWORD WINAPI window_main(void *arg) {
 
 // ---- swapchain
 static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
-    const char *e = cfg_get("TOTK_VK_PRESENT");
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+    const char *e = cfg_value("TOTK_VK_PRESENT");
+    VkPresentModeKHR want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, NULL);
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
-    return VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR got = VK_PRESENT_MODE_FIFO_KHR;
+    for (uint32_t i = 0; i < n; i++) if (m[i] == want) got = want;
+    static int logged = -1;   // the mode last logged: a change from the menu shows in the log
+    if ((int)got != logged) {
+        logged = (int)got;
+        rt_log("gfx: present mode %s (TOTK_VK_PRESENT=%s)",
+               got == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : got == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo", e);
+    }
+    return got;
 }
 
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
@@ -329,7 +452,8 @@ static int create_swapchain(void) {
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface, .minImageCount = count,
         .imageFormat = sf.format, .imageColorSpace = sf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,   // every surface supports it (the menu overlay draws into it)
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(c->phys), .clipped = VK_TRUE,
         .oldSwapchain = old};
@@ -340,14 +464,24 @@ static int create_swapchain(void) {
         vk_queue_unlock();
         return 0;
     }
-    for (uint32_t i = 0; i < g_sc_n; i++) vkDestroySemaphore(c->device, g_render_done[i], NULL);
+    for (uint32_t i = 0; i < g_sc_n; i++) {
+        vkDestroySemaphore(c->device, g_render_done[i], NULL);
+        if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
+        g_sc_view[i] = VK_NULL_HANDLE;
+    }
     if (old) vkDestroySwapchainKHR(c->device, old, NULL);
     g_sc_fmt = sf.format;
     g_sc_ext = ext;
     g_sc_n = MAX_IMAGES;
     vkGetSwapchainImagesKHR(c->device, g_sc, &g_sc_n, g_sc_img);
     VkSemaphoreCreateInfo semi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    for (uint32_t i = 0; i < g_sc_n; i++) vkCreateSemaphore(c->device, &semi, NULL, &g_render_done[i]);
+    for (uint32_t i = 0; i < g_sc_n; i++) {
+        vkCreateSemaphore(c->device, &semi, NULL, &g_render_done[i]);
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_sc_img[i],
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &g_sc_view[i]) != VK_SUCCESS) g_sc_view[i] = VK_NULL_HANDLE;
+    }
     free_capture();
     vk_queue_unlock();
     InterlockedExchange(&g_dirty, 0);
@@ -505,6 +639,23 @@ int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
     return ok;
 }
 
+// The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha.
+static void save_capture(const char *path) {
+    size_t n = (size_t)g_cap_w * (size_t)g_cap_h * 4;
+    uint8_t *px = malloc(n);
+    if (!px) return;
+    int bgra = g_sc_fmt == VK_FORMAT_B8G8R8A8_UNORM || g_sc_fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    for (size_t i = 0; i < n; i += 4) {
+        px[i] = g_cap_ptr[i + (bgra ? 2 : 0)];
+        px[i + 1] = g_cap_ptr[i + 1];
+        px[i + 2] = g_cap_ptr[i + (bgra ? 0 : 2)];
+        px[i + 3] = 255;
+    }
+    rt_write_png(path, px, (uint32_t)g_cap_w, (uint32_t)g_cap_h);
+    free(px);
+    rt_log("gfx: menu test shot %s (%dx%d)", path, g_cap_w, g_cap_h);
+}
+
 static void present_image(VkImage src, VkImageLayout layout, int w, int h, const int crop[4], int defer) {
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     gfx_window_start();
@@ -542,7 +693,14 @@ static void present_image(VkImage src, VkImageLayout layout, int w, int h, const
     if (cy < 0) cy = 0;
     if (cx + cw > w) cw = w - cx;
     if (cy + ch > h) ch = h - cy;
-    int cap = g_capture && ensure_capture_buffer();
+    window_settings_live();
+    // The menu overlay: laid out before recording (its first frame starts the ImGui back end and uploads the font)
+    const char *menu_shot = NULL;
+    MenuTarget mt = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue, g_sc_fmt, g_sc_ext.width,
+                     g_sc_ext.height};
+    int overlay = g_sc_view[idx] &&
+                  menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot);
+    int cap = (g_capture || menu_shot) && ensure_capture_buffer();
     int thumb = g_th_n && ensure_thumbs();
 
     VkCommandBuffer cb = g_cb[slot];
@@ -564,25 +722,46 @@ static void present_image(VkImage src, VkImageLayout layout, int w, int h, const
     if (general)   // later submissions that write the source wait for the blit's read
         sync_barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+    // last: the image's layout, and the stage and access of its last write, as each step leaves it
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    VkAccessFlags2 last_write = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    if (overlay) {
+        sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, last_stage, last_write,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_sc_view[idx],
+                                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, g_sc_ext}, .layerCount = 1,
+                              .colorAttachmentCount = 1, .pColorAttachments = &ca};
+        vkCmdBeginRendering(cb, &ri);
+        menu_overlay_draw(cb);
+        vkCmdEndRendering(cb);
+        last = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    }
     if (cap) {
-        sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                     VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageExtent = {g_sc_ext.width, g_sc_ext.height, 1}};
         vkCmdCopyImageToBuffer(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_cap_buf, 1, &bc);
         last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        last_write = 0;
     }
     if (thumb) {
         if (last != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-            sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        last_write = 0;
         record_thumb(cb, dst, slot);
     }
-    sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                 last == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ? VK_ACCESS_2_TRANSFER_WRITE_BIT : 0,
-                 VK_PIPELINE_STAGE_2_NONE, 0);
+    sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vkEndCommandBuffer(cb);
 
     VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
@@ -610,6 +789,7 @@ static void present_image(VkImage src, VkImageLayout layout, int w, int h, const
         g_cap_w = (int)g_sc_ext.width;
         g_cap_h = (int)g_sc_ext.height;
         g_cap_valid = 1;
+        if (menu_shot) save_capture(menu_shot);
     }
 out:
     LeaveCriticalSection(&g_pl);
@@ -649,13 +829,18 @@ void gfx_window_release_vk(void) {
         vkDeviceWaitIdle(c->device);
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
+        menu_vk_release();
         free_capture();
         free_thumbs();
         for (int i = 0; i < FRAMES; i++) {
             vkDestroySemaphore(c->device, g_acquire[i], NULL);
             vkDestroyFence(c->device, g_fence[i], NULL);
         }
-        for (uint32_t i = 0; i < g_sc_n; i++) vkDestroySemaphore(c->device, g_render_done[i], NULL);
+        for (uint32_t i = 0; i < g_sc_n; i++) {
+            vkDestroySemaphore(c->device, g_render_done[i], NULL);
+            if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
+            g_sc_view[i] = VK_NULL_HANDLE;
+        }
         if (g_pool) vkDestroyCommandPool(c->device, g_pool, NULL);
         if (g_sc) vkDestroySwapchainKHR(c->device, g_sc, NULL);
         if (g_surface) vkDestroySurfaceKHR(c->instance, g_surface, NULL);
@@ -702,7 +887,10 @@ void gfx_window_start(void) {
         EnterCriticalSection(&g_pl);
         create_swapchain();
         LeaveCriticalSection(&g_pl);
-        rt_log("gfx: window %dx%d, swapchain %ux%u format %d", 1920, 1080, g_sc_ext.width, g_sc_ext.height, (int)g_sc_fmt);
+        RECT rc = {0};
+        GetClientRect(g_hwnd, &rc);
+        rt_log("gfx: window %ldx%ld, swapchain %ux%u format %d", rc.right, rc.bottom, g_sc_ext.width, g_sc_ext.height,
+               (int)g_sc_fmt);
     }
     LeaveCriticalSection(&g_start_lock);
     vsync_ensure();

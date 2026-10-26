@@ -150,33 +150,29 @@ Each platform item gets a written design first, agreed with the maintainer.
 
 ## Later
 
-38. **In-game menu** (branch `task/menu`, in progress). Base: LAS Recomp's menu (MIT, same Vulkan base as ours):
-    `refs/LASRecomp/runtime/nvn/vulkan/imgui_glue.cpp` (Dear ImGui on our device and dynamic rendering),
-    `runtime/ui/menu.mm`, `option_rows.mm`, `controls_ui.mm`; SavageWindRecomp has the same menu. It opens with F1/Esc
-    or Minus+Plus; while it is open the game gets no input and keeps running. Every setting is saved to `totk.ini`.
-    It is drawn after the blit of the game image into the swapchain image (`gfx_window.c`). The menu and settings code
-    stays free of Win32; a thin adapter feeds window and input events to ImGui. Menu text goes through a translation
-    catalog (SavageWindRecomp `runtime/ui/i18n.mm`), English and Russian. Stages, one branch each:
-    1. Frame: ImGui, open and close, input, live settings with `cfg_save`, the catalog; pages for video (fullscreen
-       and window size, FPS counter, frame limit 30 or 60), controls (rumble strength and curve, gyro on or off),
-       sound (volume) and quit.
-    2. The remapping page (`controls_ui.mm`; the bindings of `input_map.c` and [controls.md](controls.md) are the
-       defaults) and mouse sensitivity.
+38. **In-game menu**: the first stage is in. F1, Esc or Minus+Plus opens it; the game gets no input while it is open.
+    Tabs Screen, Game, Sound, Controls and Menu show option rows over the `cfg` table (`runtime/cfg.c`), with the
+    description of the selected row beside them, English and Russian text from `runtime/ui_text.c`. Every change goes
+    to `totk.ini`, keeping the user's comments; a key set in the environment shows greyed out, a key read only at start
+    says "after restart". Dear ImGui is drawn after the blit into the swapchain image (`runtime/ui/menu.cpp`).
 
-    Later pages: AMD FSR 1 or bilinear scaling of the 900p image to the window (LAS Recomp's Windows upscaler); a
-    frame-time graph with the wait breakdown of `TOTK_TRACE=perf`; VSync (FIFO) for 60 Hz displays without VRR, if
-    testers report double frames under back-edge pacing; gyro sensitivity.
-
-    Live settings: today each module reads its `cfg_get` string once and keeps the value (`rumble_cfg` in
-    `ov_input.c`). The menu needs `cfg_set` and a version counter that consumers check (per-frame readers re-read only
-    when it changes), and a `cfg_save` that rewrites only the changed lines of `totk.ini`, keeps the user's comments and
-    adds a missing key under its section (LAS Recomp's `settings_save` rewrites the whole file). A key set in the
-    environment shows greyed out. Settings read only at start (RomFS mods, shader preparation, operation mode) are
-    marked "after restart".
+    Left to do, in this order (unfinished work on branch `task/menu-advanced`):
+    1. Performance overlay (`TOTK_PERF_OVERLAY`, off, fps or full, F10 cycles; SavageWindRecomp `runtime/perfmon.c`):
+       frame rate, frame time, CPU and GPU load through PDH and NVML. Its menu row is greyed out until then.
+    2. Advanced tab: the remaining `cfg` keys (scheduling, replay thread, pipeline and shader switches), reset of all
+       settings, and a system information block (`sysinfo.c`) with copy to clipboard and open the log folder.
+    3. Game language list without Portuguese (TotK ships ja, en, fr, de, it, es, nl, ru, zh-CN, zh-TW, ko).
+    4. The Presentation row notes the mode the swapchain got when it differs from the setting (mailbox falls back to
+       fifo).
+    5. Not yet checked by hand: keyboard and gamepad navigation, Quit, input right after closing, `totk.ini` locked by
+       another program.
+    6. Later pages: button remapping (LAS Recomp `runtime/ui/controls_ui.mm`), AMD FSR 1 or bilinear scaling of the
+       900p image, a frame-time graph with the wait breakdown of `TOTK_TRACE=perf`, gyro sensitivity.
 
     Rendering above the game's 900p is a separate study (a game-side resolution patch, as Switch mods do, or scaling
     every render target ourselves); MacNativeGames has neither. The software keyboard could move onto
     SavageWindRecomp's `osk.mm`.
+
 39. **Game version 1.4.3** (branch `task/v143`, paused). The 1.4.3 files extract and verify, and the generator runs on
     them unchanged. Estimate: one day to the title screen, two to three to play at 60 fps. Steps:
     1. `stg` no-op lift, DT_RELR in `recomp/nso.py` and `runtime/loader.c`, symbol count from DT_GNU_HASH for `sdk`

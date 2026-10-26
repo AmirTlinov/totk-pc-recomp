@@ -173,9 +173,10 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 
 def runtime_sources(skip=()):
-    """Every runtime/*.c, runtime/platform/*.c and runtime/*.rc except the names in skip, so a task adds a file without
-    editing this script."""
-    pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc')
+    """Every runtime/*.c, *.cpp, platform/*.c, *.rc, the in-game menu (ui/*.cpp) and Dear ImGui except the names in skip,
+    so a task adds a file without editing this script."""
+    pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
+            'third_party/imgui/backends/*.cpp')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip)
 
 
@@ -222,7 +223,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
     inc = f'-I {cmd_path(RUNTIME)} -I {cmd_path(gen)}'
     vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(VMA_INCLUDE)
-    rt_inc = f'{inc} -I {cmd_path(out)} -I {vma}'   # romfs_config.h, vk_mem_alloc.h (and the deps headers)
+    imgui = cmd_path(RUNTIME / 'third_party' / 'imgui')
+    rt_inc = f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
     libs = [f'-L {cmd_path(DEPS / "lib")}'] + LLVM_LINK_LIBS if DEPS else LINK_LIBS
     lines = [
         '# Written by tools/build_game.py; do not edit.',

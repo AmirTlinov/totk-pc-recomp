@@ -7,6 +7,7 @@
 
 #include "gfx.h"
 #include "input.h"
+#include "ui/menu.h"
 #include "vk.h"
 
 #define SRC_W 640
@@ -162,6 +163,7 @@ int probe_window(void) {
     SendMessageW(hw, WM_ACTIVATEAPP, FALSE, 0);
     SendMessageW(hw, WM_ACTIVATEAPP, TRUE, 0);
     int back = input_cursor_released();
+    if (menu_is_open()) menu_toggle();   // Esc opened the menu: the presents below compare the bare game image
     if (!esc || click || client || !caption || back) {
         printf("probe-window: released esc=%d click=%d client=%d caption=%d reactivated=%d\n", esc, click, client, caption, back);
         return fail("cursor release");

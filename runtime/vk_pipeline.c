@@ -251,8 +251,7 @@ static int ensure_init(void) {
     // Descriptor update templates (core 1.1; the push variant comes with VK_KHR_push_descriptor on 1.1): the driver
     // walks a layout prepared when the layout is made instead of parsing write structs every draw (DXVK does so for the
     // same reason). TOTK_DESC_TEMPLATE=0 keeps the write structs.
-    const char *dt = cfg_get("TOTK_DESC_TEMPLATE");
-    if (dt && !strcmp(dt, "0")) {
+    if (!cfg_bool("TOTK_DESC_TEMPLATE")) {
         rt_log("vk_pipeline: descriptor update templates off (TOTK_DESC_TEMPLATE=0)");
     } else if (c->props.apiVersion >= VK_API_VERSION_1_1 && PROC(tpl_create, "vkCreateDescriptorUpdateTemplate") &&
                PROC(tpl_destroy, "vkDestroyDescriptorUpdateTemplate") && PROC(tpl_update, "vkUpdateDescriptorSetWithTemplate")) {
@@ -265,7 +264,7 @@ static int ensure_init(void) {
     // TOTK_VK_DYN_VERTEX=0/1 forces dynamic vertex input off or on. Default off on Intel's frozen Windows driver for its
     // older integrated GPUs (UHD 630, Ice Lake: Vulkan 1.3.215 and older), which draws nothing with it (LAS Recomp
     // 61fe44ff, its issues #8 and #357).
-    const char *dv = cfg_get("TOTK_VK_DYN_VERTEX");
+    const char *dv = cfg_get("TOTK_VK_DYN_VERTEX");   // no fixed default: it depends on the GPU, see above
     int intel_legacy = c->props.vendorID == 0x8086 && c->props.apiVersion <= VK_MAKE_API_VERSION(0, 1, 3, 215);
     int dv_on = dv && *dv ? strcmp(dv, "0") != 0 : !intel_legacy;
     P.dyn_vi = dv_on && c->has_vertex_input_dynamic_state && PROC(set_vi, "vkCmdSetVertexInputEXT");
@@ -2119,8 +2118,7 @@ static void workers_drain(void) {
 }
 
 void vk_pipeline_async_enable(void) {
-    const char *w = cfg_get("TOTK_PIPE_WAIT");
-    U.on = !(w && !strcmp(w, "draw"));
+    U.on = strcmp(cfg_value("TOTK_PIPE_WAIT"), "draw") != 0;
     const char *e = cfg_get("TOTK_PIPE_SYNC");
     if (e && *e && strcmp(e, "0")) return;
     A.on = 1;
@@ -2405,10 +2403,10 @@ static DWORD WINAPI warm_builder(void *arg) {
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
 
 void vk_pipeline_prewarm(void) {
-    const char *e = cfg_get("TOTK_PIPE_PREBUILD"), *gpu = rt_config()->gpu;
+    const char *gpu = rt_config()->gpu;
     uint32_t pr_hist[16] = {0}, fs_hist[4] = {0};   // library state of the recorded pipelines (lb_start)
     if (!A.on || (gpu && !strcmp(gpu, "null"))) return;
-    if (e && !strcmp(e, "0")) {   // prebuild_start logs the off case
+    if (!cfg_bool("TOTK_PIPE_PREBUILD")) {   // prebuild_start logs the off case
         if (ensure_init()) lb_start(pr_hist, fs_hist);
         return;
     }
@@ -2436,7 +2434,7 @@ void vk_pipeline_prewarm(void) {
     for (size_t i = 0; i < m; i++)
         if (!u || memcmp(ids[u - 1], ids[i], 32)) memcpy(ids[u++], ids[i], 32);
     int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    const char *pe = cfg_get("TOTK_PREWARM_XLATE");
+    const char *pe = cfg_get("TOTK_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     gfx_shader_prewarm((const uint8_t(*)[32])ids, u, sh, cpus, procs < 1 ? 1 : procs);
     double t1 = now_ms();
@@ -2509,9 +2507,8 @@ void vk_pipeline_prewarm(void) {
 static void prebuild_start(void) {
     AcquireSRWLockExclusive(&P.lock);
     if (K.file && !K.warm) {
-        const char *e = cfg_get("TOTK_PIPE_PREBUILD");
         rt_log("vk_pipeline: prebuild off%s; %zu records not built",
-               e && !strcmp(e, "0") ? " (TOTK_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
+               !cfg_bool("TOTK_PIPE_PREBUILD") ? " (TOTK_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
         free(K.file);
         K.file = NULL;
     }
@@ -2801,9 +2798,9 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 
 // Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
-    const char *e = cfg_get("TOTK_LIB_PREBUILD"), *te = cfg_get("TOTK_LIB_PREBUILD_THREADS"),
-               *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
-    if (!A.on || (e && !strcmp(e, "0"))) return;
+    const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
+    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
+    if (!A.on || !cfg_bool("TOTK_LIB_PREBUILD")) return;
     GfxWarmEnt *all = NULL;
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
     LB.keep_n = ke && *ke ? atoi(ke) : 0;
@@ -2814,7 +2811,7 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     for (size_t i = 0; LB.e && i < total && (LONG)(n - n_cs) < LB.keep_n; i++)
         if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
     free(all);
-    if (e && atoi(e) > 0 && (size_t)atoi(e) < n) n = (size_t)atoi(e);
+    if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
     if (!n) {
         free(LB.e), LB.e = NULL;
         return;
@@ -2922,7 +2919,7 @@ int vk_pipeline_prepare_shaders(void) {
     if (!cut) return 1;
     *cut = 0;
     int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    const char *pe = cfg_get("TOTK_PREWARM_XLATE");
+    const char *pe = cfg_get("TOTK_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
     if (!rc) lb_warm_prepared(dir);

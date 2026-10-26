@@ -266,7 +266,7 @@ static void ap_init(void);
 
 static int cores_enabled(void) {
     if (g_cores_on < 0) {
-        g_cores_on = cfg_get("TOTK_FREE_CORES") ? 0 : 1;
+        g_cores_on = !cfg_bool("TOTK_FREE_CORES");   // "0" keeps the gate, like unset
         diag_init();
         ap_init();
     }
@@ -307,9 +307,9 @@ void kern_ap_stub(void);
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
-    const char *e = cfg_get("TOTK_ASYNC_PREEMPT");
-    g_ap = !(e && !strcmp(e, "0"));
-    g_ap_int = g_ap && !(e && !strcmp(e, "2"));
+    const char *e = cfg_value("TOTK_ASYNC_PREEMPT");
+    g_ap = strcmp(e, "0") != 0;
+    g_ap_int = g_ap && strcmp(e, "2") != 0;
     if (g_ap) {
         RtModule m[16];
         int n = rt_linked_modules(m, 16);

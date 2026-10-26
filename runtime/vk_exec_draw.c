@@ -725,8 +725,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
 static int c0_on(void) {   // TOTK_FIX_C0=0: c0 reads zeros, as in M4
     static int on = -1;
     if (on < 0) {
-        const char *e = cfg_get("TOTK_FIX_C0");
-        on = !(e && !strcmp(e, "0"));
+        on = cfg_bool("TOTK_FIX_C0");
     }
     return on;
 }
@@ -1043,8 +1042,7 @@ static void repeat_stats(const VkExec *ex, const VkPipeInfo *info) {
 static int push_skip_on(void) {   // TOTK_PUSH_SKIP=0: every graphics draw pushes its set again
     static int on = -1;
     if (on < 0) {
-        const char *e = cfg_get("TOTK_PUSH_SKIP");
-        on = !(e && !strcmp(e, "0"));
+        on = cfg_bool("TOTK_PUSH_SKIP");
     }
     return on;
 }
@@ -1068,8 +1066,8 @@ static int push_skip_on(void) {   // TOTK_PUSH_SKIP=0: every graphics draw pushe
 // writes, census counts or descriptor commands.
 static int bind_skip_on(void) {
     if (RS.on < 0) {
-        const char *e = cfg_get("TOTK_BIND_SKIP");
-        RS.on = e && !strcmp(e, "check") ? 2 : !(e && !strcmp(e, "0"));
+        const char *e = cfg_value("TOTK_BIND_SKIP");
+        RS.on = !strcmp(e, "check") ? 2 : strcmp(e, "0") != 0;
         if (RS.on != 1) rt_log("vk_exec: descriptor build skip %s", RS.on ? "check" : "off");
     }
     return RS.on;
@@ -1458,8 +1456,8 @@ static void bind_vertex_buffers(VkExec *ex) {
 static int pipe_skip_mode(void) {
     static int mode = -1;
     if (mode < 0) {
-        const char *e = cfg_get("TOTK_PIPE_SKIP");
-        mode = !e || !*e ? 1 : !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
+        const char *e = cfg_value("TOTK_PIPE_SKIP");
+        mode = !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
         static const char *const what[3] = {"only draws into per-frame passes (TOTK_PIPE_SKIP=strict)",
                                             "draws into passes with a target the previous frame rendered",
                                             "those and full-screen draws (TOTK_PIPE_SKIP=fullscreen)"};
@@ -1499,8 +1497,8 @@ static int memo_match(const VkExec *ex, uint32_t gen, const MemoKey *k) {
 
 static int shader_memo_on(void) {
     if (SM.on < 0) {
-        const char *e = cfg_get("TOTK_SHADER_MEMO");
-        SM.on = e && !strcmp(e, "check") ? 2 : !(e && !strcmp(e, "0"));
+        const char *e = cfg_value("TOTK_SHADER_MEMO");
+        SM.on = !strcmp(e, "check") ? 2 : strcmp(e, "0") != 0;
     }
     return SM.on;
 }
