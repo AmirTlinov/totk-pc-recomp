@@ -12,59 +12,23 @@
 >
 > Extraction, the generated C and `totk.exe` happen on your machine and stay out of this repository. The program you build contains the game, so it is for your own use. Do not share it.
 
-The Switch code is lifted from ARM64 to C ahead of time, compiled with Clang, and linked with a host that answers the system calls. NVN, the Switch graphics API, is implemented on Vulkan. Maxwell shaders are translated to SPIR-V the first time the game uses them, then read from a cache.
+The Switch code is lifted from ARM64 to C ahead of time, compiled with Clang, and linked with a host that answers the system calls. NVN, the Switch graphics API, is implemented on Vulkan. Maxwell shaders are translated to SPIR-V the first time the game uses them, then read from a cache. The design is described in [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-This is an early build. Version 1.2.1 starts, shows the title screen, loads saves and runs in the world at 60 fps, with keyboard, mouse or gamepad input and with sound. Graphics, stability and speed are still being worked on: visual bugs and crashes are expected. No release has been published yet. You build the game from source, or assemble the installer described in [docs/installer.md](docs/installer.md), which builds it on the player's machine from the player's own files.
+This is an early build: version 1.2.1 starts, loads saves and runs in the world at 60 fps with keyboard, mouse or gamepad input and with sound, and it has been tested on AMD, NVIDIA and Intel GPUs. Visual bugs and crashes are expected; the known ones are listed in [docs/backlog.md](docs/backlog.md). No release has been published yet, and macOS, Linux, other game versions and an in-game settings menu are not supported yet.
 
-It is developed on a Ryzen 9 7900X with a Radeon RX 9070 and tested on two more machines: a laptop with a GeForce GTX 1050 Ti and an 8th- to 10th-generation Core i7, and a Core i7 of the same generations with Intel UHD Graphics 630. An RTX 3090 Ti has also been measured. On the GTX 1050 Ti laptop the game is limited by the CPU and runs at 25 to 45 fps. Other GPUs are expected to work but are barely tested; [docs/tester-guide.md](docs/tester-guide.md) says what to send back.
-
-To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md). Include the GPU and driver, the log, and the steps that get there. Screenshots are fine.
-
-### Known problems
-
-The full list, with the evidence for each item, is in [docs/backlog.md](docs/backlog.md).
-
-- For one frame, a rock or pillar can appear in the wrong place, or nearby objects vanish, most often while running or falling from a sky island.
-- Yunobo fades out and disappears when his ability is used.
-- On the GTX 1050 Ti, black patches appear for a moment, for example when the Purah Pad opens.
-- Without `tools\prepare_shaders.py` (build step 6) the first launch compiles shaders and pipelines and stutters until the caches fill. With it, a fight on a cleared driver cache had 1 slow frame instead of 37.
-- Newly streamed areas still have single slow frames while their textures upload.
-- Far terrain can turn flat gray or brown for a few frames after Link is knocked down.
-
-### Not in yet
-
-- macOS and Linux
-- Running 1.0.0, 1.1.2 or 1.4.3. The extractor recognises those updates, but the host is built for 1.2.1. Work on 1.4.3 has started.
-- An in-game settings menu. Settings are edited in `totk.ini`.
-- A published installer release
+To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md). Testers: [docs/tester-guide.md](docs/tester-guide.md) says what to send back.
 
 ## Features
 
-**Runs natively**
-- **This is not emulation.** The 1.2.1 `main`, `sdk` and `subsdk0` modules (about 96 MB of image, a little under 300,000 functions) are compiled into `totk.exe`.
-- Title screen, save loading and play, including the overworld, combat and the map.
-- 60 fps with the game running at real-time speed: MacNativeGames' 60 fps and frame-step patches are built in and can be switched off (`TOTK_FPS60=0`, `TOTK_REALTIME=0`).
-- F11 switches between the window and borderless fullscreen.
-- Keyboard, mouse and the first SDL3 gamepad, merged into one controller. Buttons are taken by position, so the south face button is B. The mouse turns the camera (`mouse_sens` sets the speed) and Esc releases the cursor. Every button can be rebound in `totk.ini` (`bind_*` lines). The key map and the remapping syntax are in [docs/controls.md](docs/controls.md). Keys count only while the game window is in front.
-- Rumble with adjustable strength and response curve, and motion controls on gamepads that have a gyro.
-- Sound through the game's own audio renderer, played with SDL3, including Opus voice.
-- Language from the Windows locale, or from `TOTK_LOCALE`. A locale the game does not ship becomes `en-US`. `TOTK_LANG` sets a Switch code directly (`en-US`, `ja`, `zh-Hant`, …).
-- Docked mode by default, which reports the boost performance configuration. `TOTK_OPERATION_MODE=handheld` reports the normal one.
-- A resizable window that opens at 1920×1080. The game's picture is scaled to the client area.
-- Presentation uses mailbox when the driver offers it, and vsync (FIFO) otherwise. `TOTK_VK_PRESENT=fifo` or `immediate` selects those.
-- A shader cache and a Vulkan pipeline cache. The first launch translates and compiles; the next launch reuses both.
-- Saves under `build/profile`, created on first use.
-
-## How it works
-
-The design and the research it rests on are in [docs/architecture.md](docs/architecture.md).
-
-1. **Input.** Your base game and the 1.2.1 update are decrypted and unpacked locally with your own `prod.keys`. File hashes are checked against known retail dumps.
-2. **CPU.** `main`, `sdk` and `subsdk0` are lifted to C, one function per guest function. NEON and floating point are lowered to C that follows ARM rounding. Guest addresses are host addresses. Jump tables are resolved by a symbolic pass in the generator.
-3. **Host.** Threads, memory, the RomFS, saves, time, account, language and the audio renderer are implemented on Windows. Every guest thread is a host thread, but only three run game code at once: the host models the Switch's three application cores and its priority preemption, because the game keeps per-core data without locks and orders some work by thread priority alone. A thread that waits for a core interrupts a lower-priority holder that is running game code, as MacNativeGames does. Input and audio output go through SDL3.
-4. **Graphics.** The NVN front end records what the game submits. A Vulkan 1.3 back end replays it, uploading the memory the CPU wrote and writing GPU results back when the CPU reads them. On a discrete GPU, memory the game binds as buffers is mirrored in video memory. The Ryujinx Maxwell translator, built as `totk_xlate.exe`, turns shaders into SPIR-V. Pipelines are linked from precompiled stages on first use (`VK_EXT_graphics_pipeline_library`) and optimised in the background. ASTC textures are decoded by a compute shader, or uploaded as they are where the GPU samples ASTC.
+- Native code, not emulation: the 1.2.1 `main`, `sdk` and `subsdk0` modules are compiled into `totk.exe`.
+- 60 fps with the game running at real-time speed, using MacNativeGames' frame-rate patches (`TOTK_FPS60=0` and `TOTK_REALTIME=0` switch them off).
+- Keyboard, mouse and the first gamepad, merged into one controller, with the mouse on the camera and every button remappable: [docs/controls.md](docs/controls.md).
+- Rumble with adjustable strength, and motion controls on gamepads that have a gyro.
+- Sound through the game's own audio renderer, including voice.
+- Language from the Windows locale, docked mode by default, a resizable window, and F11 for borderless fullscreen.
+- Shader and pipeline caches, so later launches reuse what the first one compiled.
 
 ## How this project is made
 
@@ -121,21 +85,23 @@ From the repository root, in PowerShell:
    .venv\Scripts\python tools\build_game.py
    ```
 
-   `--patches` builds in the 60 fps and frame-step patches; `make_romfs_patches.py` writes their RomFS half to `build\v121\romfs-patches`. The generator takes well under a minute. A clean compile takes a few minutes and is incremental after that. The link copies `SDL3.dll`, `libiconv-2.dll` and `libopus-0.dll` next to the exe. `vulkan-1.dll` comes from Windows.
+   `--patches` builds in the 60 fps and frame-step patches; `make_romfs_patches.py` writes their RomFS half to `build\v121\romfs-patches`. The link copies `SDL3.dll`, `libiconv-2.dll` and `libopus-0.dll` next to the exe.
 
-6. Prepare the shaders (once per build; about 5 minutes and 1.3 GB). It needs `refs\MacNativeGames` (`tools\fetch_refs.sh`) for the shared shader list:
+6. Prepare the shaders (once per build). It needs `refs\MacNativeGames` (`tools\fetch_refs.sh`) for the shared shader list:
 
    ```powershell
    .venv-py314\Scripts\python tools\prepare_shaders.py build\v121
    ```
 
-7. Package a portable folder (optional; about 2.4 GB without the RomFS):
+   Without this step the first launch compiles shaders and pipelines during play and stutters until the caches fill.
+
+7. Package a portable folder (optional):
 
    ```powershell
    .venv\Scripts\python tools\package_build.py
    ```
 
-   This writes `build\v121-portable` with `totk.exe`, its DLLs, the shader translator (a native exe, no .NET), the ExeFS, the RomFS index and patches, the shared fonts and the shader and pipeline caches. Copy the folder to another machine of yours; it needs no MSYS2, Python or .NET, only Vulkan 1.3 drivers. `romfs.bin` stays out (16 GB): `--with-romfs` copies it, or put it in `romfs\` next to the exe, or set `TOTK_ROMFS` (also settable in `totk.ini`) to its folder. Saves go to `profile\` in the folder (`TOTK_PROFILE_DIR` moves it, `TOTK_EXEFS` moves the ExeFS). The folder holds game code and data derived from your game: it is for your own machines only, never share it. The driver keeps its pipeline library cache per exe path, so after copying run `totk.exe --prepare-shaders` once in the new folder (about a minute; it needs no Python), or the first fights stutter.
+   This writes `build\v121-portable`, which runs on another of your machines without MSYS2, Python or .NET. `romfs.bin` stays out unless you pass `--with-romfs`; otherwise put it in `romfs\` next to the exe or point `TOTK_ROMFS` at its folder. After copying, run `totk.exe --prepare-shaders` once in the new folder, because the driver keeps its pipeline cache per exe path. The folder holds game code and data derived from your game: it is for your own machines only, never share it.
 
 8. Run:
 
@@ -143,23 +109,11 @@ From the repository root, in PowerShell:
    build\v121\totk.exe
    ```
 
-   Keep the window in the foreground; an unfocused window stalls the game. Close the window to quit. The first launch spends time on shaders and pipelines. Later launches read `build\v121\shader-cache` and `build\v121\pipeline-cache.bin`.
+   Keep the window in the foreground; an unfocused window stalls the game. Close the window to quit.
 
-`build\v121\totk.exe --selftest` checks the layout and the host tables and needs no game files. `--frames N` exits after N presented frames; `--frames N --shot out.png` writes that frame. The other modes are development probes (`--boot`, `--probe-kernel`, `--probe-fs`, and the rest printed by the exe when the arguments are wrong).
+`build\v121\totk.exe --selftest` checks the build without game files.
 
-Where files live, all under the repository and all ignored by git:
-
-- Extracted code and data: `build\extracted\v121\exefs` and `build\extracted\v121\romfs`
-- Generated C: `generated\v121`
-- The program: `build\v121\totk.exe`, with the three DLLs beside it
-- Saves, temp and cache: `build\profile` (`--profile` on `totk.exe` or on `tools\build_game.py` points elsewhere)
-- Shader cache: `build\v121\shader-cache` (`TOTK_SHADER_CACHE` overrides the directory)
-- Pipeline cache: `build\v121\pipeline-cache.bin` (`TOTK_PIPELINE_CACHE` overrides the file)
-- Translator: `build\xlate\totk_xlate.exe` (`TOTK_XLATE` overrides the path)
-
-Settings live in `totk.ini` next to `totk.exe`; copy [totk.ini.example](totk.ini.example) and edit it. A `TOTK_*` environment variable overrides the file (`TOTK_FPS60=0` beats `fps60 = 1`), and the startup log lists the file read and each override. The `TOTK_*` names in this README are also the ini keys without the prefix.
-
-`TOTK_AUDIO=none` mixes without opening a device. `TOTK_GPU=null` runs the graphics front end with no GPU, for tests.
+Settings live in `totk.ini` next to `totk.exe`; copy [totk.ini.example](totk.ini.example), which lists them, and edit it. A `TOTK_*` environment variable of the same name overrides the file (`TOTK_FPS60=0` beats `fps60 = 1`). Saves go to `build\profile`, created on first use. Everything the build writes stays under `build\` and `generated\`, which git ignores.
 
 ## Contributing
 

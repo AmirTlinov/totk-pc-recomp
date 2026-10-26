@@ -79,8 +79,8 @@ Numbers from this machine do not carry over. The user's other machines (the test
   the 1050 Ti to 10-11 ms; that machine is now CPU-bound at 25-45 fps (replay 25-30 ms per frame, backlog item 8).
 - The same write-watch scan costs about 3x the CPU time it costs here.
 - NVIDIA and AMD desktop GPUs have no ASTC: textures decode in a compute shader (`TOTK_ASTC`). Before that, CPU
-  decodes made 0.4-0.7 s load frames on the 1050 Ti. The UHD 630 reports ASTC, so it takes the native upload path
-  (not yet confirmed in a run).
+  decodes made 0.4-0.7 s load frames on the 1050 Ti. Whether the UHD 630 takes the native ASTC path is unverified:
+  no log from it shows it yet.
 - `cannot alias its pool memory` fills its 16-line log limit on NVIDIA and on the RX 9070 alike (1920x1080, 1600x900,
   800x450 render targets); a suspect for the black patches of backlog item 2.
 
