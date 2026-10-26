@@ -978,7 +978,14 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
         if (img) view = get_view(ex, img, &v, hv, r->type, storage);
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
-        if (!storage && !separate) samp = vk_sampler_by_id_locked((int)(h >> 20 & 0xfff));
+        if (!storage && !separate) {
+            // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
+            // blending neighbouring depths puts reconstructed positions in mid-air at object edges (shadow masks).
+            int sid = (int)(h >> 20 & 0xfff);
+            int point = img && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(r->type & 0x400) &&
+                        vk_exec_view_aspect(img, &v, hv) != VK_IMAGE_ASPECT_STENCIL_BIT;
+            samp = point ? vk_sampler_point_by_id_locked(sid) : vk_sampler_by_id_locked(sid);
+        }
     }
     if (!view) {
         int di = dummy_index(res_view_type(r->type), ms);

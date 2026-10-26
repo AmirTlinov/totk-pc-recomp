@@ -70,7 +70,8 @@ typedef struct {
     view_t v;
     tex_t t;
 } TexSlot;
-typedef struct { samp_par p; VkSampler s; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up
+typedef struct { samp_par p; VkSampler s, sp; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
+                                                                           // its point-sampled form (vk_sampler_point_by_id_locked)
 
 static CRITICAL_SECTION tex_lock;
 static INIT_ONCE tex_once = INIT_ONCE_STATIC_INIT;
@@ -1462,7 +1463,7 @@ void vk_sampler_register(int id, const samp_par *s) {
         sslots = p, nsslots = n;
     }
     sslots[id].p = *s;
-    sslots[id].s = VK_NULL_HANDLE;
+    sslots[id].s = sslots[id].sp = VK_NULL_HANDLE;
     sslots[id].used = 1;
     samp_gen++;
     unlock();
@@ -1501,6 +1502,21 @@ VkSampler vk_sampler_by_id_locked(int id) {
         v = s->s;
     }
     return v;
+}
+
+VkSampler vk_sampler_point_by_id_locked(int id) {
+    VkCtx *c = vk_ctx();
+    if (!c || id < 0 || id >= nsslots || !sslots[id].used) return VK_NULL_HANDLE;
+    SampSlot *s = &sslots[id];
+    if (!s->sp) {
+        samp_par k = s->p;
+        k.magf = NVN_MAG_FILTER_NEAREST;
+        k.minf = k.minf == NVN_MIN_FILTER_LINEAR ? NVN_MIN_FILTER_NEAREST :
+                 k.minf > NVN_MIN_FILTER_LINEAR ? NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST : k.minf;
+        k.aniso = 1;
+        s->sp = sampler_for(c, &k);
+    }
+    return s->sp;
 }
 
 VkSampler vk_sampler_by_id(int id) {

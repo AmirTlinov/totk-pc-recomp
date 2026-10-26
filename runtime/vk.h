@@ -258,6 +258,9 @@ void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 VkSampler vk_sampler_by_id_locked(int id);
+// The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
+// on the Switch although the game binds a linear sampler (MacNativeGames 6283599). VK_NULL_HANDLE for an empty slot.
+VkSampler vk_sampler_point_by_id_locked(int id);
 uint32_t vk_texture_slots_gen(void);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
