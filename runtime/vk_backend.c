@@ -263,7 +263,8 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         CloseHandle(h);
         r_started = 1;
     }
-    if (rq_n == RQ_CAP) {
+    // rl is dropped while the core is taken back, and another thread may fill the queue again meanwhile: check again.
+    while (rq_n == RQ_CAP) {
         uint64_t p0 = perf_begin();
         dr_calls[DR_FULL]++, dr_tcalls[DR_FULL]++;
         int away = core_away_unlocked();
