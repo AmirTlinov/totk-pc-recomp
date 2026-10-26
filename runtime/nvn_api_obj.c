@@ -633,13 +633,12 @@ NVN_API(nvnWindowSetCrop) {
 // ---------- Present pacing
 // The vsync thread ticks at a fixed 60 Hz whatever the monitor does, so one game frame lasts `interval` ticks. With
 // the real-time frame step (frame_rate.c) game speed does not depend on the interval, so a frame is shown when it is
-// ready, at most at the frame limit (60 or 30 per second): holding it to the 2nd or 3rd tick would only add latency
-// and 50 ms frames.
+// ready, at most at the frame limit (TOTK_FPS_LIMIT: 30 to 360 per second or the monitor's rate): holding it to the
+// 2nd or 3rd tick would only add latency and 50 ms frames.
 #define VSYNC_HZ 60ull
 static uint64_t present_period(const win_t *o) {
-    uint64_t ticks = frame_step_realtime() ? (uint64_t)frame_step_cap_ticks()
-                   : o->interval > 0 ? (uint64_t)o->interval : 1ull;
-    return ticks * 1000000000ull / VSYNC_HZ;
+    if (frame_step_realtime()) return frame_step_cap_ns();
+    return (o->interval > 0 ? (uint64_t)o->interval : 1ull) * 1000000000ull / VSYNC_HZ;
 }
 
 // MacNativeGames nvn_pace.h: the present slot is the previous slot plus one period. Early: wait for the slot. Late by

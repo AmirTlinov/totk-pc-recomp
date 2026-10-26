@@ -1,9 +1,12 @@
 # totk.ini: settings for totk.exe. Copy this file to totk.ini next to totk.exe and remove the '#' of a line to change it.
-# Each line shows the default. A TOTK_* environment variable of the same name (TOTK_FPS60 for fps60) overrides the
+# Each line shows the default. A TOTK_* environment variable of the same name (TOTK_FPS_LIMIT for fps_limit) overrides the
 # file. Keys are case-insensitive; '#' and ';' start a comment; [sections] only group lines.
 
 [frame rate]
-# 60 fps patch (0 = the game's own 30 fps).
+# Frame rate limit: 30, 60, 120, 144, any whole rate from 30 to 360, or display (the refresh rate of the window's
+# monitor). Above 60 is experimental and needs realtime = 1. Changes while the game runs take effect at once.
+# fps_limit = 60
+# Older key, read only while fps_limit is unset: fps60 = 0 means a limit of 30.
 # fps60 = 1
 # Real-time frame step: game speed follows the clock instead of the frame count.
 # realtime = 1

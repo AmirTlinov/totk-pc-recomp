@@ -56,6 +56,7 @@ void menu_vk_release(void);               // before the device goes away (gfx_wi
 void gfx_window_apply_settings(void);     // TOTK_FULLSCREEN or TOTK_WINDOW_SIZE changed: the window follows
 void gfx_window_request_close(void);      // as the window's close button: the process ends
 int gfx_window_monitor_size(int *w, int *h);   // pixels of the monitor the window is on; 0 when unknown
+double gfx_window_refresh_hz(void);            // its refresh rate (TOTK_FPS_LIMIT=display); 0 when unknown
 
 #ifdef __cplusplus
 }

@@ -435,6 +435,24 @@ static void row_game_lang(void) {
     opt_choice_list("TOTK_LANG", UI_MENU_GAME_LANG, vals, names, N, UI_MENU_GAME_LANG_DESC, cur);
 }
 
+// The frame limit (frame_rate.c): unset, the older fps60 = 0 still means 30. The monitor choice shows the rate it gives.
+static void row_fps_limit() {
+    static const char *const vals[] = {"30", "60", "120", "144", "display"};
+    static const UiTextId ids[] = {UI_MENU_FPS_30, UI_MENU_FPS_60, UI_MENU_FPS_120, UI_MENU_FPS_144, UI_MENU_FPS_DISPLAY};
+    enum { N = sizeof vals / sizeof *vals };
+    const char *names[N];
+    for (int i = 0; i < N; i++) names[i] = menu_text(ids[i]);
+    static char display[64];
+    double hz = gfx_window_refresh_hz();
+    if (hz > 0) {
+        snprintf(display, sizeof display, menu_text(UI_MENU_FPS_DISPLAY_HZ), hz);
+        names[N - 1] = display;
+    }
+    const char *set = cfg_get("TOTK_FPS_LIMIT"), *old = cfg_get("TOTK_FPS60");
+    int cur = (!set || !*set) && old && !strcmp(old, "0") ? 0 : -1;
+    opt_choice_list("TOTK_FPS_LIMIT", UI_MENU_FPS_LIMIT, vals, names, N, UI_MENU_FPS_LIMIT_DESC, cur);
+}
+
 // ---- the tabs
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
@@ -450,8 +468,7 @@ static void tab_screen(float scale) {
 
 static void tab_game(float scale) {
     opt_begin("##game", scale);
-    static const UiTextId fps[] = {UI_MENU_FPS_30, UI_MENU_FPS_60};   // values 0|1
-    opt_choice("TOTK_FPS60", UI_MENU_FPS60, fps, 2, UI_MENU_FPS60_DESC);
+    row_fps_limit();
     opt_toggle("TOTK_REALTIME", UI_MENU_REALTIME, UI_MENU_REALTIME_DESC);
     opt_toggle("TOTK_CLOTH_REALTIME", UI_MENU_CLOTH_REALTIME, UI_MENU_CLOTH_REALTIME_DESC);
     opt_toggle("TOTK_HIGHFPS_FIX", UI_MENU_HIGHFPS_FIX, UI_MENU_HIGHFPS_FIX_DESC);
