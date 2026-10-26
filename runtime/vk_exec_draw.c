@@ -497,9 +497,12 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     uint8_t sw[4] = {NVN_TEXTURE_SWIZZLE_R, NVN_TEXTURE_SWIZZLE_G, NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A};
     if (!storage) {   // MNG nvn_mtl.m tex_swizzle_sel: view selectors replace the texture's, then the format remap
         memcpy(sw, hv && v->set_swizzle ? v->swz : img->swz, 4);
-        if (img->alpha_one)
-            for (int i = 0; i < 4; i++)
-                if (sw[i] == NVN_TEXTURE_SWIZZLE_A) sw[i] = NVN_TEXTURE_SWIZZLE_ONE;
+        if (img->alpha_one || img->chan[0])
+            for (int i = 0; i < 4; i++) {
+                if (img->alpha_one && sw[i] == NVN_TEXTURE_SWIZZLE_A) sw[i] = NVN_TEXTURE_SWIZZLE_ONE;
+                else if (img->chan[0] && sw[i] >= NVN_TEXTURE_SWIZZLE_R && sw[i] <= NVN_TEXTURE_SWIZZLE_A)
+                    sw[i] = img->chan[sw[i] - NVN_TEXTURE_SWIZZLE_R];
+            }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     CbRes *r = cb_res(ex);

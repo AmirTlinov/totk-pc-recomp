@@ -49,6 +49,8 @@ typedef struct TexVkFormat {
     VkFormatFeatureFlags need;    // optimal-tiling features vk must report for sampling and upload
     uint8_t expand_rgb;           // 3-component format: the upload expands each texel to 4 components (alpha / integer 1)
     uint8_t alpha_one;            // "X" format: sample alpha as 1 (view swizzle)
+    uint8_t chan[4];              // nonzero chan[0]: vk stands in with another component order; chan[i] is the
+                                  // NVN_TEXTURE_SWIZZLE_R..A selector of the image component holding R, G, B, A
     uint8_t astc_bw, astc_bh;     // nonzero: ASTC decoded into vk (RGBA8, same colour space) by vk_astc.c or tex_astc.c;
                                   // zero for native ASTC (vk == ideal, raw blocks as for BC)
     uint8_t astc_srgb;

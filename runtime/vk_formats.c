@@ -12,13 +12,25 @@
 
 enum { F_RGB = 1, F_X = 2 };   // expand_rgb, alpha_one
 
-typedef struct { VkFormat vk; uint8_t flags; const char *note; } Row;
+// chan: the component order vk holds (TexVkFormat.chan), zero when it is NVN's. alt, alt_chan: a mandatory format
+// standing in, with its order, when the device lacks vk.
+typedef struct { VkFormat vk; uint8_t flags; const char *note; uint8_t chan[4]; VkFormat alt; uint8_t alt_chan[4]; } Row;
 
 #define R(nvn, vkf) [nvn] = {vkf, 0, NULL}
 #define RGB(nvn, vkf) [nvn] = {vkf, F_RGB, "3-component format: each texel is expanded to 4 components on upload"}
 #define X(nvn, vkf) [nvn] = {vkf, F_X, "X format: alpha is sampled as 1 through the view swizzle"}
 #define N(nvn, vkf, why) [nvn] = {vkf, 0, why}
-#define PACK16 "16-bit packed layout: component order follows LAS Recomp, not verified against the SDK"
+
+// 16-bit packed formats. NVN names their components from the least significant bit, as it does for RGB10A2
+// (A2B10G10R10): RGB565 holds R in bits 0-4, RGB5A1 R in bits 0-4 and A in bit 15. Vulkan names them from the most
+// significant bit, so RGB565 is B5G6R5. RGB5A1's counterpart A1B5G5R5 needs VK_KHR_maintenance5, so it stands in as
+// A1R5G5B5 with R and B swapped by the view swizzle: sampling is right, rendering into it would store R and B swapped
+// (no TotK pass does). The terrain's normal (RGB5A1) and blend (RGB565) maps read with the old order stretched the
+// ground textures along one axis.
+enum { CR = NVN_TEXTURE_SWIZZLE_R, CG = NVN_TEXTURE_SWIZZLE_G, CB = NVN_TEXTURE_SWIZZLE_B, CA = NVN_TEXTURE_SWIZZLE_A };
+#define P(nvn, vkf, fl, c0, c1, c2, c3, altf, a0, a1, a2, a3) \
+    [nvn] = {vkf, fl, "16-bit packed format, NVN names components from the least significant bit", {c0, c1, c2, c3}, altf, \
+             {a0, a1, a2, a3}}
 
 static const Row rows[0x9D] = {
     R(0x01, VK_FORMAT_R8_UNORM), R(0x02, VK_FORMAT_R8_SNORM), R(0x03, VK_FORMAT_R8_UINT), R(0x04, VK_FORMAT_R8_SINT),
@@ -43,8 +55,11 @@ static const Row rows[0x9D] = {
     N(0x35, VK_FORMAT_D32_SFLOAT_S8_UINT, "the RX 9070 has no D24S8 attachments; D32_SFLOAT_S8_UINT"),
     R(0x36, VK_FORMAT_D32_SFLOAT_S8_UINT),
     X(0x37, VK_FORMAT_R8G8B8A8_SRGB), R(0x38, VK_FORMAT_R8G8B8A8_SRGB),
-    N(0x39, VK_FORMAT_R4G4B4A4_UNORM_PACK16, PACK16), N(0x3A, VK_FORMAT_R5G5B5A1_UNORM_PACK16, PACK16),
-    N(0x3B, VK_FORMAT_R5G5B5A1_UNORM_PACK16, PACK16), N(0x3C, VK_FORMAT_R5G6B5_UNORM_PACK16, PACK16),
+    // RGBA4: A4B4G4R4 (core in 1.3, optional), else B4G4R4A4 whose A, R, G, B hold NVN's R, G, B, A.
+    P(0x39, VK_FORMAT_A4B4G4R4_UNORM_PACK16, 0, 0, 0, 0, 0, VK_FORMAT_B4G4R4A4_UNORM_PACK16, CA, CR, CG, CB),
+    P(0x3A, VK_FORMAT_A1R5G5B5_UNORM_PACK16, F_X, CB, CG, CR, CA, 0, 0, 0, 0, 0),
+    P(0x3B, VK_FORMAT_A1R5G5B5_UNORM_PACK16, 0, CB, CG, CR, CA, 0, 0, 0, 0, 0),
+    P(0x3C, VK_FORMAT_B5G6R5_UNORM_PACK16, 0, 0, 0, 0, 0, VK_FORMAT_R5G6B5_UNORM_PACK16, CB, CG, CR, CA),
     R(0x3D, VK_FORMAT_A2B10G10R10_UNORM_PACK32), R(0x3E, VK_FORMAT_A2B10G10R10_UINT_PACK32),
     R(0x3F, VK_FORMAT_B10G11R11_UFLOAT_PACK32), R(0x40, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32),
     R(0x41, VK_FORMAT_BC1_RGB_UNORM_BLOCK), R(0x42, VK_FORMAT_BC1_RGBA_UNORM_BLOCK),
@@ -62,8 +77,10 @@ static const Row rows[0x9D] = {
     X(0x73, VK_FORMAT_R16G16B16A16_SNORM), X(0x74, VK_FORMAT_R16G16B16A16_UINT), X(0x75, VK_FORMAT_R16G16B16A16_SINT),
     X(0x76, VK_FORMAT_R32G32B32A32_SFLOAT), X(0x77, VK_FORMAT_R32G32B32A32_UINT), X(0x78, VK_FORMAT_R32G32B32A32_SINT),
     // 0x79-0x94 ASTC: handled in tex_vk_format.
-    N(0x95, VK_FORMAT_B5G6R5_UNORM_PACK16, PACK16), N(0x96, VK_FORMAT_B5G5R5A1_UNORM_PACK16, PACK16),
-    N(0x97, VK_FORMAT_B5G5R5A1_UNORM_PACK16, PACK16), N(0x98, VK_FORMAT_A1R5G5B5_UNORM_PACK16, PACK16),
+    P(0x95, VK_FORMAT_R5G6B5_UNORM_PACK16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    P(0x96, VK_FORMAT_A1R5G5B5_UNORM_PACK16, F_X, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    P(0x97, VK_FORMAT_A1R5G5B5_UNORM_PACK16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    P(0x98, VK_FORMAT_R5G5B5A1_UNORM_PACK16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     R(0x99, VK_FORMAT_B8G8R8A8_UNORM), R(0x9A, VK_FORMAT_B8G8R8A8_UNORM),
     R(0x9B, VK_FORMAT_B8G8R8A8_SRGB), R(0x9C, VK_FORMAT_B8G8R8A8_SRGB),
 };
@@ -124,6 +141,13 @@ int tex_vk_format(int nvn_format, TexVkFormat *o) {
     o->expand_rgb = (r->flags & F_RGB) != 0;
     o->alpha_one = (r->flags & F_X) != 0;
     o->note = r->note;
+    memcpy(o->chan, r->chan, sizeof o->chan);
+    if (r->alt && vk_ctx() && !tex_vk_format_supported(o)) {
+        o->vk = r->alt;
+        memcpy(o->chan, r->alt_chan, sizeof o->chan);
+        o->note = "16-bit packed format: the device lacks the exact Vulkan format, a mandatory one stands in with the "
+                  "components reordered by the view swizzle";
+    }
     if (f == 0x31) o->stencil = 1;
     if (f >= 0x32 && f <= 0x34) o->depth = 1;
     if (f == 0x35 || f == 0x36) o->depth = o->stencil = 1;

@@ -240,6 +240,7 @@ typedef struct {
     uint32_t width, height, depth, levels, layers, samples;
     uint64_t addr;                 // storage GPU address
     uint8_t alpha_one;             // X format: sample alpha as 1 through the view swizzle
+    uint8_t chan[4];               // TexVkFormat.chan: component order of a stand-in format, applied by the view swizzle
     uint8_t mirrored, gpu_owned;
     uint8_t bound;                 // aliases physical-pool memory (physical and virtual pools)
     uint8_t block_views;           // BC image that renders through uncompressed views of its blocks (BLOCK_TEXEL_VIEW_
