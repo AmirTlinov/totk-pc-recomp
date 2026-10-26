@@ -12,6 +12,11 @@
 # Fix for physics that bounce at high frame rates.
 # highfps_fix = 1
 
+[performance]
+# A thread waiting for a virtual core interrupts the owner when it runs game code (0 = off, the old scheduling).
+# async_preempt = 1
+# Replay NVN submissions on their own thread, at most one frame behind the game (1 = on).
+# replay_async = 0
 [display]
 # Presentation mode: mailbox (default when the driver offers it, vsync otherwise), fifo (vsync) or immediate.
 # vk_present = mailbox

@@ -170,7 +170,7 @@ int vk_replay_async(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = cfg_get("TOTK_REPLAY_ASYNC");
-        on = !(e && !strcmp(e, "0"));
+        on = e && !strcmp(e, "1");   // off by default: no measured gain yet, one more frame of latency
         rt_log("vk: replay %s (TOTK_REPLAY_ASYNC=%d)",
                on ? "on its own thread, at most one frame behind the game" : "on the submitting thread", on);
     }

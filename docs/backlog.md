@@ -26,8 +26,13 @@ Measure before building: every item states the number that decides it.
    copies, locks) before choosing a worker-thread upload, GPU deswizzle, image pooling or a per-frame budget.
 3. Virtual-core preemption as Horizon does (MacNativeGames 8bf0893 / e4b4601, PR #488: asynchronous preemption of an
    owner in game code, priority inheritance, the SDK's preemption-disable protocol; Mac worst-1% frame 18.4 to 10.6
-   ms): `task/preempt`, `build/v121-preempt/HANDOFF.md`. Port only if the measured waits behind an owner in game code
-   are significant; our checkpoints at indirect calls may already cover most.
+   ms): `task/preempt`, `build/v121-preempt/NOTES.md`. Ported (`TOTK_ASYNC_PREEMPT`, on by default; 0 restores the old
+   scheduling, 2 keeps inheritance and the disable protocol without interrupting). It cuts the waits it targets
+   (`TOTK_CORE_DIAG`: game-class waits of 1 ms or more 53 / 41 / 27 to 4 / 10 / 18 in field / fight / monsters2), but
+   the A/B timings show no mean-fps gain: fight >25 ms frames base 62, port 96 over four pairs (fps 58.7 / 58.2,
+   inside run-to-run noise); one of three base field runs froze 7 s at frame 2388 with the render thread blocked on
+   nothing, no port run did. Next: user play with it on, `TOTK_ASYNC_PREEMPT=0` first on a new hang or stutter; if
+   fight stays worse, try a shorter first spin (`AP_FIRST_NS`, 250 us) or mode 2.
 4. Start-up re-warm when the driver cache does not match the exe path or device (5a.3): `task/rewarm` (main merged
    in, 0b3bc73), untested in game. Needed before the laptop package.
 5. Shared shader list: the newer MacNativeGames lists collapse variants that differ only in texture kind into `"*"`
@@ -118,10 +123,12 @@ present cadence by back-edge pacing (fight intervals outside 16.7 +- 1 ms 24.5% 
     52.9% of frames over 16.7 ms, 6.3% over 20 ms; frames over 20 ms are 87% replay (19 ms) with no pipeline or
     shader waits. The user's play added 0 shader translations and 29 full pipelines.
     1. Uneven frames: replay off the critical path. Translate command buffers at `EndRecording` or on a queued replay
-       thread, so `QueueSubmitCommands` only queues; `TOTK_REPLAY_ASYNC=0` restores the synchronous path. Merge with
-       the new path off by default if the play test leaves any doubt. Code and probes done in `build/v121-rq`
-       (0 validation errors); no valid timings yet (its runs fell in the 21:00 file-cache corruption). Next: rebase on
-       runtime/, measure `fight.txt` warm with `--quiet`.
+       thread, so `QueueSubmitCommands` only queues. Merged 2026-10-26 (eb17360) off by default:
+       `TOTK_REPLAY_ASYNC=1` turns it on. Reads wait for the texture's newest writer, releases are queued, drain
+       waits give the virtual core up; checks and validation clean (`build/archive/v121-replayq/NOTES.md`). On the
+       RX 9070 no fps gain: fight and monsters2 are bound by the game threads, field render busy 10 to 1.3 ms. With
+       the replay itself longer than the frame (the 1050 Ti case) there is nothing to overlap: the game's main thread
+       waits each frame for the previous frame's GPU work. Next: a user test on the laptops with `replay_async = 1`.
     2. Hitches when something new appears: first texture uploads decode ASTC on the CPU inside the frame (367 ms at
        frame 219 of `fight.txt` on the RX 9070; 402-714 ms load frames on the GTX 1050 Ti, `build/mem-plan.md`).
        Desktop AMD and NVIDIA have no ASTC; Intel Gen9-11 iGPUs do (check that `vk_texture.c` uses it when the
