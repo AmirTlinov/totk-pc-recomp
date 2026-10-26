@@ -715,13 +715,17 @@ static uint64_t stub(const char *sym) {
 //   mutex look owned by the caller (__cxa_guard_acquire in nn::sm::Initialize aborts);
 // - sdk's full DT_INIT needs nn::os initialised (its TLS slot constructor reaches ThreadManager), which is the boot
 //   sequence's job (T6). The audio client only needs its two sf heap constructors: 16 KiB ExpHeaps on static buffers,
-//   stored at sdk+0xd37e90 and sdk+0xd3bec0 (CreateAudioRendererManagerByHipc reads the second).
+//   stored at sdk+0xd37e90 and sdk+0xd3bec0 (CreateAudioRendererManagerByHipc reads the second). The 1.4.3 SDK creates
+//   that heap lazily; its OpenAudioRenderer takes nn::audio::detail::g_RendererResourceSemaphore first, which the
+//   constructor at sdk+0x221fb0 initializes (two renderers).
 static void sdk_prepare(Cpu *c) {
     Cpu *again;
     ST32(LD64(c->tpidrro + 0x1F8) + 0x1B0, kern_main_thread(&again));
     const RtLoaded *sdk = ldr_module(2);
-    static const uint64_t heap_ctors[] = {0x1dcbd0, 0x1de8a0};
-    for (unsigned k = 0; !RT_V143 && k < sizeof heap_ctors / sizeof *heap_ctors; k++) {
+    static const uint64_t ctors_121[] = {0x1dcbd0, 0x1de8a0}, ctors_143[] = {0x221fb0};
+    const uint64_t *heap_ctors = RT_V143 ? ctors_143 : ctors_121;
+    unsigned nctors = RT_V143 ? sizeof ctors_143 / sizeof *ctors_143 : sizeof ctors_121 / sizeof *ctors_121;
+    for (unsigned k = 0; k < nctors; k++) {
         int found = 0;
         for (uint64_t e = 0; e < sdk->init_array_size; e += 8)
             found |= LD64(sdk->init_array + e) == sdk->base + heap_ctors[k];
@@ -784,7 +788,10 @@ static void probe_sdk_client(Cpu *c) {
            "lifted client (sm: kept open by the SDK: %ld session)\n", audren_renderers_live(),
            (unsigned long long)(ipc_sessions_released() - released0), (unsigned long long)requests,
            ipc_sessions_live());
-    CHECK(audren_renderers_live() == 0 && ipc_sessions_released() - released0 >= 3 && ipc_sessions_live() == 1,
+    // The 1.2.1 SDK closes the renderer, device and manager sessions and keeps sm; the 1.4.3 SDK keeps the
+    // audren:u manager it created lazily, beside sm.
+    CHECK(audren_renderers_live() == 0 && ipc_sessions_released() - released0 >= (RT_V143 ? 1u : 3u) &&
+              ipc_sessions_live() == (RT_V143 ? 2 : 1),
           "SDK CloseAudioRenderer");
     rt_trace = trace;
 }
