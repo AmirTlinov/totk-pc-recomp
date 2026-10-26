@@ -160,16 +160,21 @@ void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, int32_t 
     out[1] = (int32_t)lrint(y);
 }
 
-// Minus and Plus held together open or close the menu. *held: the combo was down at the previous poll (the caller keeps it).
-// The poll where both are down reports neither to the game, and neither does any later poll of the same hold; Minus alone
-// reaches the game unchanged. With the menu open the game sees a neutral pad. Returns 1 in the poll where the combo goes
-// down: the caller toggles the menu once.
+// Minus and Plus held together open or close the menu. *held: latched from the poll where both go down until neither is
+// down (the caller keeps it). Every poll of the latch reports neither to the game, so releasing one button first does not
+// leak the other; Minus alone before Plus reaches the game unchanged. With the menu open the game sees a neutral pad.
+// Returns 1 in the poll where both go down: the caller toggles the menu once.
 int input_menu_gate(int *held, int menu_open, uint64_t *buttons, int32_t sticks[4]) {
     const uint64_t combo = 1ull << B_MINUS | 1ull << B_PLUS;
-    int down = (*buttons & combo) == combo;
-    int edge = down && !*held;
-    *held = down;
-    if (down) *buttons &= ~combo;
+    uint64_t raw = *buttons & combo;
+    int edge = 0;
+    if (*held) {
+        *held = raw != 0;
+    } else if (raw == combo) {
+        *held = 1;
+        edge = 1;
+    }
+    if (*held) *buttons &= ~combo;
     if (menu_open) {
         *buttons = 0;
         sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0;

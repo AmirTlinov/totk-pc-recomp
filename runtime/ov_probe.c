@@ -756,6 +756,18 @@ static void probe_menu_gate(void) {
     input_menu_gate(&held, 0, &b, st);
     b = minus | plus;
     CHECK(input_menu_gate(&held, 0, &b, st) == 1, "the second hold did not toggle");
+    // Plus released first while Minus is still down: Minus must not leak; a new Minus press after both are up passes
+    held = 0;
+    b = minus | plus;
+    input_menu_gate(&held, 0, &b, st);
+    b = minus;
+    int t4 = input_menu_gate(&held, 0, &b, st);
+    CHECK(!t4 && b == 0 && held, "Minus left down after Plus leaked: buttons %#llx", (unsigned long long)b);
+    b = 0;
+    input_menu_gate(&held, 0, &b, st);
+    b = minus | a;
+    int t5 = input_menu_gate(&held, 0, &b, st);
+    CHECK(!t5 && b == (minus | a) && !held, "Minus after the release did not pass: buttons %#llx", (unsigned long long)b);
     printf("menu gate: Minus alone passes, Minus+Plus is consumed and toggles once per hold, an open menu gives a neutral pad\n");
 }
 

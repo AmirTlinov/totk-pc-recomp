@@ -191,8 +191,18 @@ static int key_vk(int key) {
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
-static volatile LONG cur_released;         // Esc, or activation by a click on the title bar or border: until a client click
-static volatile LONG cur_esc;              // cur_released was set by Esc (not before): closing the menu gives the capture back
+// Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
+// by Esc (not when it was already set): closing the menu gives the capture back. One word, changed by one CAS.
+enum { CUR_REL = 1, CUR_ESC = 2 };
+static volatile LONG cur_rel;
+static void cur_rel_update(LONG (*f)(LONG)) {
+    LONG o, n;
+    do { o = cur_rel; n = f(o); } while (n != o && InterlockedCompareExchange(&cur_rel, n, o) != o);
+}
+static LONG rel_esc(LONG o) { return o & CUR_REL ? o : CUR_REL | CUR_ESC; }
+static LONG rel_title(LONG o) { (void)o; return CUR_REL; }
+static LONG rel_clear(LONG o) { (void)o; return 0; }
+static LONG rel_menu_closed(LONG o) { return o & CUR_ESC ? 0 : o; }
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
@@ -214,7 +224,7 @@ static float mouse_sens_get(void) {
 static void cursor_update(HWND h) {
     const char *in = cfg_get("TOTK_INPUT");
     AcquireSRWLockExclusive(&cur_lock);
-    int want = h && cur_active && !cur_released && !cur_suspend && g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 &&
+    int want = h && cur_active && !(cur_rel & CUR_REL) && !cur_suspend && g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 &&
                !(in && !strcmp(in, "none")) && GetForegroundWindow() == h && !IsIconic(h);
     RECT r;
     POINT tl = {0, 0};
@@ -230,7 +240,7 @@ static void cursor_update(HWND h) {
     ReleaseSRWLockExclusive(&cur_lock);
 }
 
-int input_cursor_released(void) { return cur_released != 0; }
+int input_cursor_released(void) { return (cur_rel & CUR_REL) != 0; }
 
 void input_cursor_suspend(int on) {
     InterlockedExchange(&cur_suspend, on != 0);
@@ -259,16 +269,16 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
         if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
         break;
     case WM_KEYDOWN:   // Esc is unbound in the game layout: it releases the cursor and opens the menu (menu_window_msg)
-        if (w == VK_ESCAPE && !cur_released) { InterlockedExchange(&cur_released, 1); InterlockedExchange(&cur_esc, 1); cursor_update(h); }
+        if (w == VK_ESCAPE && !(cur_rel & CUR_REL)) { cur_rel_update(rel_esc); cursor_update(h); }
         break;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
-        if (cur_released) { InterlockedExchange(&cur_released, 0); InterlockedExchange(&cur_esc, 0); cursor_update(h); }
+        if (cur_rel & CUR_REL) { cur_rel_update(rel_clear); cursor_update(h); }
         break;
     case WM_MOUSEACTIVATE:   // sent before WM_ACTIVATEAPP: a title bar or border click must not capture
-        if (LOWORD(l) != HTCLIENT) InterlockedExchange(&cur_released, 1);
+        if (LOWORD(l) != HTCLIENT) cur_rel_update(rel_title);
         break;
     case WM_ACTIVATEAPP:
-        if (!w) InterlockedExchange(&cur_released, 0);   // Alt+Tab back in captures again
+        if (!w) cur_rel_update(rel_clear);   // Alt+Tab back in captures again
         InterlockedExchange(&cur_active, w != 0);
         cursor_update(h);
         break;
@@ -442,7 +452,7 @@ void input_block(int on) {
 // the release. The cursor is released while it is open, for the menu's mouse.
 void input_menu(int open) {
     InterlockedExchange(&g_menu, open ? 1 : 2);
-    if (!open && InterlockedExchange(&cur_esc, 0)) InterlockedExchange(&cur_released, 0);   // the capture before Esc comes back
+    if (!open) cur_rel_update(rel_menu_closed);   // the capture before Esc comes back
     cursor_update(gfx_window_handle());
 }
 

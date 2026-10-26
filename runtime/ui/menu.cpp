@@ -38,12 +38,25 @@ static const unsigned char roboto_ttf[] = {
 static std::atomic<int> g_open;     // the menu is open
 static std::atomic<int> g_reset;    // opened or closed since the last laid-out frame: drop stale input
 
-static void set_open(int open) {
-    if (g_open.exchange(open) == open) return;
-    g_reset.store(1);
-    input_menu(open);
-    rt_log("menu: %s", open ? "open" : "closed");
+// g_open, the input block and the log line change together under open_lock, so they cannot disagree when the window thread
+// (F1, Esc), the polling thread (combo) and the present path (Continue, B) race.
+static PlatMutex open_lock = PLAT_MUTEX_INIT;
+
+// want 0 or 1 sets the state; -1 flips it. Returns the new state.
+static int change_open(int want) {
+    plat_mutex_lock(&open_lock);
+    int open = want < 0 ? !g_open.load() : want;
+    if (g_open.load() != open) {
+        g_open.store(open);
+        g_reset.store(1);
+        input_menu(open);
+        rt_log("menu: %s", open ? "open" : "closed");
+    }
+    plat_mutex_unlock(&open_lock);
+    return open;
 }
+
+static void set_open(int open) { change_open(open); }
 
 // TOTK_MENU_TEST=<frame>[:<frames per page>]: the presented frame the menu opens at for the shot hook; 0 when unset
 static uint64_t test_frame(void) {
@@ -59,10 +72,9 @@ static uint64_t test_frame(void) {
 }
 
 static int g_failed_flag();
-extern "C" int menu_available(void) { return 1; }
 extern "C" int menu_is_open(void) { return g_open.load(std::memory_order_relaxed); }
 extern "C" void menu_toggle(void) {
-    if (!g_failed_flag()) set_open(!g_open.load());
+    if (!g_failed_flag()) change_open(-1);
 }
 
 // ---- events from the window adapter, queued while the menu is open; the present path hands them to ImGui

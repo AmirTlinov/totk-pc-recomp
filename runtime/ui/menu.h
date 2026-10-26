@@ -20,7 +20,6 @@ extern "C" {
 #endif
 
 // ---- state, any thread
-int menu_available(void);                 // always 1: the menu opens on every platform
 int menu_is_open(void);
 void menu_toggle(void);                   // F1 / Esc on the keyboard, Minus+Plus on the pad
 
