@@ -24,7 +24,7 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
 - ExeFS and RomFS extraction: MacNativeGames' Python extractor (Python 3.14 for `compression.zstd`, `.venv-py314`).
 - Update merging: hactool at `1d64a83`, with MacNativeGames' BKTR patches (`toolchain/hactool`).
 - Verification: MacNativeGames' `expected-v*.json` hashes of ExeFS, RomFS and fonts.
-- Primary version: 1.2.1, the update most players have. MacNativeGames supports it with the same build path as the others. 1.0.0, 1.1.2 and 1.2.1 share `sdk`, `subsdk0` and `rtld` byte for byte, so the lifted SDK modules and the host's SDK boundary serve all three; only `main` differs. 1.4.3 replaced all three modules (new SDK 20.5.22, RELR relocations, audio renderer REV15) and is a separate, later target.
+- Primary version: 1.2.1, the update most players have. MacNativeGames supports it with the same build path as the others. 1.0.0, 1.1.2 and 1.2.1 share `sdk`, `subsdk0` and `rtld` byte for byte, so the lifted SDK modules and the host's SDK boundary serve all three; only `main` differs. 1.4.3 replaced all three modules (new SDK 20.5.22, RELR relocations, audio renderer REV15) and is a separate target; work on it has started on a branch and is not merged.
 - Windows driver: `tools/extract.py` runs the vendored extractors (`tools/vendor/macnativegames/`) and identifies the update by the SHA-256 of its `main`. hactool has no Darwin `funopen` here, so the base Program NCA is copied out of the NSP before the BKTR merge (about 17 GB of temporary space).
 
 ### 2. CPU: lift ARM64 to C
@@ -47,7 +47,7 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
 - Portable C from MacNativeGames: threads and synchronisation, IPC, memory services, fs/RomFS, time, account, applet, audio renderer and effects. The Apple pieces (mach VM, CommonCrypto, AudioToolbox, GameController) are replaced with Win32 and SDL3.
 - SDK boundary at the `nn::*` function level, matching MacNativeGames. Only `audren:u` and `sm:` are real IPC services.
 - Window, input, controllers and audio output: SDL3. Voice: libopus (BSD). Movies: the SDK's `movie::Decoder` is replaced by a host VP9 decoder over libvpx (BSD, static; `runtime/ov_movie.c`), because FFmpeg from MSYS2 is a GPL build.
-- OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`), so a Linux or macOS host adds one file instead of touching the rest. `tools/check_platform.py` keeps Win32 calls out of the other files.
+- OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`), so a Linux or macOS host adds one file instead of touching the rest. The split is not finished: `tools/check_platform.py` lists the Win32 uses left in the other files.
 
 #### Threads and cores
 
@@ -71,13 +71,15 @@ Other ports and what they changed about scheduling: [port-lessons.md](research/p
 
 - NVN front end from MacNativeGames (`nvn_api_*.c`, `nvn_obj.h`, texture layout and deswizzle). The game records command buffers through it; nothing reaches the GPU until the game submits.
 - Vulkan 1.3 back end in place of MacNativeGames' Metal one. At `QueueSubmitCommands` the recorded NVN commands are replayed into Vulkan command buffers (`vk_exec*.c`).
-- Memory pools. Apple's unified memory let MacNativeGames use the game's pools zero-copy. On a discrete GPU the back end uploads the pages the CPU wrote (write watch, above) before a replay, and writes GPU-rendered textures back when the CPU reads them (`vk_texture.c`).
+- Memory pools. Apple's unified memory let MacNativeGames use the game's pools zero-copy. The back end imports the pools as host memory (`VK_EXT_external_memory_host`). On a discrete GPU, pools bound as buffers are mirrored in device-local memory and the pages the CPU wrote (write watch, above) are uploaded before a replay; idle pool regions are made read-only so the write-watch queries skip them (`vk_memory.c`). GPU-rendered textures are written back when the CPU reads them: on a pool invalidate, on a CPU copy, and for small targets once the CPU waits for a fence (`vk_texture.c`).
+- Replay thread. `TOTK_REPLAY_ASYNC=1` moves the replay off the submitting thread onto a queue at most one frame behind the game; reads of GPU results wait for the newest writer instead of draining the queue (`vk_backend.c`). It is off by default because no timing has shown a gain yet.
 - Driver data. The NVN driver keeps a per-stage constant bank (c0) that shaders read for things like point size, dispatch size and base instance. The back end fills it the way the driver does.
 - Shaders: the Ryujinx translator 1.3.2 with MacNativeGames' patches and ours (`tools/xlate/patches/`), built with .NET 10 NativeAOT as `totk_xlate.exe` and run as a separate process. Its SPIR-V goes to Vulkan directly. Translated shaders are cached on disk.
-- Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it. Shader stages are compiled ahead into libraries; a draw that meets a new state links them at once (fast link), and an optimised pipeline replaces the linked one when a background thread finishes it. Pipeline keys seen in play are saved and built at boot. Without the extension, a missing pipeline is built on a worker and the draw waits or is skipped.
+- Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it. Shader stages are compiled ahead into libraries; a draw that meets a new state links them at once (fast link), and an optimised pipeline replaces the linked one when a background thread finishes it. Pipeline keys seen in play are saved and built at boot. A draw whose pipeline is not ready is skipped when one of its pass's targets was rendered in the previous frame, and waits otherwise, so one-shot passes are never lost (`TOTK_PIPE_SKIP`); the stage libraries a waiting draw needs are built on idle workers in parallel (`TOTK_PIPE_WAIT`). Without the extension, a missing pipeline is built on a worker and the draw waits or is skipped by the same rule.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
-- ASTC textures are decoded on the CPU when the GPU has no ASTC support (`tex_astc*.c`).
-- Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`TOTK_DUMP`, `vk_dump.c`) and a flight recorder (`TOTK_FLIGHT`). RenderDoc cannot capture, because the driver hides `VK_EXT_external_memory_host` from it.
+- ASTC textures are uploaded as they are where the device reports `textureCompressionASTC_LDR`, and decoded by a compute shader everywhere else (`vk_astc.c`, `TOTK_ASTC`). The CPU decoder (`tex_astc*.c`) is the fallback and the test oracle.
+- Draw state. A draw whose program, bound state and textures repeat reuses the previous draw's shaders and skips rebuilding its descriptor sets; descriptor sets are written through update templates (`vk_exec_draw.c`, `vk_pipeline.c`).
+- Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`TOTK_DUMP`, `vk_dump.c`) and a flight recorder (`TOTK_FLIGHT`). RenderDoc cannot capture, because it hides `VK_EXT_external_memory_host` from the application.
 
 Maxwell behaviour the back end has to match, and the TotK bugs other ports fixed: [maxwell.md](research/maxwell.md).
 
@@ -93,7 +95,7 @@ Why Vulkan rather than D3D12 or wgpu:
 - Host code: the same Clang, C11.
 - Builds: `tools/build_game.py` writes a Ninja file and runs MSYS2 Ninja. Every object is hashed before linking, because a faulty RAM module once flipped bits in stored objects.
 - Analysis: Ghidra with the Switch loader, Capstone, `llvm-objdump`.
-- Later, for players: build the game code on their machine with a bundled `zig cc`, as LAS Recomp does, so no recompiled code is ever distributed.
+- Players: the installer ([installer.md](installer.md)) builds the game code on the player's machine with a bundled llvm-mingw, so no recompiled code is ever distributed.
 
 ## Milestones
 
@@ -105,6 +107,6 @@ Why Vulkan rather than D3D12 or wgpu:
 | M3 | Host boots | The exe reaches the first NVN call with threads, memory and RomFS working | Done |
 | M4 | Playable | Vulkan back end draws the title screen and the world; input and audio work | Done |
 | M5 | Renderer foundation | Fewer stutters and visual glitches, a render thread with room for 60 fps | In progress |
-| M6 | Release shape | Build-on-player-machine packaging, Linux, 60 fps | |
+| M6 | Release shape | Build-on-player-machine packaging, Linux, 60 fps without dips | Installer done; Linux open |
 
 Open problems, in the order they are worked on: [backlog.md](backlog.md).

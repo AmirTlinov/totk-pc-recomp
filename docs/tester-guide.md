@@ -19,12 +19,11 @@ from it may be shared.
    with your own paths, extraction, the shader translator, then lifting and linking. The result is
    `build\v121\totk.exe`.
 3. Check the build without the game: `build\v121\totk.exe --selftest` must print a pass.
-4. To run the build on another of your machines, `.venv\Scripts\python tools\package_build.py` writes
-   `build\v121-portable` (about 2.4 GB). Copy it over; it needs no MSYS2, Python or .NET. The 16 GB RomFS is not in it:
-   copy `build\extracted\v121\romfs\romfs.bin` into `romfs\` there, or run the packager with `--with-romfs`.
-   Then run `totk.exe --prepare-shaders` once in the copied folder (about a minute): the driver caches pipeline
-   libraries per exe path, and without it the first fights stutter.
-   The folder holds game code: for your own machines only.
+4. To run the build on another of your machines, package a portable folder as in step 7 of "Building from source"
+   in the README, and run `totk.exe --prepare-shaders` once in the copied folder. The folder holds game code: for your
+   own machines only.
+5. The installer ([installer.md](installer.md)) is the other route to a machine without the toolchain: it builds the
+   game there from your own files. No installer release is published yet.
 
 ## Run and collect the log
 

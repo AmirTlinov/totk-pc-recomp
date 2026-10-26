@@ -6,7 +6,8 @@ holds only the game; the installer and its tools stay outside it.
 
 ## What the player does
 
-1. Downloads `TotK-Setup-<version>-windows.zip` from GitHub Releases, unpacks it anywhere and starts `TotK-Setup.exe`.
+1. Downloads `TotK-Setup-<version>-windows.zip` from GitHub Releases (none is published yet), unpacks it anywhere and
+   starts `TotK-Setup.exe`.
 2. Picks:
    - the base game (XCI or NSP) and the 1.2.1 update (NSP);
    - their `prod.keys`;
@@ -41,8 +42,7 @@ release that changes nothing game-derived skips the rebuild.
 2. **Extract** ExeFS and RomFS into the install folder and verify the hashes.
 3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt`) into a temp folder next to the installer.
 4. **Compile** the generated C, `modules.c` and `romfs.c` (they bake per-install layout and RomFS hashes) and link
-   them with the prebuilt runtime library into `totk.exe` (`build_game.py --runtime-lib`, proven on task/llvmmingw:
-   3 min on 24 cores).
+   them with the prebuilt runtime library into `totk.exe` (`build_game.py --runtime-lib`; about 3 min on 24 cores).
 5. **Prepare** the RomFS patches and the shaders (`tools/make_romfs_patches.py`, `tools/prepare_shaders.py`,
    `totk.exe --prepare-shaders`) in the install folder.
 6. **Clean up** the temp folder (generated C and objects, about 1.3 GB).
@@ -79,7 +79,7 @@ python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR
 
 ## Release layout
 
-The unpacked release; `tools/make_release.py` assembles it, CI zips it:
+The unpacked release; `tools/make_release.py` assembles it and `--zip` packs it:
 
 ```
 TotK-Setup.exe        starts python/pythonw.exe -m installer.gui (installer/launcher/launcher.c, no console)
@@ -96,7 +96,8 @@ totk.ini.example, VERSION  the default ini; the release string (git describe of 
 
 - SDL3 comes from the upstream release, not MSYS2: MSYS2's DLL imports the LGPL libiconv.
 - Every bundled third-party piece gets a row in `THIRD_PARTY_NOTICES.md`.
-- The release contains nothing game-derived; `tools/check_content.py` runs over it in CI.
+- The release contains nothing game-derived; `make_release.py` runs `tools/check_content.py` over the folder before it
+  finishes.
 
 ## Constraints
 
@@ -106,7 +107,7 @@ totk.ini.example, VERSION  the default ini; the release string (git describe of 
   ...`), which prints one JSON progress event per line. Tests and CI use the CLI.
 - Paths may hold any Unicode characters (a Cyrillic user name puts the temp and install folders under it). Every exe
   the setup runs or builds reads its arguments and paths as UTF-8 through an `activeCodePage` manifest: hactool
-  (`toolchain/hactool/unicode-patches.diff`), totk.exe (`runtime/totk.rc`), ninja (upstream). The Python steps write
+  (our patch, [toolchain-msys2-python.md](toolchain-msys2-python.md)), totk.exe (`runtime/totk.rc`), ninja (upstream). The Python steps write
   their files and logs as UTF-8, and `build_game.py` quotes paths with spaces on its Ninja command lines.
 - A game file whose data fails its hash checks or ends early stops the setup with `check.input_damaged`, which names
   the file and asks to copy it again (`extract.DamagedFile`). A failed merge checks the base Program NCA alone to tell
@@ -115,6 +116,5 @@ totk.ini.example, VERSION  the default ini; the release string (git describe of 
 
 ## Later
 
-- Re-warm the driver cache on start after a move, GPU or driver change (WIP on task/rewarm: stamp in
-  `shader-prepared.bin`).
+- Re-warm the driver cache on start after a move, GPU or driver change ([backlog.md](backlog.md) item 12).
 - NSZ and XCZ input. Linux release.

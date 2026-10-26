@@ -9,8 +9,8 @@ Update: `C:\msys64\usr\bin\bash.exe -lc "pacman -Syuu --noconfirm"` (twice: firs
 
 Install:
 
-    pacman -S --needed --noconfirm make mingw-w64-ucrt-x86_64-{clang,lld,sdl3,ffmpeg,vulkan-devel,shaderc,spirv-tools,
-      pkgconf,gdb,vulkan-memory-allocator,vulkan-validation-layers,nasm,cmake,ninja,gcc,make} base-devel git unzip zip p7zip
+    pacman -S --needed --noconfirm make mingw-w64-ucrt-x86_64-{clang,lld,sdl3,opus,libvpx,ffmpeg,vulkan-devel,shaderc,
+      spirv-tools,pkgconf,gdb,vulkan-memory-allocator,vulkan-validation-layers,nasm,cmake,ninja,gcc,make} base-devel git unzip zip p7zip
 
 | Package | Version |
 |---|---|
@@ -18,7 +18,9 @@ Install:
 | gcc | 16.2.0 |
 | make (msys) / mingw32-make | 4.4.1 |
 | sdl3 | 3.4.18 |
-| ffmpeg | 9.0.2 (MSYS2 build is GPLv3; LASRecomp ships an LGPL build via `tools/build_deps_windows.sh`) |
+| opus | 1.6.1 (`libopus-0.dll`, voice) |
+| libvpx | 1.17.0 (`libvpx.a`, linked statically for the movies) |
+| ffmpeg | 9.0.2 (never linked: the MSYS2 build is GPLv3) |
 | vulkan-devel group (headers, loader, utility libs, spirv-headers, spirv-tools, validation layers) | 1.4.363 |
 | shaderc (glslc) | 2026.4 |
 | vulkan-memory-allocator | 3.4.0, header at `/ucrt64/include/vma/vk_mem_alloc.h` |
@@ -27,16 +29,16 @@ Install:
 | nasm / gdb | 3.02 / 18.1 |
 | git / unzip / zip / p7zip | 2.56.0 / 6.0 / 3.0 / 17.06 |
 
-Use from Git Bash: `export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"`. Built exes need
-`C:\msys64\ucrt64\bin` on PATH at run time (SDL3, FFmpeg, Vulkan, shaderc DLLs).
+Use from Git Bash: `export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"`. `tools/build_game.py` copies
+`SDL3.dll`, `libiconv-2.dll` and `libopus-0.dll` next to `totk.exe`, so the game runs without MSYS2 on `PATH`.
 
 Verify:
 
     clang --version; ld.lld --version
-    pkgconf --modversion sdl3 vulkan libavcodec
+    pkgconf --modversion sdl3 vulkan opus vpx
     glslc --version; ffmpeg -version; spirv-val --version
 
-### Vulkan back end of M4
+### Vulkan back end
 
     # all part of the install line above plus spirv-cross and glslang; --needed makes this a check
     pacman -S --needed mingw-w64-ucrt-x86_64-{vulkan-devel,vulkan-memory-allocator,vulkan-validation-layers,shaderc,spirv-tools,spirv-cross,glslang}
@@ -88,14 +90,14 @@ Verify:
 hactool source: `toolchain\src\hactool` (git checkout of the pinned commit). Build: UCRT64 gcc, `config.mk` =
 `CC=gcc EXEEXT=.exe CFLAGS=-O2 ... LDFLAGS=... -static`, `make -j8`.
 
-Applied the portable part of MacNativeGames `build_app.py:build_hactool()` (diff in
-`toolchain\hactool\portable-patches.diff`):
+Applied the portable part of MacNativeGames `build_app.py:build_hactool()` (kept as
+`toolchain\hactool\portable-patches.diff` in the local toolchain folder, not in the repository):
 
 1. `MNG_TITLE_KEYS` env var selects the title-key file.
 2. BKTR: allow 0x200-aligned padding after the subsection table (`nca.c`).
 3. BKTR: accept the subsection total-size layout of newer cumulative updates (`nca.c`).
 
-Ours (`toolchain\hactool\unicode-patches.diff`): `hactool.manifest` with `<activeCodePage>UTF-8</activeCodePage>`,
+Ours (kept locally as `toolchain\hactool\unicode-patches.diff`): `hactool.manifest` with `<activeCodePage>UTF-8</activeCodePage>`,
 embedded through `hactool.rc` (Makefile rule `hactool.res.o`, `windres`). hactool converts argv, `HOME` and
 `USERPROFILE` from UTF-8 to UTF-16 (`filepath.c`); without the manifest they arrive in the ANSI code page, and a
 non-ASCII user profile or path stops it with `Failed to convert ... to UTF-16!`. Needs Windows 10 1903 or later.
