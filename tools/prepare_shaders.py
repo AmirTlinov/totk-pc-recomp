@@ -94,7 +94,8 @@ def answers(deps, stage, control):
     """GfxShaderAnswers in gfx_shader.c pack_answers layout (147 bytes) from the list's deps JSON."""
     tex, img, fmt, attr, fout = bytearray(32), bytearray(32), bytearray(32), bytearray(32), bytearray(8)
     for slot, t in deps.get('tex', {}).items():
-        tex[int(slot)] = TEX.index(t.removesuffix('_depth'))
+        t = t.removesuffix('_depth')
+        tex[int(slot)] = TEX.index('2d' if t == '*' else t)   # "*": any kind, translated as the plain 2D it stands for
     for slot, o in deps.get('img', {}).items():
         img[int(slot)] = TEX.index(o['type'])
         fmt[int(slot)] = FMT.index(o['fmt']) if o.get('fmt') in FMT else 0
