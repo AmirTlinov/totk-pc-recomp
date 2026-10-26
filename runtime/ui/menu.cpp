@@ -19,6 +19,7 @@ extern "C" {
 #include "input_map.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
+#include "ui_text.h"
 // host.h and vk.h pull in cpu.h, which is C only: the three functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
@@ -36,7 +37,6 @@ static const unsigned char roboto_ttf[] = {
 // ---- open state, any thread
 static std::atomic<int> g_open;     // the menu is open
 static std::atomic<int> g_reset;    // opened or closed since the last laid-out frame: drop stale input
-static std::atomic<int> g_combo;    // Minus and Plus were held at the last menu_pad_combo
 
 static void set_open(int open) {
     if (g_open.exchange(open) == open) return;
@@ -45,7 +45,7 @@ static void set_open(int open) {
     rt_log("menu: %s", open ? "open" : "closed");
 }
 
-// TOTK_MENU_TEST=<frame>: the presented frame the test window opens at; 0 when unset (the menu cannot open, no pages yet)
+// TOTK_MENU_TEST=<frame>[:<frames per page>]: the presented frame the menu opens at for the shot hook; 0 when unset
 static uint64_t test_frame(void) {
     static std::atomic<long long> f{-1};
     long long v = f.load(std::memory_order_relaxed);
@@ -58,14 +58,11 @@ static uint64_t test_frame(void) {
     return (uint64_t)v;
 }
 
-extern "C" int menu_available(void) { return test_frame() != 0; }
+static int g_failed_flag();
+extern "C" int menu_available(void) { return 1; }
 extern "C" int menu_is_open(void) { return g_open.load(std::memory_order_relaxed); }
 extern "C" void menu_toggle(void) {
-    if (menu_available()) set_open(!g_open.load());
-}
-
-extern "C" void menu_pad_combo(int held) {
-    if (g_combo.exchange(held) != held && held) menu_toggle();
+    if (!g_failed_flag()) set_open(!g_open.load());
 }
 
 // ---- events from the window adapter, queued while the menu is open; the present path hands them to ImGui
@@ -147,7 +144,9 @@ static void pad_events(ImGuiIO &io, int reset) {
 }
 
 // ---- ImGui and its Vulkan back end (present path)
-static int g_ctx_ok, g_failed;    // context made; set-up failed for good (the menu stays closed)
+static int g_ctx_ok;              // context made
+static std::atomic<int> g_failed; // set-up failed for good (the menu stays closed)
+static int g_failed_flag() { return g_failed.load(std::memory_order_relaxed); }
 static int g_vk_ok;               // back end initialised for g_vk_fmt
 static VkFormat g_vk_fmt;
 static uint64_t g_last_ns;
@@ -218,20 +217,20 @@ extern "C" void menu_vk_release(void) {
     if (g_ctx_ok) vk_down();
 }
 
-// ---- the test window (TOTK_MENU_TEST): no words, so no catalog entry; the pages and the translation catalog replace it.
-// A dimmed frame, a centred window with a progress bar (font glyphs: the percentage) and a colour swatch.
-static void layout_test(uint32_t w, uint32_t h, float progress) {
+// ---- the page: a dimmed frame and a centred window with "Continue" and "Quit game" (Task 4 moves them into the bottom row
+// of the tabbed menu). Esc on the keyboard and B on the gamepad close it.
+static void layout_page(uint32_t w, uint32_t h) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImVec2((float)w, (float)h), IM_COL32(0, 0, 0, 120));
     ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(w * 0.32f, 0), ImGuiCond_Always);
-    ImGui::Begin("##menu_test", nullptr,
+    ImGui::SetNextWindowSize(ImVec2(w * 0.28f, 0), ImGuiCond_Always);
+    ImGui::Begin("##menu", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-    ImGui::ProgressBar(progress, ImVec2(-1, 0));
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();   // "Continue" is selected on opening
+    ImVec2 full(-1, 0);
+    if (ImGui::Button(menu_text(UI_MENU_CONTINUE), full)) set_open(0);
     ImGui::Spacing();
-    ImGui::ColorButton("##swatch", ImVec4(0.2f, 0.6f, 0.9f, 1), ImGuiColorEditFlags_NoTooltip,
-                       ImVec2(ImGui::GetContentRegionAvail().x, 40));
-    // Esc on the keyboard, B on the gamepad: close
+    if (ImGui::Button(menu_text(UI_MENU_QUIT), full)) gfx_window_request_close();
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) set_open(0);
     ImGui::End();
 }
@@ -239,7 +238,7 @@ static void layout_test(uint32_t w, uint32_t h, float progress) {
 enum { TEST_SHOT_AFTER = 30 };   // frames between the test window opening and its shot
 
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
-    static uint64_t opened_at;   // frame of the test hook's open; ~0 once its shot is taken
+    static uint64_t opened_at;   // frame of the shot hook's open; ~0 once its shot is taken
     *shot = NULL;
     if (!g_open.load(std::memory_order_relaxed)) {
         uint64_t at = test_frame();
@@ -247,7 +246,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         opened_at = frame;
         set_open(1);
     }
-    if (g_failed) {
+    if (g_failed_flag()) {
         set_open(0);
         return 0;
     }
@@ -255,7 +254,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     if (!g_ctx_ok) make_context(t->height);
     if (!vk_up(t)) {
         rt_log("menu: Dear ImGui Vulkan back end set-up failed; the menu stays closed");
-        g_failed = 1;
+        g_failed.store(1);
         set_open(0);
         return 0;
     }
@@ -275,7 +274,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     uint64_t since = opened_at != ~0ull && frame > opened_at ? frame - opened_at : 0;
-    layout_test(t->width, t->height, since >= TEST_SHOT_AFTER ? 1.0f : (float)since / TEST_SHOT_AFTER);
+    layout_page(t->width, t->height);
     ImGui::Render();
     g_cost_ns += plat_now_ns() - t0;
     if (opened_at != ~0ull && since >= TEST_SHOT_AFTER) {   // this frame's image goes to a file, then the window closes

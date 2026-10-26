@@ -3,13 +3,13 @@
 // (gfx_window.c). The menu core calls no window system: events come in through menu_event_*, the drawing happens in the
 // present path's command buffer.
 //
-// No pages yet (the tabs and options are still being agreed): the menu opens only for the test hook
-// TOTK_MENU_TEST=<frame>, which opens a text-free test window at that presented frame, saves one swapchain shot 30
-// frames later into TOTK_MENU_TEST_DIR (default: the working directory) and closes it. While the test hook is set, F1 or
-// Esc on the keyboard and Minus and Plus held together on the gamepad also open and close it. While it is open the game
-// gets no input (input_menu, input.h) and keeps running; the cursor is released from the mouse camera.
+// F1 or Esc on the keyboard and Minus and Plus held together (consumed in poll_merged, input_menu_gate in input.h) open it;
+// F1, Esc, B or "Continue" close it. While it is open the game gets no input (input_menu, input.h) and keeps running; the
+// cursor is released from the mouse camera. Only "Continue" and "Quit game" so far (the tabs are still being agreed).
+// Test hook TOTK_MENU_TEST=<frame> opens the menu at that presented frame, saves one swapchain shot 30 frames later into
+// TOTK_MENU_TEST_DIR (default: the working directory) and closes it.
 //
-// Threads: the event functions are called by the window thread, menu_pad_combo by whichever thread polls the gamepad, the
+// Threads: the event functions are called by the window thread, menu_toggle by whichever thread polls the pad, the
 // overlay functions by the present path under its lock. ImGui itself runs on the present path only.
 #pragma once
 #include <stdint.h>
@@ -20,10 +20,9 @@ extern "C" {
 #endif
 
 // ---- state, any thread
-int menu_available(void);                 // the menu can open (for now only with the test hook TOTK_MENU_TEST)
+int menu_available(void);                 // always 1: the menu opens on every platform
 int menu_is_open(void);
-void menu_toggle(void);                   // F1 / Esc on the keyboard
-void menu_pad_combo(int held);            // Minus and Plus held together on the gamepad (toggles once per hold)
+void menu_toggle(void);                   // F1 / Esc on the keyboard, Minus+Plus on the pad
 
 // ---- events from the window adapter, used only while the menu is open. key: an ImGuiKey; coordinates in pixels of the
 // window's client area, which is the swapchain image.

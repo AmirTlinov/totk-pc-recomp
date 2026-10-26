@@ -1,10 +1,10 @@
 // Win32 adapter of the in-game menu: window messages to menu events (menu.h). The only Win32 code of the menu; an SDL3
 // window gets its own adapter later. Window thread.
 //
-// F1 opens and closes the menu, Esc opens it (with the menu open, Esc goes to the menu, which closes); both only while
-// menu_available. Esc also releases the cursor (input_window_msg runs first). While the menu is open, its keys, the
-// mouse and focus changes go to it; the game polls the keyboard on its own (input_win.c) and gets nothing while the menu
-// is open (input_menu).
+// F1 opens and closes the menu, Esc opens it (with the menu open, Esc goes to the menu, which closes). Esc also releases
+// the cursor (input_window_msg runs first; closing the menu gives the capture back). While the menu is open, its keys,
+// the mouse and focus changes go to it; the game polls the keyboard on its own (input_win.c) and gets nothing while the
+// menu is open (input_menu).
 #include <windows.h>
 #include <windowsx.h>
 
@@ -44,7 +44,7 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         // bit 30: auto-repeat
-        if (!(l & (1 << 30)) && menu_available() && (w == VK_F1 || (w == VK_ESCAPE && !menu_is_open()))) {
+        if (!(l & (1 << 30)) && (w == VK_F1 || (w == VK_ESCAPE && !menu_is_open()))) {
             menu_toggle();
             *res = 0;
             return 1;

@@ -192,6 +192,7 @@ static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sa
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
 static volatile LONG cur_released;         // Esc, or activation by a click on the title bar or border: until a client click
+static volatile LONG cur_esc;              // cur_released was set by Esc (not before): closing the menu gives the capture back
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
@@ -257,11 +258,11 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_SETCURSOR:
         if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
         break;
-    case WM_KEYDOWN:   // Esc is unbound in the game layout, so it only releases the cursor
-        if (w == VK_ESCAPE) { InterlockedExchange(&cur_released, 1); cursor_update(h); }
+    case WM_KEYDOWN:   // Esc is unbound in the game layout: it releases the cursor and opens the menu (menu_window_msg)
+        if (w == VK_ESCAPE && !cur_released) { InterlockedExchange(&cur_released, 1); InterlockedExchange(&cur_esc, 1); cursor_update(h); }
         break;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
-        if (cur_released) { InterlockedExchange(&cur_released, 0); cursor_update(h); }
+        if (cur_released) { InterlockedExchange(&cur_released, 0); InterlockedExchange(&cur_esc, 0); cursor_update(h); }
         break;
     case WM_MOUSEACTIVATE:   // sent before WM_ACTIVATEAPP: a title bar or border click must not capture
         if (LOWORD(l) != HTCLIENT) InterlockedExchange(&cur_released, 1);
@@ -388,8 +389,6 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (state > 0) {
-        if (state == 1 && pad_read(&b, sl, sr))   // Minus and Plus held together on the gamepad open or close the menu
-            menu_pad_combo((b >> B_MINUS & 1) && (b >> B_PLUS & 1));
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
             uint8_t down[KEY_COUNT] = {0};
@@ -419,7 +418,13 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     }
     script_apply(&b, sl, sr);
     rec_apply(b, sl, sr);
+    // Minus and Plus held together (gamepad or keys) open or close the menu and never reach the game
+    static int combo_held;
+    int32_t st[4] = {sl[0], sl[1], sr[0], sr[1]};
+    int toggle = input_menu_gate(&combo_held, menu_is_open(), &b, st);
+    sl[0] = st[0], sl[1] = st[1], sr[0] = st[2], sr[1] = st[3];
     ReleaseSRWLockExclusive(&lock);
+    if (toggle) menu_toggle();
     stick_bits(&b, sl[0], sl[1], B_SL_LEFT);
     stick_bits(&b, sr[0], sr[1], B_SR_LEFT);
     *buttons = b; *lx = sl[0]; *ly = sl[1]; *rx = sr[0]; *ry = sr[1];
@@ -437,6 +442,7 @@ void input_block(int on) {
 // the release. The cursor is released while it is open, for the menu's mouse.
 void input_menu(int open) {
     InterlockedExchange(&g_menu, open ? 1 : 2);
+    if (!open && InterlockedExchange(&cur_esc, 0)) InterlockedExchange(&cur_released, 0);   // the capture before Esc comes back
     cursor_update(gfx_window_handle());
 }
 
