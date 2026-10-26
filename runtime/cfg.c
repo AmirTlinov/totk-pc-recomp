@@ -52,7 +52,7 @@ static const char *const known[] = {
 // The totk.ini section a key cfg_set may write goes to when the file lacks it (totk.ini.example's sections).
 static const struct { const char *key, *section; } sections[] = {
     {"FPS60", "frame rate"},
-    {"FULLSCREEN", "display"}, {"WINDOW_SIZE", "display"}, {"FPS_COUNTER", "display"},
+    {"FULLSCREEN", "display"}, {"WINDOW_SIZE", "display"}, {"FPS_COUNTER", "display"}, {"VK_PRESENT", "display"},
     {"MENU_LANG", "language"},
     {"VOLUME", "audio"},
     {"MOTION", "input"}, {"RUMBLE_STRENGTH", "input"}, {"RUMBLE_CURVE", "input"}, {"RUMBLE_TRIGGERS", "input"},
