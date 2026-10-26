@@ -20,6 +20,7 @@
 #include "input.h"
 #include "kernel.h"
 #include "ov.h"
+#include "platform/platform.h"
 #include "ui_text.h"
 
 #define CHILD_ENV "TOTK_PROBE_SERVICES_CHILD"
@@ -757,6 +758,38 @@ static void probe_fonts(void) {
            (unsigned long long)size, path);
 }
 
+// The host catalog (ui_text.c): every menu id has its own English and Russian text, the software keyboard keeps its
+// game-language rows, and menu_text follows TOTK_MENU_LANG.
+static void probe_menu_text(void) {
+    static const char *const langs[] = {"en", "ja", "fr", "de", "it", "es", "nl", "pt", "ru", "zh-Hans", "zh-Hant", "ko"};
+    for (int id = UI_MENU_FIRST; id <= UI_MENU_LAST_ID; id++) {
+        CHECK(ui_text_defined("en", (UiTextId)id) && ui_text_defined("ru", (UiTextId)id), "menu text id %d lacks en or ru", id);
+        CHECK(*ui_text_in("en", (UiTextId)id) && *ui_text_in("ru", (UiTextId)id), "menu text id %d is empty", id);
+    }
+    CHECK(!ui_text_defined("en", UI_TEXT_COUNT) && !*ui_text_in("ru", UI_TEXT_COUNT), "an id past the catalog gives text");
+    // other languages fall back to English for the menu, and keep their own keyboard texts
+    CHECK(!strcmp(ui_text_in("ja", UI_MENU_CONTINUE), ui_text_in("en", UI_MENU_CONTINUE)), "ja menu text is not English");
+    CHECK(!strcmp(ui_text_in("ru", UI_SWKBD_OK), "ОК") && !strcmp(ui_text_in("de", UI_SWKBD_CANCEL), "Abbrechen") &&
+          !strcmp(ui_text_in("en", UI_SWKBD_OK), "OK"), "keyboard texts changed");
+    // language names: the same string in every row
+    for (int id = UI_MENU_LANGNAME_EN; id <= UI_MENU_LANGNAME_KO; id++)
+        for (size_t i = 1; i < sizeof langs / sizeof *langs; i++)
+            CHECK(!strcmp(ui_text_in(langs[i], (UiTextId)id), ui_text_in("en", (UiTextId)id)), "language name %d differs in %s", id, langs[i]);
+    CHECK(!strcmp(ui_text_in("en", UI_MENU_LANGNAME_RU), "Русский"), "Russian is not shown as Russian");
+    // the overlay formats keep their conversions
+    CHECK(strstr(ui_text_in("ru", UI_MENU_OV_GAME_PCT), "%.0f%%") && strstr(ui_text_in("ru", UI_MENU_OV_MAX_MS), "%.1f"),
+          "overlay format lost its conversion");
+    // menu_text follows the setting live
+    cfg_set("TOTK_MENU_LANG", "ru");
+    CHECK(menu_text(UI_MENU_CONTINUE) == ui_text_in("ru", UI_MENU_CONTINUE), "menu_text ignores MENU_LANG=ru");
+    cfg_set("TOTK_MENU_LANG", "en");
+    CHECK(menu_text(UI_MENU_CONTINUE) == ui_text_in("en", UI_MENU_CONTINUE), "menu_text did not follow MENU_LANG=en");
+    cfg_set("TOTK_MENU_LANG", "");
+    const char *sys = plat_ui_language();
+    int ru = !strncmp(sys, "ru", 2);
+    CHECK(menu_text(UI_MENU_CONTINUE) == ui_text_in(ru ? "ru" : "en", UI_MENU_CONTINUE), "menu_text auto ignores the system language");
+}
+
 static void probe_main(Cpu *c) {
     gc = c;
     probe_oe();
@@ -768,6 +801,7 @@ static void probe_main(Cpu *c) {
     probe_input();
     probe_media_gfx();
     probe_swkbd();
+    probe_menu_text();
     probe_fonts();
 }
 

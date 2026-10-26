@@ -1,20 +1,119 @@
-// Text the host shows the player (runtime/ui_text.c): one catalog, keyed by stable ids, in the game's language.
+// Text the host shows the player (runtime/ui_text.c): one catalog, keyed by stable ids. The software keyboard reads it
+// in the game's language (ui_text); the menu and the performance overlay read it in the menu language (menu_text).
 #pragma once
 
 typedef enum {
+    // Software keyboard
     UI_SWKBD_TITLE,          // caption of the text-entry window
     UI_SWKBD_PROMPT,         // prompt when the game gives no header, guide or sub text (TotK names a horse)
     UI_SWKBD_DEFAULT_NAME,   // text the entry starts with when the game gives none, so a controller can confirm it
     UI_SWKBD_OK,
     UI_SWKBD_CANCEL,
     UI_SWKBD_PAD_HINT,       // how a controller answers
+
+    // Menu: window, tabs, bottom row. UI_MENU_FIRST..UI_MENU_LAST_ID carry English and Russian texts.
+    UI_MENU_FIRST,
+    UI_MENU_TITLE = UI_MENU_FIRST,
+    UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND, UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MENU,
+    UI_MENU_TAB_ADVANCED,
+    UI_MENU_CONTINUE, UI_MENU_QUIT,
+    UI_MENU_ON, UI_MENU_OFF, UI_MENU_AUTO, UI_MENU_DEFAULT_MARK,      // "default" beside the default value
+    UI_MENU_AFTER_RESTART,    // note on a setting that is read at start
+    UI_MENU_SET_BY_ENV,       // note on a setting an environment variable fixes
+    UI_MENU_SAVE_FAILED,
+
+    // Screen
+    UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC,
+    UI_MENU_WINDOW_SIZE, UI_MENU_WINDOW_SIZE_DESC, UI_MENU_WINDOW_SIZE_CUSTOM,
+    UI_MENU_PRESENT, UI_MENU_PRESENT_DESC, UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE,
+    UI_MENU_GPU, UI_MENU_GPU_DESC, UI_MENU_GPU_AUTO,
+    UI_MENU_PERF_OVERLAY, UI_MENU_PERF_OVERLAY_DESC, UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL,
+
+    // Game
+    UI_MENU_FPS60, UI_MENU_FPS60_DESC, UI_MENU_FPS_60, UI_MENU_FPS_30,
+    UI_MENU_REALTIME, UI_MENU_REALTIME_DESC,
+    UI_MENU_CLOTH_REALTIME, UI_MENU_CLOTH_REALTIME_DESC,
+    UI_MENU_HIGHFPS_FIX, UI_MENU_HIGHFPS_FIX_DESC,
+    UI_MENU_GAME_LANG, UI_MENU_GAME_LANG_DESC, UI_MENU_GAME_LANG_AUTO,
+    UI_MENU_OPERATION_MODE, UI_MENU_OPERATION_MODE_DESC, UI_MENU_MODE_DOCKED, UI_MENU_MODE_HANDHELD,
+
+    // Sound
+    UI_MENU_VOLUME, UI_MENU_VOLUME_DESC,
+
+    // Controls
+    UI_MENU_MOTION, UI_MENU_MOTION_DESC,
+    UI_MENU_RUMBLE_STRENGTH, UI_MENU_RUMBLE_STRENGTH_DESC,
+    UI_MENU_RUMBLE_CURVE, UI_MENU_RUMBLE_CURVE_DESC,
+    UI_MENU_RUMBLE_TRIGGERS, UI_MENU_RUMBLE_TRIGGERS_DESC,
+    UI_MENU_MOUSE_SENS, UI_MENU_MOUSE_SENS_DESC,
+
+    // Menu tab
+    UI_MENU_MENU_LANG, UI_MENU_MENU_LANG_DESC, UI_MENU_MENU_LANG_AUTO,
+
+    // Language names, each in its own language and the same in every row (game language and menu language lists)
+    UI_MENU_LANGNAME_EN, UI_MENU_LANGNAME_JA, UI_MENU_LANGNAME_FR, UI_MENU_LANGNAME_DE, UI_MENU_LANGNAME_IT,
+    UI_MENU_LANGNAME_ES, UI_MENU_LANGNAME_NL, UI_MENU_LANGNAME_PT, UI_MENU_LANGNAME_RU, UI_MENU_LANGNAME_ZH_HANS,
+    UI_MENU_LANGNAME_ZH_HANT, UI_MENU_LANGNAME_KO,
+
+    // Advanced
+    UI_MENU_ADV_WARNING,
+    UI_MENU_GROUP_SCHED, UI_MENU_GROUP_SHADERS, UI_MENU_GROUP_TEXMEM, UI_MENU_GROUP_FIXES, UI_MENU_GROUP_VULKAN,
+    UI_MENU_GROUP_DIAG,
+    UI_MENU_ASYNC_PREEMPT, UI_MENU_ASYNC_PREEMPT_DESC, UI_MENU_PREEMPT_OFF, UI_MENU_PREEMPT_ON,
+    UI_MENU_PREEMPT_INHERIT,
+    UI_MENU_REPLAY_ASYNC, UI_MENU_REPLAY_ASYNC_DESC,
+    UI_MENU_FREE_CORES, UI_MENU_FREE_CORES_DESC,
+    UI_MENU_TIMER_1MS, UI_MENU_TIMER_1MS_DESC,
+    UI_MENU_PIPE_WAIT, UI_MENU_PIPE_WAIT_DESC, UI_MENU_PIPE_WAIT_DEFAULT, UI_MENU_PIPE_WAIT_DRAW,
+    UI_MENU_PIPE_SKIP, UI_MENU_PIPE_SKIP_DESC, UI_MENU_PIPE_SKIP_STRICT, UI_MENU_PIPE_SKIP_ANY,
+    UI_MENU_PIPE_SKIP_FULLSCREEN,
+    UI_MENU_LIB_PREBUILD, UI_MENU_LIB_PREBUILD_DESC,
+    UI_MENU_LIB_PREBUILD_THREADS, UI_MENU_LIB_PREBUILD_THREADS_DESC,
+    UI_MENU_PIPE_PREBUILD, UI_MENU_PIPE_PREBUILD_DESC,
+    UI_MENU_PREWARM_XLATE, UI_MENU_PREWARM_XLATE_DESC,
+    UI_MENU_GPL, UI_MENU_GPL_DESC,
+    UI_MENU_ASTC, UI_MENU_ASTC_DESC, UI_MENU_ASTC_AUTO, UI_MENU_ASTC_GPU, UI_MENU_ASTC_NATIVE, UI_MENU_ASTC_CPU,
+    UI_MENU_MEMORY, UI_MENU_MEMORY_DESC, UI_MENU_MEMORY_AUTO, UI_MENU_MEMORY_IMPORT, UI_MENU_MEMORY_MIRROR,
+    UI_MENU_MEMORY_VERIFY,
+    UI_MENU_TEX_ALIAS, UI_MENU_TEX_ALIAS_DESC,
+    UI_MENU_LOD_GUARD, UI_MENU_LOD_GUARD_DESC,
+    UI_MENU_FIX_C0, UI_MENU_FIX_C0_DESC,
+    UI_MENU_FIX_ZERO, UI_MENU_FIX_ZERO_DESC,
+    UI_MENU_BIND_SKIP, UI_MENU_BIND_SKIP_DESC,
+    UI_MENU_SHADER_MEMO, UI_MENU_SHADER_MEMO_DESC,
+    UI_MENU_DESC_TEMPLATE, UI_MENU_DESC_TEMPLATE_DESC,
+    UI_MENU_PUSH_SKIP, UI_MENU_PUSH_SKIP_DESC,
+    UI_MENU_SPLIT_DRAWS, UI_MENU_SPLIT_DRAWS_DESC,
+    UI_MENU_VK_VALIDATION, UI_MENU_VK_VALIDATION_DESC, UI_MENU_VK_VALIDATION_MISSING,
+    UI_MENU_VK_DYN_VERTEX, UI_MENU_VK_DYN_VERTEX_DESC,
+    UI_MENU_VK_SUBGROUP_PIN, UI_MENU_VK_SUBGROUP_PIN_DESC,
+    UI_MENU_TRACE, UI_MENU_TRACE_DESC,
+    UI_MENU_FLIGHT, UI_MENU_FLIGHT_DESC,
+    UI_MENU_FLIGHT_SPIKE_MS, UI_MENU_FLIGHT_SPIKE_MS_DESC,
+    UI_MENU_INPUT_RECORD, UI_MENU_INPUT_RECORD_DESC,
+    UI_MENU_OPEN_LOG, UI_MENU_OPEN_LOG_DESC,
+    UI_MENU_COPY_INFO, UI_MENU_COPY_INFO_DESC, UI_MENU_COPY_INFO_DONE,
+    UI_MENU_RESET, UI_MENU_RESET_DESC, UI_MENU_RESET_CONFIRM, UI_MENU_RESET_YES, UI_MENU_RESET_NO,
+
+    // Performance overlay
+    UI_MENU_OV_FPS, UI_MENU_OV_FRAME_MS, UI_MENU_OV_GAME_PCT, UI_MENU_OV_MAX_MS,
+    UI_MENU_OV_GPU, UI_MENU_OV_CPU, UI_MENU_OV_RAM, UI_MENU_OV_VRAM, UI_MENU_OV_TEMP, UI_MENU_OV_POWER,
+    UI_MENU_OV_CLOCK, UI_MENU_OV_NONE,
+    UI_MENU_OV_REPLAY, UI_MENU_OV_GPU_TIME, UI_MENU_OV_PIPE_WAIT, UI_MENU_OV_SHADER_WAIT, UI_MENU_OV_TEX_UPLOADS,
+    UI_MENU_LAST_ID = UI_MENU_OV_TEX_UPLOADS,
     UI_TEXT_COUNT
 } UiTextId;
 
 // UTF-8 text for id in the language of ov_language(); English when the catalog has no row for that language.
 const char *ui_text(UiTextId id);
 // The same for an explicit catalog language ("en", "ja", "fr", "de", "it", "es", "nl", "pt", "ru", "zh-Hans",
-// "zh-Hant", "ko"), for the probe.
+// "zh-Hant", "ko"); an empty entry gives the English text.
 const char *ui_text_in(const char *lang, UiTextId id);
+// 1 when the row of lang has its own text for id (no fallback to English), for the probe.
+int ui_text_defined(const char *lang, UiTextId id);
 // The catalog language for a Switch language code ("en-GB" -> "en", "zh-CN" -> "zh-Hans", ...).
 const char *ui_text_lang(const char *switch_code);
+
+// Menu text: ui_text_in(menu language, id). The menu language is TOTK_MENU_LANG ("en" / "ru"); unset, Russian when the
+// system UI language is Russian, else English. Follows a live change of the setting.
+const char *menu_text(UiTextId id);

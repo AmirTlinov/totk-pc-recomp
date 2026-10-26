@@ -66,6 +66,8 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 int plat_exe_path(char *out, size_t cap);                 // path of the running executable; 0 on failure
 // Environment variable as UTF-8 into out; its length, or 0 when unset, empty or too long for cap.
 size_t plat_getenv(const char *name, char *out, size_t cap);
+// The user's UI language as a BCP-47 tag ("ru-RU", "en-US"); "" when the system gives none. Valid for the process.
+const char *plat_ui_language(void);
 uint32_t plat_thread_id(void);                            // id of the calling thread, for unique file names
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.

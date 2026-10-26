@@ -1,27 +1,312 @@
-// Catalog of the text the host shows the player (ui_text.h). Rows follow the game's text languages; a new string gets
-// an id in ui_text.h and a column in every row (an empty entry falls back to English).
+// Catalog of the text the host shows the player (ui_text.h). One array per catalog language, indexed by UiTextId: a new
+// string gets an id in ui_text.h and an entry in every language that has one (a missing entry falls back to English).
+// The software keyboard has every language; the menu has English and Russian.
 #include <string.h>
 
+#include "cfg.h"
 #include "ov.h"
+#include "platform/platform.h"
 #include "ui_text.h"
 
-typedef struct { const char *lang, *text[UI_TEXT_COUNT]; } Row;
+typedef struct { const char *lang; const char *const *text; } Row;
 
-// Columns: TITLE, PROMPT, DEFAULT_NAME (at most 9 UTF-16 units, no '@' '%' '\'), OK, CANCEL, PAD_HINT.
+// The language names are the same in every row.
+#define LANG_NAMES \
+    [UI_MENU_LANGNAME_EN] = "English", [UI_MENU_LANGNAME_JA] = "日本語", [UI_MENU_LANGNAME_FR] = "Français", \
+    [UI_MENU_LANGNAME_DE] = "Deutsch", [UI_MENU_LANGNAME_IT] = "Italiano", [UI_MENU_LANGNAME_ES] = "Español", \
+    [UI_MENU_LANGNAME_NL] = "Nederlands", [UI_MENU_LANGNAME_PT] = "Português", [UI_MENU_LANGNAME_RU] = "Русский", \
+    [UI_MENU_LANGNAME_ZH_HANS] = "简体中文", [UI_MENU_LANGNAME_ZH_HANT] = "繁體中文", [UI_MENU_LANGNAME_KO] = "한국어"
+
+// SWKBD: TITLE, PROMPT, DEFAULT_NAME (at most 9 UTF-16 units, no '@' '%' '\'), OK, CANCEL, PAD_HINT.
+#define SWKBD(title, prompt, name, ok, cancel, hint) \
+    [UI_SWKBD_TITLE] = title, [UI_SWKBD_PROMPT] = prompt, [UI_SWKBD_DEFAULT_NAME] = name, [UI_SWKBD_OK] = ok, \
+    [UI_SWKBD_CANCEL] = cancel, [UI_SWKBD_PAD_HINT] = hint, LANG_NAMES
+
+static const char *const text_en[UI_TEXT_COUNT] = {
+    SWKBD("Text entry", "Enter a name", "Horse", "OK", "Cancel", "Controller: A = OK, B = Cancel"),
+
+    [UI_MENU_TITLE] = "Settings",
+    [UI_MENU_TAB_SCREEN] = "Screen", [UI_MENU_TAB_GAME] = "Game", [UI_MENU_TAB_SOUND] = "Sound",
+    [UI_MENU_TAB_CONTROLS] = "Controls", [UI_MENU_TAB_MENU] = "Menu", [UI_MENU_TAB_ADVANCED] = "Advanced",
+    [UI_MENU_CONTINUE] = "Continue", [UI_MENU_QUIT] = "Quit game",
+    [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
+    [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
+    [UI_MENU_SAVE_FAILED] = "could not save settings",
+
+    [UI_MENU_FULLSCREEN] = "Fullscreen", [UI_MENU_FULLSCREEN_DESC] = "Fills the screen with the game; F11 toggles it.",
+    [UI_MENU_WINDOW_SIZE] = "Window size", [UI_MENU_WINDOW_SIZE_DESC] = "Size of the game window when not fullscreen.",
+    [UI_MENU_WINDOW_SIZE_CUSTOM] = "Custom",
+    [UI_MENU_PRESENT] = "Presentation", [UI_MENU_PRESENT_DESC] = "How finished frames reach the screen.",
+    [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Immediate",
+    [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "The Vulkan device that draws the game.",
+    [UI_MENU_GPU_AUTO] = "Automatic",
+    [UI_MENU_PERF_OVERLAY] = "Performance overlay",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate and system numbers over the picture; F10 cycles the modes.",
+    [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full",
+
+    [UI_MENU_FPS60] = "Frame rate", [UI_MENU_FPS60_DESC] = "Runs the game at 60 frames per second instead of 30.",
+    [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_30] = "30 FPS",
+    [UI_MENU_REALTIME] = "Game speed follows the clock",
+    [UI_MENU_REALTIME_DESC] = "Steps the game by real time, so a slow frame does not slow the game down.",
+    [UI_MENU_CLOTH_REALTIME] = "Cloth on the clock",
+    [UI_MENU_CLOTH_REALTIME_DESC] = "Steps cloth and hair by real time as well.",
+    [UI_MENU_HIGHFPS_FIX] = "High frame rate physics fix",
+    [UI_MENU_HIGHFPS_FIX_DESC] = "Corrects physics that misbehave above 30 frames per second.",
+    [UI_MENU_GAME_LANG] = "Game language", [UI_MENU_GAME_LANG_DESC] = "Language of the game's text and voices.",
+    [UI_MENU_GAME_LANG_AUTO] = "Automatic",
+    [UI_MENU_OPERATION_MODE] = "Console mode",
+    [UI_MENU_OPERATION_MODE_DESC] = "Whether the game thinks it runs docked or handheld.",
+    [UI_MENU_MODE_DOCKED] = "Docked", [UI_MENU_MODE_HANDHELD] = "Handheld",
+
+    [UI_MENU_VOLUME] = "Volume", [UI_MENU_VOLUME_DESC] = "Master volume of the game.",
+
+    [UI_MENU_MOTION] = "Motion controls", [UI_MENU_MOTION_DESC] = "Aiming with the controller's gyroscope.",
+    [UI_MENU_RUMBLE_STRENGTH] = "Vibration strength",
+    [UI_MENU_RUMBLE_STRENGTH_DESC] = "How strong the controller vibrates.",
+    [UI_MENU_RUMBLE_CURVE] = "Vibration curve",
+    [UI_MENU_RUMBLE_CURVE_DESC] = "Lower values make weak vibration stronger.",
+    [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
+    [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Vibrates the triggers of an Xbox controller too.",
+    [UI_MENU_MOUSE_SENS] = "Mouse camera sensitivity",
+    [UI_MENU_MOUSE_SENS_DESC] = "How fast the mouse turns the camera.",
+
+    [UI_MENU_MENU_LANG] = "Menu language", [UI_MENU_MENU_LANG_DESC] = "Language of this menu and the overlay.",
+    [UI_MENU_MENU_LANG_AUTO] = "Automatic (from Windows)",
+
+    [UI_MENU_ADV_WARNING] = "These settings are for testing and troubleshooting. Change them only when you know why.",
+    [UI_MENU_GROUP_SCHED] = "Scheduling", [UI_MENU_GROUP_SHADERS] = "Shaders and pipelines",
+    [UI_MENU_GROUP_TEXMEM] = "Textures and memory", [UI_MENU_GROUP_FIXES] = "Render fixes",
+    [UI_MENU_GROUP_VULKAN] = "Vulkan", [UI_MENU_GROUP_DIAG] = "Diagnostics",
+    [UI_MENU_ASYNC_PREEMPT] = "Virtual core preemption",
+    [UI_MENU_ASYNC_PREEMPT_DESC] = "Lets a game thread interrupt another one on the same virtual core.",
+    [UI_MENU_PREEMPT_OFF] = "Off", [UI_MENU_PREEMPT_ON] = "On", [UI_MENU_PREEMPT_INHERIT] = "Inheritance only",
+    [UI_MENU_REPLAY_ASYNC] = "Replay on its own thread",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Runs the recorded GPU commands on a separate thread.",
+    [UI_MENU_FREE_CORES] = "Virtual core gate",
+    [UI_MENU_FREE_CORES_DESC] = "Lets only one thread run per virtual core, as on the console.",
+    [UI_MENU_TIMER_1MS] = "1 ms Windows timer",
+    [UI_MENU_TIMER_1MS_DESC] = "Raises the system timer resolution to 1 ms for steadier frame pacing.",
+    [UI_MENU_PIPE_WAIT] = "Waiting draw handling",
+    [UI_MENU_PIPE_WAIT_DESC] = "What a draw does while its pipeline is still building.",
+    [UI_MENU_PIPE_WAIT_DEFAULT] = "Default", [UI_MENU_PIPE_WAIT_DRAW] = "Draw",
+    [UI_MENU_PIPE_SKIP] = "Draws skipped while a pipeline builds",
+    [UI_MENU_PIPE_SKIP_DESC] = "Which draws are dropped instead of waiting for their pipeline.",
+    [UI_MENU_PIPE_SKIP_STRICT] = "Strict", [UI_MENU_PIPE_SKIP_ANY] = "Any",
+    [UI_MENU_PIPE_SKIP_FULLSCREEN] = "Fullscreen passes",
+    [UI_MENU_LIB_PREBUILD] = "Stage library prebuild",
+    [UI_MENU_LIB_PREBUILD_DESC] = "Builds shader stage libraries ahead of time in the background.",
+    [UI_MENU_LIB_PREBUILD_THREADS] = "Stage library prebuild threads",
+    [UI_MENU_LIB_PREBUILD_THREADS_DESC] = "Threads used for the prebuild; empty picks a number from your CPU.",
+    [UI_MENU_PIPE_PREBUILD] = "Pipeline prebuild",
+    [UI_MENU_PIPE_PREBUILD_DESC] = "Builds known pipelines ahead of time.",
+    [UI_MENU_PREWARM_XLATE] = "Translator prewarm",
+    [UI_MENU_PREWARM_XLATE_DESC] = "Threads that translate known shaders at start; empty picks a number.",
+    [UI_MENU_GPL] = "Graphics pipeline library",
+    [UI_MENU_GPL_DESC] = "Uses the Vulkan pipeline library extension; turn off if your driver misbehaves with it.",
+    [UI_MENU_ASTC] = "ASTC texture decoding", [UI_MENU_ASTC_DESC] = "Where compressed ASTC textures are decoded.",
+    [UI_MENU_ASTC_AUTO] = "Automatic", [UI_MENU_ASTC_GPU] = "GPU shader", [UI_MENU_ASTC_NATIVE] = "Native",
+    [UI_MENU_ASTC_CPU] = "CPU",
+    [UI_MENU_MEMORY] = "GPU memory mode", [UI_MENU_MEMORY_DESC] = "How game memory is shared with the GPU.",
+    [UI_MENU_MEMORY_AUTO] = "Automatic", [UI_MENU_MEMORY_IMPORT] = "Import", [UI_MENU_MEMORY_MIRROR] = "Mirror",
+    [UI_MENU_MEMORY_VERIFY] = "Verify",
+    [UI_MENU_TEX_ALIAS] = "Texture aliasing", [UI_MENU_TEX_ALIAS_DESC] = "Lets textures share GPU memory.",
+    [UI_MENU_LOD_GUARD] = "LOD guard", [UI_MENU_LOD_GUARD_DESC] = "Stops texture detail levels from flickering.",
+    [UI_MENU_FIX_C0] = "Constant buffer fix",
+    [UI_MENU_FIX_C0_DESC] = "Works around a wrong constant buffer read in some shaders.",
+    [UI_MENU_FIX_ZERO] = "Zero value fix",
+    [UI_MENU_FIX_ZERO_DESC] = "Works around shader results that must be exactly zero.",
+    [UI_MENU_BIND_SKIP] = "Skip repeated binds",
+    [UI_MENU_BIND_SKIP_DESC] = "Optimisation: skips bindings that did not change.",
+    [UI_MENU_SHADER_MEMO] = "Shader memo", [UI_MENU_SHADER_MEMO_DESC] = "Optimisation: remembers shader lookups.",
+    [UI_MENU_DESC_TEMPLATE] = "Descriptor templates",
+    [UI_MENU_DESC_TEMPLATE_DESC] = "Optimisation: updates descriptors in bulk.",
+    [UI_MENU_PUSH_SKIP] = "Skip repeated push constants",
+    [UI_MENU_PUSH_SKIP_DESC] = "Optimisation: skips push constants that did not change.",
+    [UI_MENU_SPLIT_DRAWS] = "Split draws",
+    [UI_MENU_SPLIT_DRAWS_DESC] = "Optimisation: size at which long draws are split; 0 turns it off.",
+    [UI_MENU_VK_VALIDATION] = "Validation layer",
+    [UI_MENU_VK_VALIDATION_DESC] = "Checks every Vulkan call and slows the game down a lot.",
+    [UI_MENU_VK_VALIDATION_MISSING] = "The validation layer is not installed.",
+    [UI_MENU_VK_DYN_VERTEX] = "Dynamic vertex state",
+    [UI_MENU_VK_DYN_VERTEX_DESC] = "Uses dynamic vertex input when the driver offers it.",
+    [UI_MENU_VK_SUBGROUP_PIN] = "Pin subgroup size", [UI_MENU_VK_SUBGROUP_PIN_DESC] = "Fixes the shader subgroup size.",
+    [UI_MENU_TRACE] = "Performance log", [UI_MENU_TRACE_DESC] = "Writes frame timings to a file.",
+    [UI_MENU_FLIGHT] = "Flight recorder",
+    [UI_MENU_FLIGHT_DESC] = "Keeps a short history and saves it when a frame freezes.",
+    [UI_MENU_FLIGHT_SPIKE_MS] = "Freeze threshold (ms)",
+    [UI_MENU_FLIGHT_SPIKE_MS_DESC] = "Frame time that counts as a freeze.",
+    [UI_MENU_INPUT_RECORD] = "Input recording",
+    [UI_MENU_INPUT_RECORD_DESC] = "Writes your inputs to a file for bug reports.",
+    [UI_MENU_OPEN_LOG] = "Open log folder", [UI_MENU_OPEN_LOG_DESC] = "Shows the folder with the log files.",
+    [UI_MENU_COPY_INFO] = "Copy system info",
+    [UI_MENU_COPY_INFO_DESC] = "Copies GPU, driver, CPU, RAM and changed settings to the clipboard.",
+    [UI_MENU_COPY_INFO_DONE] = "Copied",
+    [UI_MENU_RESET] = "Reset all settings to defaults", [UI_MENU_RESET_DESC] = "Applies to every tab.",
+    [UI_MENU_RESET_CONFIRM] = "Reset every setting to its default?", [UI_MENU_RESET_YES] = "Reset",
+    [UI_MENU_RESET_NO] = "Cancel",
+
+    [UI_MENU_OV_FPS] = "%.0f FPS", [UI_MENU_OV_FRAME_MS] = "%.1f ms", [UI_MENU_OV_GAME_PCT] = "game %.0f%%",
+    [UI_MENU_OV_MAX_MS] = "max %.1f ms",
+    [UI_MENU_OV_GPU] = "GPU", [UI_MENU_OV_CPU] = "CPU", [UI_MENU_OV_RAM] = "RAM", [UI_MENU_OV_VRAM] = "VRAM",
+    [UI_MENU_OV_TEMP] = "Temperature", [UI_MENU_OV_POWER] = "Power", [UI_MENU_OV_CLOCK] = "Clock",
+    [UI_MENU_OV_NONE] = "-",
+    [UI_MENU_OV_REPLAY] = "Replay", [UI_MENU_OV_GPU_TIME] = "GPU time", [UI_MENU_OV_PIPE_WAIT] = "Pipeline waits",
+    [UI_MENU_OV_SHADER_WAIT] = "Shader waits", [UI_MENU_OV_TEX_UPLOADS] = "Texture uploads",
+};
+
+static const char *const text_ru[UI_TEXT_COUNT] = {
+    SWKBD("Ввод текста", "Введите имя", "Лошадь", "ОК", "Отмена", "Контроллер: A — ОК, B — отмена"),
+
+    [UI_MENU_TITLE] = "Настройки",
+    [UI_MENU_TAB_SCREEN] = "Экран", [UI_MENU_TAB_GAME] = "Игра", [UI_MENU_TAB_SOUND] = "Звук",
+    [UI_MENU_TAB_CONTROLS] = "Управление", [UI_MENU_TAB_MENU] = "Меню", [UI_MENU_TAB_ADVANCED] = "Дополнительно",
+    [UI_MENU_CONTINUE] = "Продолжить", [UI_MENU_QUIT] = "Выйти из игры",
+    [UI_MENU_ON] = "Вкл.", [UI_MENU_OFF] = "Выкл.", [UI_MENU_AUTO] = "Автоматически",
+    [UI_MENU_DEFAULT_MARK] = "по умолчанию",
+    [UI_MENU_AFTER_RESTART] = "после перезапуска", [UI_MENU_SET_BY_ENV] = "задано переменной окружения",
+    [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
+
+    [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран; F11 переключает режим.",
+    [UI_MENU_WINDOW_SIZE] = "Размер окна", [UI_MENU_WINDOW_SIZE_DESC] = "Размер окна игры вне полноэкранного режима.",
+    [UI_MENU_WINDOW_SIZE_CUSTOM] = "Свой",
+    [UI_MENU_PRESENT] = "Вывод кадров", [UI_MENU_PRESENT_DESC] = "Как готовые кадры попадают на экран.",
+    [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "Вертикальная синхронизация",
+    [UI_MENU_PRESENT_IMMEDIATE] = "Без ожидания",
+    [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Устройство Vulkan, которое рисует игру.",
+    [UI_MENU_GPU_AUTO] = "Автоматически",
+    [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров и данные о системе поверх картинки; F10 переключает режимы.",
+    [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
+
+    [UI_MENU_FPS60] = "Частота кадров", [UI_MENU_FPS60_DESC] = "Игра идёт в 60 кадров в секунду вместо 30.",
+    [UI_MENU_FPS_60] = "60 кадр/с", [UI_MENU_FPS_30] = "30 кадр/с",
+    [UI_MENU_REALTIME] = "Скорость игры по часам",
+    [UI_MENU_REALTIME_DESC] = "Игра идёт по реальному времени, медленный кадр её не замедляет.",
+    [UI_MENU_CLOTH_REALTIME] = "Ткань по часам",
+    [UI_MENU_CLOTH_REALTIME_DESC] = "Ткань и волосы тоже идут по реальному времени.",
+    [UI_MENU_HIGHFPS_FIX] = "Исправление физики на высоком FPS",
+    [UI_MENU_HIGHFPS_FIX_DESC] = "Исправляет физику, которая ломается при частоте выше 30 кадров в секунду.",
+    [UI_MENU_GAME_LANG] = "Язык игры", [UI_MENU_GAME_LANG_DESC] = "Язык текста и озвучки игры.",
+    [UI_MENU_GAME_LANG_AUTO] = "Автоматически",
+    [UI_MENU_OPERATION_MODE] = "Режим консоли",
+    [UI_MENU_OPERATION_MODE_DESC] = "Игра считает, что консоль в док-станции или в портативном режиме.",
+    [UI_MENU_MODE_DOCKED] = "В док-станции", [UI_MENU_MODE_HANDHELD] = "Портативный",
+
+    [UI_MENU_VOLUME] = "Громкость", [UI_MENU_VOLUME_DESC] = "Общая громкость игры.",
+
+    [UI_MENU_MOTION] = "Управление движением", [UI_MENU_MOTION_DESC] = "Прицеливание гироскопом контроллера.",
+    [UI_MENU_RUMBLE_STRENGTH] = "Сила вибрации",
+    [UI_MENU_RUMBLE_STRENGTH_DESC] = "Насколько сильно вибрирует контроллер.",
+    [UI_MENU_RUMBLE_CURVE] = "Кривая вибрации",
+    [UI_MENU_RUMBLE_CURVE_DESC] = "Чем ниже значение, тем сильнее слабая вибрация.",
+    [UI_MENU_RUMBLE_TRIGGERS] = "Вибрация триггеров (Xbox)",
+    [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Вибрация и в триггерах контроллера Xbox.",
+    [UI_MENU_MOUSE_SENS] = "Чувствительность мыши",
+    [UI_MENU_MOUSE_SENS_DESC] = "Как быстро мышь поворачивает камеру.",
+
+    [UI_MENU_MENU_LANG] = "Язык меню", [UI_MENU_MENU_LANG_DESC] = "Язык этого меню и индикатора.",
+    [UI_MENU_MENU_LANG_AUTO] = "Автоматически (из Windows)",
+
+    [UI_MENU_ADV_WARNING] = "Эти настройки нужны для тестов и поиска неполадок. Меняйте их, только если знаете зачем.",
+    [UI_MENU_GROUP_SCHED] = "Планирование", [UI_MENU_GROUP_SHADERS] = "Шейдеры и конвейеры",
+    [UI_MENU_GROUP_TEXMEM] = "Текстуры и память", [UI_MENU_GROUP_FIXES] = "Исправления графики",
+    [UI_MENU_GROUP_VULKAN] = "Vulkan", [UI_MENU_GROUP_DIAG] = "Диагностика",
+    [UI_MENU_ASYNC_PREEMPT] = "Вытеснение на виртуальных ядрах",
+    [UI_MENU_ASYNC_PREEMPT_DESC] = "Позволяет потоку игры прервать другой поток на том же виртуальном ядре.",
+    [UI_MENU_PREEMPT_OFF] = "Выкл.", [UI_MENU_PREEMPT_ON] = "Вкл.", [UI_MENU_PREEMPT_INHERIT] = "Только наследование",
+    [UI_MENU_REPLAY_ASYNC] = "Повтор команд в отдельном потоке",
+    [UI_MENU_REPLAY_ASYNC_DESC] = "Записанные команды GPU выполняются в отдельном потоке.",
+    [UI_MENU_FREE_CORES] = "Затвор виртуальных ядер",
+    [UI_MENU_FREE_CORES_DESC] = "На каждом виртуальном ядре работает один поток, как на консоли.",
+    [UI_MENU_TIMER_1MS] = "Таймер Windows 1 мс",
+    [UI_MENU_TIMER_1MS_DESC] = "Повышает точность системного таймера до 1 мс для ровного темпа кадров.",
+    [UI_MENU_PIPE_WAIT] = "Обработка ожидающих отрисовок",
+    [UI_MENU_PIPE_WAIT_DESC] = "Что делает отрисовка, пока её конвейер ещё собирается.",
+    [UI_MENU_PIPE_WAIT_DEFAULT] = "По умолчанию", [UI_MENU_PIPE_WAIT_DRAW] = "Рисовать",
+    [UI_MENU_PIPE_SKIP] = "Пропуск отрисовок при сборке конвейера",
+    [UI_MENU_PIPE_SKIP_DESC] = "Какие отрисовки отбрасываются, а не ждут свой конвейер.",
+    [UI_MENU_PIPE_SKIP_STRICT] = "Строго", [UI_MENU_PIPE_SKIP_ANY] = "Любые",
+    [UI_MENU_PIPE_SKIP_FULLSCREEN] = "Полноэкранные проходы",
+    [UI_MENU_LIB_PREBUILD] = "Предсборка библиотек стадий",
+    [UI_MENU_LIB_PREBUILD_DESC] = "Заранее собирает библиотеки стадий шейдеров в фоне.",
+    [UI_MENU_LIB_PREBUILD_THREADS] = "Потоки предсборки библиотек",
+    [UI_MENU_LIB_PREBUILD_THREADS_DESC] = "Сколько потоков занято предсборкой; пусто — по числу ядер процессора.",
+    [UI_MENU_PIPE_PREBUILD] = "Предсборка конвейеров",
+    [UI_MENU_PIPE_PREBUILD_DESC] = "Заранее собирает известные конвейеры.",
+    [UI_MENU_PREWARM_XLATE] = "Прогрев транслятора",
+    [UI_MENU_PREWARM_XLATE_DESC] = "Потоки, которые при запуске переводят известные шейдеры; пусто — выбрать самому.",
+    [UI_MENU_GPL] = "Библиотека графических конвейеров",
+    [UI_MENU_GPL_DESC] = "Использует расширение Vulkan для библиотек конвейеров; выключите, если драйвер с ним сбоит.",
+    [UI_MENU_ASTC] = "Распаковка текстур ASTC", [UI_MENU_ASTC_DESC] = "Где распаковываются сжатые текстуры ASTC.",
+    [UI_MENU_ASTC_AUTO] = "Автоматически", [UI_MENU_ASTC_GPU] = "Шейдер GPU", [UI_MENU_ASTC_NATIVE] = "Аппаратно",
+    [UI_MENU_ASTC_CPU] = "Процессор",
+    [UI_MENU_MEMORY] = "Режим памяти GPU", [UI_MENU_MEMORY_DESC] = "Как память игры передаётся видеокарте.",
+    [UI_MENU_MEMORY_AUTO] = "Автоматически", [UI_MENU_MEMORY_IMPORT] = "Импорт", [UI_MENU_MEMORY_MIRROR] = "Зеркало",
+    [UI_MENU_MEMORY_VERIFY] = "Проверка",
+    [UI_MENU_TEX_ALIAS] = "Наложение текстур", [UI_MENU_TEX_ALIAS_DESC] = "Текстуры могут делить память GPU.",
+    [UI_MENU_LOD_GUARD] = "Защита LOD", [UI_MENU_LOD_GUARD_DESC] = "Не даёт уровням детализации текстур мерцать.",
+    [UI_MENU_FIX_C0] = "Исправление константного буфера",
+    [UI_MENU_FIX_C0_DESC] = "Обходит неверное чтение константного буфера в некоторых шейдерах.",
+    [UI_MENU_FIX_ZERO] = "Исправление нуля",
+    [UI_MENU_FIX_ZERO_DESC] = "Обходит случаи, когда результат шейдера должен быть строго нулём.",
+    [UI_MENU_BIND_SKIP] = "Пропуск повторных привязок",
+    [UI_MENU_BIND_SKIP_DESC] = "Оптимизация: пропускает неизменившиеся привязки.",
+    [UI_MENU_SHADER_MEMO] = "Память шейдеров", [UI_MENU_SHADER_MEMO_DESC] = "Оптимизация: запоминает поиск шейдеров.",
+    [UI_MENU_DESC_TEMPLATE] = "Шаблоны дескрипторов",
+    [UI_MENU_DESC_TEMPLATE_DESC] = "Оптимизация: обновляет дескрипторы пачками.",
+    [UI_MENU_PUSH_SKIP] = "Пропуск повторных push-констант",
+    [UI_MENU_PUSH_SKIP_DESC] = "Оптимизация: пропускает неизменившиеся push-константы.",
+    [UI_MENU_SPLIT_DRAWS] = "Разбиение отрисовок",
+    [UI_MENU_SPLIT_DRAWS_DESC] = "Оптимизация: размер, с которого длинные отрисовки разбиваются; 0 — выключить.",
+    [UI_MENU_VK_VALIDATION] = "Слой проверки",
+    [UI_MENU_VK_VALIDATION_DESC] = "Проверяет каждый вызов Vulkan и сильно замедляет игру.",
+    [UI_MENU_VK_VALIDATION_MISSING] = "Слой проверки не установлен.",
+    [UI_MENU_VK_DYN_VERTEX] = "Динамическое состояние вершин",
+    [UI_MENU_VK_DYN_VERTEX_DESC] = "Использует динамический ввод вершин, если драйвер его поддерживает.",
+    [UI_MENU_VK_SUBGROUP_PIN] = "Фиксировать размер подгруппы",
+    [UI_MENU_VK_SUBGROUP_PIN_DESC] = "Фиксирует размер подгруппы шейдера.",
+    [UI_MENU_TRACE] = "Журнал производительности", [UI_MENU_TRACE_DESC] = "Пишет время кадров в файл.",
+    [UI_MENU_FLIGHT] = "Бортовой самописец",
+    [UI_MENU_FLIGHT_DESC] = "Хранит короткую историю и сохраняет её, когда кадр подвисает.",
+    [UI_MENU_FLIGHT_SPIKE_MS] = "Порог подвисания (мс)",
+    [UI_MENU_FLIGHT_SPIKE_MS_DESC] = "Время кадра, которое считается подвисанием.",
+    [UI_MENU_INPUT_RECORD] = "Запись ввода",
+    [UI_MENU_INPUT_RECORD_DESC] = "Пишет ваш ввод в файл для отчёта об ошибке.",
+    [UI_MENU_OPEN_LOG] = "Открыть папку журналов", [UI_MENU_OPEN_LOG_DESC] = "Показывает папку с файлами журнала.",
+    [UI_MENU_COPY_INFO] = "Копировать сведения о системе",
+    [UI_MENU_COPY_INFO_DESC] = "Копирует в буфер обмена видеокарту, драйвер, процессор, память и изменённые настройки.",
+    [UI_MENU_COPY_INFO_DONE] = "Скопировано",
+    [UI_MENU_RESET] = "Сбросить все настройки", [UI_MENU_RESET_DESC] = "Действует на все вкладки.",
+    [UI_MENU_RESET_CONFIRM] = "Сбросить все настройки к значениям по умолчанию?", [UI_MENU_RESET_YES] = "Сбросить",
+    [UI_MENU_RESET_NO] = "Отмена",
+
+    [UI_MENU_OV_FPS] = "%.0f FPS", [UI_MENU_OV_FRAME_MS] = "%.1f мс", [UI_MENU_OV_GAME_PCT] = "игра %.0f%%",
+    [UI_MENU_OV_MAX_MS] = "макс. %.1f мс",
+    [UI_MENU_OV_GPU] = "GPU", [UI_MENU_OV_CPU] = "ЦП", [UI_MENU_OV_RAM] = "ОЗУ", [UI_MENU_OV_VRAM] = "Видеопамять",
+    [UI_MENU_OV_TEMP] = "Температура", [UI_MENU_OV_POWER] = "Мощность", [UI_MENU_OV_CLOCK] = "Частота",
+    [UI_MENU_OV_NONE] = "-",
+    [UI_MENU_OV_REPLAY] = "Повтор команд", [UI_MENU_OV_GPU_TIME] = "Время GPU",
+    [UI_MENU_OV_PIPE_WAIT] = "Ожидания конвейеров",
+    [UI_MENU_OV_SHADER_WAIT] = "Ожидания шейдеров", [UI_MENU_OV_TEX_UPLOADS] = "Загрузки текстур",
+};
+
+#define SWKBD_ONLY(name, ...) static const char *const name[UI_TEXT_COUNT] = {SWKBD(__VA_ARGS__)}
+SWKBD_ONLY(text_ja, "文字入力", "名前を入力してください", "ウマ", "OK", "キャンセル", "コントローラー: A = OK、B = キャンセル");
+SWKBD_ONLY(text_fr, "Saisie de texte", "Entrez un nom", "Cheval", "OK", "Annuler", "Manette : A = OK, B = Annuler");
+SWKBD_ONLY(text_de, "Texteingabe", "Gib einen Namen ein", "Pferd", "OK", "Abbrechen", "Controller: A = OK, B = Abbrechen");
+SWKBD_ONLY(text_it, "Inserimento testo", "Inserisci un nome", "Cavallo", "OK", "Annulla", "Controller: A = OK, B = Annulla");
+SWKBD_ONLY(text_es, "Introducir texto", "Introduce un nombre", "Caballo", "Aceptar", "Cancelar",
+           "Mando: A = Aceptar, B = Cancelar");
+SWKBD_ONLY(text_nl, "Tekstinvoer", "Voer een naam in", "Paard", "OK", "Annuleren", "Controller: A = OK, B = Annuleren");
+SWKBD_ONLY(text_pt, "Inserir texto", "Introduz um nome", "Cavalo", "OK", "Cancelar", "Comando: A = OK, B = Cancelar");
+SWKBD_ONLY(text_zh_hans, "文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消");
+SWKBD_ONLY(text_zh_hant, "文字輸入", "請輸入名字", "馬兒", "確定", "取消", "手把：A 確定，B 取消");
+SWKBD_ONLY(text_ko, "문자 입력", "이름을 입력하세요", "말", "확인", "취소", "컨트롤러: A 확인, B 취소");
+
 static const Row rows[] = {
-    {"en", {"Text entry", "Enter a name", "Horse", "OK", "Cancel", "Controller: A = OK, B = Cancel"}},
-    {"ja", {"文字入力", "名前を入力してください", "ウマ", "OK", "キャンセル", "コントローラー: A = OK、B = キャンセル"}},
-    {"fr", {"Saisie de texte", "Entrez un nom", "Cheval", "OK", "Annuler", "Manette : A = OK, B = Annuler"}},
-    {"de", {"Texteingabe", "Gib einen Namen ein", "Pferd", "OK", "Abbrechen", "Controller: A = OK, B = Abbrechen"}},
-    {"it", {"Inserimento testo", "Inserisci un nome", "Cavallo", "OK", "Annulla", "Controller: A = OK, B = Annulla"}},
-    {"es", {"Introducir texto", "Introduce un nombre", "Caballo", "Aceptar", "Cancelar",
-            "Mando: A = Aceptar, B = Cancelar"}},
-    {"nl", {"Tekstinvoer", "Voer een naam in", "Paard", "OK", "Annuleren", "Controller: A = OK, B = Annuleren"}},
-    {"pt", {"Inserir texto", "Introduz um nome", "Cavalo", "OK", "Cancelar", "Comando: A = OK, B = Cancelar"}},
-    {"ru", {"Ввод текста", "Введите имя", "Лошадь", "ОК", "Отмена", "Контроллер: A — ОК, B — отмена"}},
-    {"zh-Hans", {"文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消"}},
-    {"zh-Hant", {"文字輸入", "請輸入名字", "馬兒", "確定", "取消", "手把：A 確定，B 取消"}},
-    {"ko", {"문자 입력", "이름을 입력하세요", "말", "확인", "취소", "컨트롤러: A 확인, B 취소"}},
+    {"en", text_en}, {"ja", text_ja}, {"fr", text_fr}, {"de", text_de}, {"it", text_it}, {"es", text_es},
+    {"nl", text_nl}, {"pt", text_pt}, {"ru", text_ru}, {"zh-Hans", text_zh_hans}, {"zh-Hant", text_zh_hant},
+    {"ko", text_ko},
 };
 
 const char *ui_text_lang(const char *code) {
@@ -34,11 +319,38 @@ const char *ui_text_lang(const char *code) {
     return code;
 }
 
+static const Row *find_row(const char *lang) {
+    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++)
+        if (!strcmp(rows[i].lang, lang)) return &rows[i];
+    return NULL;
+}
+
+int ui_text_defined(const char *lang, UiTextId id) {
+    const Row *r = find_row(lang);
+    return (unsigned)id < UI_TEXT_COUNT && r && r->text[id] && *r->text[id];
+}
+
 const char *ui_text_in(const char *lang, UiTextId id) {
     if ((unsigned)id >= UI_TEXT_COUNT) return "";
-    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++)
-        if (!strcmp(rows[i].lang, lang) && rows[i].text[id] && *rows[i].text[id]) return rows[i].text[id];
-    return rows[0].text[id];
+    return ui_text_defined(lang, id) ? find_row(lang)->text[id] : rows[0].text[id];
 }
 
 const char *ui_text(UiTextId id) { return ui_text_in(ui_text_lang(ov_language()), id); }
+
+// The menu language, re-read when cfg_version changes. TOTK_MENU_LANG "ru" or "en"; anything else (unset included)
+// follows the system UI language: Russian for "ru", "ru-RU", ..., else English.
+static const char *resolve_menu_lang(void) {
+    const char *v = cfg_value("TOTK_MENU_LANG");
+    if (v && !strcmp(v, "ru")) return "ru";
+    if (v && !strcmp(v, "en")) return "en";
+    const char *sys = plat_ui_language();
+    return sys && (!strcmp(sys, "ru") || !strncmp(sys, "ru-", 3)) ? "ru" : "en";
+}
+
+const char *menu_text(UiTextId id) {
+    static const char *lang = "en";
+    static unsigned seen = ~0u;
+    unsigned v = cfg_version();
+    if (v != seen) lang = resolve_menu_lang(), seen = v;
+    return ui_text_in(lang, id);
+}
