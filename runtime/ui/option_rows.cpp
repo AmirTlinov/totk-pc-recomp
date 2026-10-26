@@ -29,22 +29,35 @@ static const ImU32 kGrey = IM_COL32(110, 110, 102, 255);
 
 static float g_scale = 1;
 static bool g_focus_req, g_take_first;   // opt_focus_first: requested / this page's first row takes it
+static char g_focus_key[64];             // opt_focus_key: the row that takes the cursor when it is next drawn
 static bool g_held;                      // the last row's left / right has been held a while (steppers go faster)
+static bool g_disable_next;              // opt_disable_next: the next row is greyed out with g_disable_note
+static UiTextId g_disable_note;
 
 // The description pane: this frame's hovered and selected rows, the page's first row, and the last one shown.
 struct Desc { char text[512]; };
 static Desc g_hover, g_focus, g_first, g_shown;
 
-static void desc_set(Desc &d, UiTextId desc, const char *key, const CfgMeta *m) {
+// disabled: the note of a row opt_disable_next greyed out, else NULL.
+static void desc_set(Desc &d, UiTextId desc, const char *key, const CfgMeta *m, const char *disabled) {
     int n = snprintf(d.text, sizeof d.text, "%s", menu_text(desc));
     if (n < 0 || n >= (int)sizeof d.text) return;
-    if (cfg_from_env(key))
+    if (disabled)
+        snprintf(d.text + n, sizeof d.text - n, "\n\n%s", disabled);
+    else if (cfg_from_env(key))
         snprintf(d.text + n, sizeof d.text - n, "\n\n%s %s", menu_text(UI_MENU_SET_BY_ENV), key);
     else if (m && !m->live)
         snprintf(d.text + n, sizeof d.text - n, "\n\n%s", menu_text(UI_MENU_AFTER_RESTART));
 }
 
 void opt_focus_first(void) { g_focus_req = true; }
+
+void opt_focus_key(const char *key) { snprintf(g_focus_key, sizeof g_focus_key, "%s", key); }
+
+void opt_disable_next(UiTextId note) {
+    g_disable_next = true;
+    g_disable_note = note;
+}
 
 void opt_begin(const char *id, float scale) {
     g_scale = scale;
@@ -86,24 +99,29 @@ struct RowView {
     const char *value;   // right side; "" for none
     bool is_default;     // the value is the setting's default: the "default" mark, the value not highlighted
     bool arrows;         // a stepper: < value >, the arrows click too
+    const char *note;    // under the value instead of the "default" mark; NULL for none
 };
 
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right) or
 // 0; always 0 for a row the environment fixes (greyed out, still selectable so its description shows).
 static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v) {
     const CfgMeta *m = cfg_meta(key);
-    bool off = cfg_from_env(key) != 0;
+    const char *disabled = g_disable_next ? menu_text(g_disable_note) : NULL;
+    g_disable_next = false;
+    bool off = disabled || cfg_from_env(key) != 0;
     ImGui::PushID(key);
     ImVec2 p = ImGui::GetCursorScreenPos();
     float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = fs * 2.2f;
     ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));   // the row's own border shows the selection
     bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h), ImGuiButtonFlags_EnableNav);
     ImGui::PopStyleColor();
-    if (g_take_first) {
-        g_take_first = false;
+    bool to_key = g_focus_key[0] && !strcmp(key, g_focus_key);
+    if (g_take_first || to_key) {
         ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
         ImGui::SetNavCursorVisible(true);
-        ImGui::SetScrollHereY(0);
+        ImGui::SetScrollHereY(g_take_first ? 0.0f : 0.5f);
+        g_take_first = false;
+        if (to_key) g_focus_key[0] = 0;
     }
     bool hov = ImGui::IsItemHovered(), foc = ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible;
     int step = clicked && !off ? 2 : 0;
@@ -123,9 +141,9 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
         // first four of steps, the stick stays with navigation
         for (int i = 0; i < 4; i++) ImGui::SetKeyOwner(steps[i], ImGui::GetItemID());
     }
-    if (foc) desc_set(g_focus, desc, key, m);
-    if (hov) desc_set(g_hover, desc, key, m);
-    if (!g_first.text[0]) desc_set(g_first, desc, key, m);
+    if (foc) desc_set(g_focus, desc, key, m, disabled);
+    if (hov) desc_set(g_hover, desc, key, m, disabled);
+    if (!g_first.text[0]) desc_set(g_first, desc, key, m, disabled);
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImFont *font = ImGui::GetFont();
@@ -157,16 +175,19 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
                     v.value);
         if (!v.arrows) value_left = vx;
     }
-    if (v.is_default) {   // under the value, right-aligned with it
-        const char *t = menu_text(UI_MENU_DEFAULT_MARK);
+    if (v.note || v.is_default) {   // under the value, right-aligned with it
+        const char *t = v.note ? v.note : menu_text(UI_MENU_DEFAULT_MARK);
         float tw = font->CalcTextSizeA(small, FLT_MAX, 0, t).x;
-        dl->AddText(font, small, ImVec2(right - tw, ny), kDim, t);
+        dl->AddText(font, small, ImVec2(right - tw, ny), v.note ? IM_COL32(220, 170, 100, 255) : kDim, t);
     }
     // the label and its note, clipped before the value
     ImVec4 clip(p.x, p.y, value_left - fs * 0.6f, p.y + h);
     dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : IM_COL32(240, 236, 224, 255), menu_text(label), NULL, 0,
                 &clip);
-    const char *note = off ? menu_text(UI_MENU_SET_BY_ENV) : m && !m->live ? menu_text(UI_MENU_AFTER_RESTART) : NULL;
+    const char *note = disabled        ? disabled
+                     : off             ? menu_text(UI_MENU_SET_BY_ENV)
+                     : m && !m->live ? menu_text(UI_MENU_AFTER_RESTART)
+                                     : NULL;
     if (note) dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : kDim, note);
     ImGui::PopID();
     return off ? 0 : step;
@@ -183,8 +204,10 @@ static void apply(const char *key, const char *value) {
         const char *k = key;
         cfg_reset(&k, 1);
     }
-    g_save_at = plat_now_ns() + 400000000ull;
+    opt_save_soon();
 }
+
+void opt_save_soon(void) { g_save_at = plat_now_ns() + 400000000ull; }
 
 int opt_save_tick(int force) {
     if (!g_save_at || (!force && plat_now_ns() < g_save_at)) return g_save_at != 0;
@@ -198,17 +221,35 @@ int opt_save_tick(int force) {
 
 // ---- rows
 
-bool opt_toggle(const char *key, UiTextId label, UiTextId desc) {
+bool opt_toggle(const char *key, UiTextId label, UiTextId desc, bool inverted) {
     const CfgMeta *m = cfg_meta(key);
-    bool on = cfg_bool(key) != 0, def = m && strcmp(m->def, "0") != 0;
-    RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), on == def, false};
+    bool set = cfg_bool(key) != 0, def = m && strcmp(m->def, "0") != 0;
+    bool on = set != inverted;   // what the row shows
+    RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), set == def, false, NULL};
     if (!row(key, label, desc, v)) return false;   // any step flips it
-    apply(key, on ? "0" : "1");
+    apply(key, set ? "0" : "1");
     return true;
 }
 
+bool opt_button(const char *id, UiTextId label, UiTextId desc, const char *value) {
+    RowView v = {value ? value : "", false, false, NULL};
+    return row(id, label, desc, v) == 2;   // A or a click; left and right do nothing
+}
+
+void opt_group(UiTextId title) {
+    ImGui::Dummy(ImVec2(0, 6 * g_scale));
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", menu_text(title));
+}
+
+void opt_text(UiTextId text, bool warn) {
+    ImGui::PushTextWrapPos(0);
+    if (warn) ImGui::TextColored(ImVec4(0.95f, 0.66f, 0.40f, 1), "%s", menu_text(text));
+    else ImGui::TextUnformatted(menu_text(text));
+    ImGui::PopTextWrapPos();
+}
+
 bool opt_choice_list(const char *key, UiTextId label, const char *const *values, const char *const *names, int n,
-                     UiTextId desc, int cur) {
+                     UiTextId desc, int cur, const char *note) {
     const CfgMeta *m = cfg_meta(key);
     const char *now = cfg_value(key);
     if (cur < 0)
@@ -217,7 +258,7 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
     int def = -1;
     for (int i = 0; m && i < n; i++)
         if (!strcmp(values[i], m->def)) def = i;
-    RowView v = {cur >= 0 ? names[cur] : now, cur == def, true};
+    RowView v = {cur >= 0 ? names[cur] : now, cur == def, true, note};
     int step = row(key, label, desc, v);
     if (!step || n <= 0) return false;
     int nv;
@@ -229,7 +270,7 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
     return true;
 }
 
-bool opt_choice(const char *key, UiTextId label, const UiTextId *names, int n, UiTextId desc) {
+bool opt_choice(const char *key, UiTextId label, const UiTextId *names, int n, UiTextId desc, const char *note) {
     enum { MAX = 32 };
     const CfgMeta *m = cfg_meta(key);
     const char *values[MAX], *shown[MAX];
@@ -245,7 +286,7 @@ bool opt_choice(const char *key, UiTextId label, const UiTextId *names, int n, U
     }
     if (n > k) n = k;
     for (int i = 0; i < n; i++) shown[i] = menu_text(names[i]);
-    return opt_choice_list(key, label, values, shown, n, desc);
+    return opt_choice_list(key, label, values, shown, n, desc, -1, note);
 }
 
 bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId desc, float step, const char *fmt) {
@@ -253,7 +294,7 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     double v = cfg_double(key), def = m ? strtod(m->def, NULL) : lo;
     char shown[48];
     snprintf(shown, sizeof shown, fmt, v);
-    RowView rv = {shown, fabs(v - def) < step * 0.01, true};
+    RowView rv = {shown, fabs(v - def) < step * 0.01, true, NULL};
     int s = row(key, label, desc, rv);
     if (!s) return false;
     int steps = g_held && (hi - lo) > 40 * step ? 10 : 1;   // held: ten steps at a time over a long range

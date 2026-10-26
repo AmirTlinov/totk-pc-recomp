@@ -433,6 +433,8 @@ static DWORD WINAPI window_main(void *arg) {
 }
 
 // ---- swapchain
+static const char *g_present_got = "";   // the TOTK_VK_PRESENT value of the mode the swapchain got; "" before one
+
 static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     const char *e = cfg_value("TOTK_VK_PRESENT");
     VkPresentModeKHR want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
@@ -444,14 +446,17 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, m);
     VkPresentModeKHR got = VK_PRESENT_MODE_FIFO_KHR;
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) got = want;
+    const char *name = got == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : got == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo";
+    __atomic_store_n(&g_present_got, name, __ATOMIC_RELEASE);
     static int logged = -1;   // the mode last logged: a change from the menu shows in the log
     if ((int)got != logged) {
         logged = (int)got;
-        rt_log("gfx: present mode %s (TOTK_VK_PRESENT=%s)",
-               got == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : got == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo", e);
+        rt_log("gfx: present mode %s (TOTK_VK_PRESENT=%s)", name, e);
     }
     return got;
 }
+
+const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_got, __ATOMIC_ACQUIRE); }
 
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.

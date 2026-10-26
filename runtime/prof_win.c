@@ -20,6 +20,7 @@
 #include "flight.h"
 #include "gfx.h"
 #include "host.h"
+#include "perfmon.h"
 
 #define PROF_SLOTS (1u << 16)   // Rip hash table, open addressing; a full table drops new Rips
 #define PROF_TOP 4000           // more than the 200 asked for: the report sums per function
@@ -233,12 +234,29 @@ void prof_write(void) {
     rt_log("prof: %llu samples, %d Rips -> %s", (unsigned long long)total, cnt, out_path);
 }
 
-static int perf_on;   // TOTK_TRACE=perf or TOTK_FLIGHT=1: event counts are taken. Wait times are always taken (frame-time summary).
+// TOTK_TRACE=perf, TOTK_FLIGHT=1 or the full performance overlay: event counts are taken. Wait times are always taken
+// (frame-time summary). perf_base: the part fixed at start.
+static int perf_on, perf_base;
+static int overlay;   // performance overlay mode (perf_set_overlay): 0 off, 1 fps, 2 full
+
+void perf_set_overlay(int mode) {
+    __atomic_store_n(&overlay, mode, __ATOMIC_RELAXED);
+    __atomic_store_n(&perf_on, perf_base || mode == 2, __ATOMIC_RELAXED);
+}
+
+int perf_gpu_timing(void) { return (rt_trace & RT_TRACE_PERF) || __atomic_load_n(&overlay, __ATOMIC_RELAXED) == 2; }
+
+static volatile LONG64 gpu_busy_total;
+
+void perf_gpu_busy(uint64_t ns) { InterlockedAdd64(&gpu_busy_total, (LONG64)ns); }
+
+uint64_t perf_gpu_busy_total(void) { return (uint64_t)__atomic_load_n(&gpu_busy_total, __ATOMIC_RELAXED); }
 
 void prof_start(void) {
     flight_init();
     atexit(perf_summary_flush);   // boot.c's _exit path goes through prof_write instead
-    perf_on = (rt_trace & RT_TRACE_PERF) || flight_on;
+    perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
+    perf_on = perf_base || overlay == 2;
     out_path = cfg_get("TOTK_PROFILE");
     if (!out_path || !*out_path) {
         out_path = NULL;
@@ -292,7 +310,7 @@ static volatile LONG64 render_wait_ns;    // the same on the render thread
 void (*perf_gpu_stats)(PerfGpu *out);
 
 void perf_gpu_wait(uint64_t t0) {
-    if (!t0 || !perf_on) return;
+    if (!t0 || !__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) return;
     LONG64 d = (LONG64)(kern_now_ns() - t0);
     InterlockedAdd64(GetCurrentThreadId() == render_tid ? &render_wait_ns : &other_wait_ns, d);
 }
@@ -304,13 +322,13 @@ void perf_replay(uint64_t t0) {
     if (!t0) return;
     LONG64 d = (LONG64)(kern_now_ns() - t0);
     InterlockedAdd64(&frame_replay_ns, d);
-    if (perf_on) InterlockedAdd64(&replay_ns, d);
+    if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) InterlockedAdd64(&replay_ns, d);
 }
 
 static volatile LONG64 counts[PERF_CNT_N];   // running totals: the perf log and the flight recorder take differences
 
 void perf_count(int kind) {
-    if (perf_on) InterlockedIncrement64(&counts[kind]);
+    if (__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) InterlockedIncrement64(&counts[kind]);
 }
 
 // ---- Frame-time summary, always on: every 60 s of play and at exit one line of frame count, mean fps, 1% low and the
@@ -360,12 +378,13 @@ void perf_summary_flush(void) {   // at exit (prof_write)
     summary_t0 = 0;
 }
 
-static void ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
+// Returns the replay time since the previous present.
+static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     LONG64 rep = InterlockedExchange64(&frame_replay_ns, 0);
     if (!summary_t0) {   // the first present starts the period; there is no interval yet
         summary_t0 = now;
         ft.t0 = now;
-        return;
+        return (uint64_t)rep;
     }
     ft.frames++;
     ft.sum += d;
@@ -386,6 +405,7 @@ static void ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         ft_report(now, "60 s");
         summary_t0 = now;
     }
+    return (uint64_t)rep;
 }
 
 // The second line of the 60-frame window: GPU busy time (timestamps), the time threads waited for GPU fences, VRAM and
@@ -424,7 +444,9 @@ void perf_present(uint64_t frame) {
     cur_frame = frame;
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
-    ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
+    uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
+    if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
+        perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
     if (flight_on) flight_frame(frame, now, d, frame_ns, counts);
     if (!(rt_trace & RT_TRACE_PERF)) {

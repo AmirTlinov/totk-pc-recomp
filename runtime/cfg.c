@@ -247,6 +247,20 @@ int cfg_reset(const char *const *keys, int n) {
 
 int cfg_last_save_ok(void) { return __atomic_load_n(&save_ok, __ATOMIC_ACQUIRE); }
 
+void cfg_each_active(void (*cb)(const char *key, const char *value, int from_env, void *ctx), void *ctx) {
+    int n = __atomic_load_n(&n_entries, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const char *v = __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
+        if (v) cb(entries[i].key, v, 0, ctx);
+    }
+    for (size_t i = 0; i < sizeof known / sizeof *known; i++) {
+        char var[80];
+        snprintf(var, sizeof var, PREFIX "%s", known[i]);
+        const char *e = getenv(var);
+        if (e) cb(known[i], e, 1, ctx);
+    }
+}
+
 const CfgMeta *cfg_meta(const char *key) {
     char k[64];
     snprintf(k, sizeof k, "%s", key);
