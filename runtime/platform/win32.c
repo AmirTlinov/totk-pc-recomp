@@ -236,6 +236,21 @@ int plat_file_truncate(const char *path, uint64_t size) {
     return ok;
 }
 
+int64_t plat_file_size(const char *path) {
+    wchar_t w[WPATH];
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!widen(path, w, WPATH) || !GetFileAttributesExW(w, GetFileExInfoStandard, &d)) return -1;
+    return (int64_t)(((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow);
+}
+
+int plat_file_set_readonly(const char *path, int on) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    DWORD a = GetFileAttributesW(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return 0;
+    return SetFileAttributesW(w, on ? a | FILE_ATTRIBUTE_READONLY : a & ~(DWORD)FILE_ATTRIBUTE_READONLY) != 0;
+}
+
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx) {
     wchar_t wd[WPATH], we[64], pat[WPATH + 64];
     if (!widen(dir, wd, WPATH) || !widen(ext, we, 64)) return 0;

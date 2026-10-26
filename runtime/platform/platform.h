@@ -58,6 +58,8 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n);
 int plat_file_flush(const char *path);                   // flushes a written file's data to the disk; 1 on success
 void plat_file_delete(const char *path);
 int plat_file_truncate(const char *path, uint64_t size);  // 1 on success
+int64_t plat_file_size(const char *path);                 // bytes of a file, -1 when missing or unreadable
+int plat_file_set_readonly(const char *path, int on);     // sets or clears the read-only attribute; 1 on success
 // Calls cb(name, ctx) for each file in dir whose name ends in ext (".in"); name has no directory part. cb returns 0 to
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);

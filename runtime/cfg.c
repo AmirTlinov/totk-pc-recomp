@@ -223,15 +223,20 @@ int cfg_reset(const char *const *keys, int n) {
         const char *name = norm_key(key);
         snprintf(var, sizeof var, PREFIX "%s", name);
         if (getenv(var)) continue;   // the environment wins; the file line stays
-        for (int i = 0; i < n_entries; i++)
-            if (!strcmp(entries[i].key, name)) {
-                if (!entries[i].value) break;
-                __atomic_store_n(&entries[i].value, NULL, __ATOMIC_RELEASE);   // the old string stays for readers
-                entries[i].dirty = 0;
-                entries[i].removed = 1;   // cfg_save_to deletes the key's lines
-                done++;
-                break;
-            }
+        int i = 0;
+        while (i < n_entries && strcmp(entries[i].key, name)) i++;
+        if (i == n_entries) {   // no value in memory ("key =" in the file): the line still has to go
+            if (i == CFG_MAX_KEYS) continue;
+            entries[i] = (CfgEntry){_strdup(name), NULL, 0, 1};
+            __atomic_store_n(&n_entries, i + 1, __ATOMIC_RELEASE);
+        } else if (entries[i].value) {
+            __atomic_store_n(&entries[i].value, NULL, __ATOMIC_RELEASE);   // the old string stays for readers
+            entries[i].dirty = 0;
+            entries[i].removed = 1;   // cfg_save_to deletes the key's lines
+            done++;
+        } else {
+            entries[i].removed = 1;
+        }
     }
     if (done) __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&set_lock);
@@ -349,6 +354,13 @@ int cfg_save_to(const char *path) {
     }
     uint64_t size = 0;
     uint8_t *data = plat_file_read(path, &size);
+    if (!data && plat_file_exists(path) && plat_file_size(path) != 0) {
+        // the file is there but unreadable (locked, transient error): rebuilding it from nothing would lose its lines
+        rt_log("cfg: cannot read %s, nothing written", path);
+        __atomic_store_n(&save_ok, 0, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&set_lock);
+        return 0;
+    }
     const char *text = data ? (const char *)data : "";
     int nl = data ? line_count(text, size) : 0;
     Line *lines = calloc((size_t)nl + 1, sizeof *lines);

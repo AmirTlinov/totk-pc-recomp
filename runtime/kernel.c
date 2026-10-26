@@ -266,7 +266,8 @@ static void ap_init(void);
 
 static int cores_enabled(void) {
     if (g_cores_on < 0) {
-        g_cores_on = cfg_get("TOTK_FREE_CORES") ? 0 : 1;
+        const char *fc = cfg_get("TOTK_FREE_CORES");
+        g_cores_on = fc && strcmp(fc, "0") ? 0 : 1;   // "0" keeps the gate, like unset
         diag_init();
         ap_init();
     }

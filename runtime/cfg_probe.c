@@ -9,9 +9,6 @@
 #include "input.h"
 #include "input_map.h"
 #include "platform/platform.h"
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
@@ -176,6 +173,17 @@ int probe_cfg(void) {
     CHECK(got && strstr((const char *)got, "\nvolume = 60\n"), "reset then set: the new line is written");
     free(got);
 
+    // an active line with an empty value has no entry in memory; Reset still removes it from the file
+    static const char rempty[] = "[audio]\n# volume = 100\nvolume =\n[input]\nmotion = 0\n";
+    CHECK(plat_file_write(path, rempty, sizeof rempty - 1) && cfg_load(path) == 1 && cfg_get("TOTK_VOLUME") == NULL,
+          "reset: load an ini with an empty value");
+    CHECK(cfg_reset(vol, 1) == 0 && cfg_save_to(path) == 1, "reset: an empty-valued key saves");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && got_n == sizeof rbase - 1 && !memcmp(got, rbase, got_n), "reset: the empty-valued line is gone");
+    free(got);
+    cfg_set("TOTK_VOLUME", "60");
+    CHECK(cfg_save_to(path) == 1, "reset: volume 60 again for the environment case");
+
     // a key the environment sets is skipped and keeps its file line
     CHECK(cfg_load(path) == 1 && EQ(cfg_get("TOTK_VOLUME"), "60"), "reset: reload");
     _putenv_s("TOTK_VOLUME", "70");
@@ -196,13 +204,11 @@ int probe_cfg(void) {
     CHECK(cfg_save_to(bad) == 0 && cfg_last_save_ok() == 0 && EQ(cfg_get("TOTK_VOLUME"), "20"),
           "save status: an unwritable path fails, the value stays");
     cfg_set("TOTK_VOLUME", "21");
-#ifdef _WIN32
     CHECK(plat_file_write(path, rbase, sizeof rbase - 1), "write the read-only ini");
-    SetFileAttributesA(path, FILE_ATTRIBUTE_READONLY);
+    CHECK(plat_file_set_readonly(path, 1), "set the file read-only");
     CHECK(cfg_save_to(path) == 0 && cfg_last_save_ok() == 0 && EQ(cfg_get("TOTK_VOLUME"), "21"),
           "save status: a read-only file fails, cfg_get returns the new value");
-    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
-#endif
+    plat_file_set_readonly(path, 0);
     CHECK(cfg_save_to(path) == 1 && cfg_last_save_ok() == 1, "save status: the retry after the failure works");
     got = plat_file_read(path, &got_n);
     CHECK(got && strstr((const char *)got, "\nvolume = 21\n"), "save status: the retried save wrote the value");
