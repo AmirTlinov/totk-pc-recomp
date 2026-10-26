@@ -184,17 +184,16 @@ static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window b
 
 static int is_fullscreen(HWND h) { return !(GetWindowLongW(h, GWL_STYLE) & WS_OVERLAPPEDWINDOW); }
 
-// TOTK_FULLSCREEN=1: borderless window over the monitor. TOTK_WINDOW_SIZE=<w>x<h>: client area of the window, default
-// 1920x1080 (the swapchain follows the window; the game image is scaled to it).
+// TOTK_FULLSCREEN=1: borderless window over the monitor. TOTK_WINDOW_SIZE=<w>x<h>: client area of the window (the
+// swapchain follows the window; the game image is scaled to it).
 static int cfg_fullscreen(void) {
-    const char *e = cfg_get("TOTK_FULLSCREEN");
-    return e && !strcmp(e, "1");
+    return cfg_bool("TOTK_FULLSCREEN");
 }
 
 static void cfg_window_size(int *w, int *h) {
-    const char *e = cfg_get("TOTK_WINDOW_SIZE");
     int x = 0, y = 0;
-    if (!e || sscanf(e, "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320) x = 1920, y = 1080;
+    if (sscanf(cfg_value("TOTK_WINDOW_SIZE"), "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320)
+        sscanf(cfg_meta("WINDOW_SIZE")->def, "%dx%d", &x, &y);   // unparsable or out of range: the default
     *w = x;
     *h = y;
 }
@@ -223,16 +222,14 @@ static char g_applied_size[32];
 static int g_applied_fs;
 
 static void note_applied(void) {
-    const char *e = cfg_get("TOTK_WINDOW_SIZE");
-    snprintf(g_applied_size, sizeof g_applied_size, "%s", e ? e : "");
+    snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("TOTK_WINDOW_SIZE"));
     g_applied_fs = cfg_fullscreen();
 }
 
 // Window thread: the window takes the size and fullscreen state of the settings when they changed. In fullscreen the
 // size goes into the placement restored when fullscreen ends.
 static void apply_settings(HWND h) {
-    const char *e = cfg_get("TOTK_WINDOW_SIZE");
-    int size_changed = strcmp(e ? e : "", g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
+    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
     note_applied();
     if (size_changed) {
         int cw, ch;
@@ -272,9 +269,9 @@ static void window_settings_live(void) {
     unsigned v = cfg_version();
     if (started && v == seen) return;
     seen = v;
-    const char *e = cfg_get("TOTK_VK_PRESENT");
-    if (!started || strncmp(e ? e : "", present, sizeof present - 1)) {
-        snprintf(present, sizeof present, "%s", e ? e : "");
+    const char *e = cfg_value("TOTK_VK_PRESENT");
+    if (!started || strncmp(e, present, sizeof present - 1)) {
+        snprintf(present, sizeof present, "%s", e);
         if (started) InterlockedExchange(&g_dirty, 1);
     }
     if (started) gfx_window_apply_settings();
@@ -364,8 +361,8 @@ static DWORD WINAPI window_main(void *arg) {
 
 // ---- swapchain
 static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
-    const char *e = cfg_get("TOTK_VK_PRESENT");
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+    const char *e = cfg_value("TOTK_VK_PRESENT");
+    VkPresentModeKHR want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, NULL);

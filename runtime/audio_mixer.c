@@ -56,7 +56,7 @@ typedef struct Mixer {
 
 static _Atomic float device_volume = 1.0f;
 
-// TOTK_VOLUME: the player's volume in percent (0..100, default 100) on top of the game's own; a live setting (the
+// TOTK_VOLUME: the player's volume in percent (0..100) on top of the game's own; a live setting (the
 // menu), parsed again when cfg_version changes. Render thread only.
 static float host_volume(void) {
     static float v = 1.0f;
@@ -64,10 +64,7 @@ static float host_volume(void) {
     unsigned ver = cfg_version();
     if (ver == seen) return v;
     seen = ver;
-    const char *e = cfg_get("TOTK_VOLUME");
-    char *end;
-    double pct = e ? strtod(e, &end) : 100;
-    if (!e || end == e || *end || pct != pct) pct = 100;
+    double pct = cfg_double("TOTK_VOLUME");
     v = (float)((pct < 0 ? 0 : pct > 100 ? 100 : pct) / 100);
     return v;
 }

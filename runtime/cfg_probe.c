@@ -261,6 +261,53 @@ int probe_cfg(void) {
     CHECK((int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768, "mouse: clamped to the unit circle");
     input_mouse_stick(30, 0, 1.0 / 60, 0, st);
     CHECK(st[0] == 0 && st[1] == 0, "mouse: sensitivity 0 is off");
+    // defaults live in the CfgMeta table: cfg_value and the typed accessors fall back to it
+    cfg_load("cfg-probe-missing.ini");
+    _putenv_s("TOTK_FPS60", "");
+    _putenv_s("TOTK_MOUSE_SENS", "");
+    _putenv_s("TOTK_FREE_CORES", "");
+    CHECK(cfg_bool("TOTK_FPS60") == 1, "default: unset FPS60 is on");
+    CHECK(EQ(cfg_value("TOTK_VK_PRESENT"), "mailbox") && cfg_int("TOTK_SPLIT_DRAWS") == 64, "default: text and integer");
+    _putenv_s("TOTK_MOUSE_SENS", "2.5");
+    CHECK(cfg_double("TOTK_MOUSE_SENS") == 2.5, "double: the environment value");
+    _putenv_s("TOTK_MOUSE_SENS", "fast");
+    CHECK(cfg_double("TOTK_MOUSE_SENS") == 1.0, "double: a value that does not parse gives the default");
+    _putenv_s("TOTK_MOUSE_SENS", "");
+    cfg_set("TOTK_MOUSE_SENS", "3");
+    CHECK(cfg_double("TOTK_MOUSE_SENS") == 3.0 && cfg_int("TOTK_MOUSE_SENS") == 3, "a cfg_set value beats the default");
+    CHECK(cfg_bool("TOTK_FREE_CORES") == 0, "free_cores unset: off");
+    _putenv_s("TOTK_FREE_CORES", "0");
+    CHECK(cfg_bool("TOTK_FREE_CORES") == 0, "free_cores 0 gives the same as unset");
+    _putenv_s("TOTK_FREE_CORES", "1");
+    CHECK(cfg_bool("TOTK_FREE_CORES") == 1, "free_cores 1: on");
+    _putenv_s("TOTK_FREE_CORES", "");
+    cfg_load("cfg-probe-missing.ini");
+    int listed = 0;
+    for (int i = 0; cfg_meta_at(i); i++) {
+        const CfgMeta *m = cfg_meta_at(i);
+        if (!*m->def) continue;
+        listed++;
+        char name[96];
+        snprintf(name, sizeof name, "TOTK_%s", m->key);
+        _putenv_s(name, "");
+        CHECK(EQ(cfg_value(name), m->def), "cfg_value returns the table default");
+        int ok = 0;
+        if (!m->values) ok = 1;
+        else if (strstr(m->values, "..")) {
+            long lo = strtol(m->values, NULL, 10), hi = strtol(strstr(m->values, "..") + 2, NULL, 10);
+            double d = strtod(m->def, NULL);
+            ok = d >= (double)lo && d <= (double)hi;
+        } else {
+            size_t dl = strlen(m->def);
+            for (const char *v = m->values; *v;) {
+                size_t n = strcspn(v, "|");
+                ok |= n == dl && !strncmp(v, m->def, n);
+                v += n + (v[n] == '|');
+            }
+        }
+        if (!ok) fprintf(stderr, "FAIL cfg: default '%s' of %s is not one of its values '%s'\n", m->def, m->key, m->values), fails++;
+    }
+    CHECK(listed >= 30, "the defaults table was walked");
     printf("probe-cfg: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

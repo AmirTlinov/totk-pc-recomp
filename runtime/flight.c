@@ -65,13 +65,12 @@ static unsigned env_u(const char *name, unsigned def) {
 }
 
 void flight_init(void) {
-    const char *e = cfg_get("TOTK_FLIGHT");
-    if (!e || strcmp(e, "1")) return;
+    if (strcmp(cfg_value("TOTK_FLIGHT"), "1")) return;
     ring_n = (int)env_u("TOTK_FLIGHT_FRAMES", 600);
     if (ring_n < 64) ring_n = 64;
     if (ring_n > 7200) ring_n = 7200;
     if (!(ring = calloc((size_t)ring_n, sizeof *ring))) { rt_log("flight: no memory for %d records, off", ring_n); return; }
-    spike_ns = (uint64_t)env_u("TOTK_FLIGHT_SPIKE_MS", 100) * 1000000ull;
+    spike_ns = (uint64_t)cfg_int("TOTK_FLIGHT_SPIKE_MS") * 1000000ull;
     for (const char *p = cfg_get("TOTK_FLIGHT_AT"); p && *p && n_at < 16;) {
         char *end;
         unsigned long long f = strtoull(p, &end, 10);

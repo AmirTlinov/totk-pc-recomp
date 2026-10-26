@@ -40,7 +40,7 @@ int vk_caps_gpl(const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *f,
                 const VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT *p) {
     gpl_lib = f->graphicsPipelineLibrary;
     gpl_fast = p->graphicsPipelineLibraryFastLinking;
-    vk_caps.gpl = gpl_lib && gpl_fast && env_u32("TOTK_GPL", 1);
+    vk_caps.gpl = gpl_lib && gpl_fast && cfg_bool("TOTK_GPL");
     return vk_caps.gpl;
 }
 
@@ -86,7 +86,7 @@ void vk_caps_init(VkCtx *c) {
     vk_caps.sbuf_align = l->minStorageBufferOffsetAlignment > 4 ? (uint32_t)l->minStorageBufferOffsetAlignment : 0;
 
     uint32_t want = env_u32("TOTK_VK_SUBGROUP", 32);
-    int pin = f13.subgroupSizeControl && env_u32("TOTK_VK_SUBGROUP_PIN", 1) && p13.minSubgroupSize <= want &&
+    int pin = f13.subgroupSizeControl && cfg_bool("TOTK_VK_SUBGROUP_PIN") && p13.minSubgroupSize <= want &&
               want <= p13.maxSubgroupSize;
     vk_caps.sg_size = want;
     vk_caps.sg_pin_stages = pin ? p13.requiredSubgroupSizeStages : 0;

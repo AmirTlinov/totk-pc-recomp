@@ -71,8 +71,9 @@ static const struct { const char *key, *section; } sections[] = {
     {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
 };
 
-// The settings the menu shows: the value each consumer uses when the key is unset, and what the key accepts. Defaults
-// are copied from the consumers (grep cfg_get("TOTK_<KEY>")); the consumers keep parsing as they do.
+// The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
+// default lives: consumers read cfg_value / cfg_int / cfg_double / cfg_bool. A row with an empty default has no fixed
+// value (it depends on the machine); its consumer reads cfg_get and keeps an "unset" branch.
 #define LIVE 1
 #define RESTART 0
 static const CfgMeta metas[] = {
@@ -253,6 +254,37 @@ const CfgMeta *cfg_meta(const char *key) {
         if (!strcmp(metas[i].key, name)) return &metas[i];
     return NULL;
 }
+
+const CfgMeta *cfg_meta_at(int i) { return i >= 0 && (size_t)i < sizeof metas / sizeof *metas ? &metas[i] : NULL; }
+
+const char *cfg_value(const char *name) {
+    const char *e = cfg_get(name);
+    if (e && *e) return e;
+    const CfgMeta *m = cfg_meta(name);
+    if (!m) rt_fatal("cfg: %s has no row in the settings table", name);
+    return m->def;
+}
+
+// The row's default as a number, for a set value that does not parse.
+static double default_number(const char *name) {
+    return strtod(cfg_meta(name)->def, NULL);
+}
+
+double cfg_double(const char *name) {
+    const char *v = cfg_value(name);
+    char *end;
+    double d = strtod(v, &end);
+    return end == v || *end || d != d ? default_number(name) : d;
+}
+
+int cfg_int(const char *name) {
+    const char *v = cfg_value(name);
+    char *end;
+    long l = strtol(v, &end, 10);
+    return end == v || *end ? (int)default_number(name) : (int)l;
+}
+
+int cfg_bool(const char *name) { return strcmp(cfg_value(name), "0") != 0; }
 
 // ---- cfg_save: the file as lines, each with its line ending
 typedef struct { const char *s; size_t n; } Line;   // n includes the '\n' (and '\r') when present

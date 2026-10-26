@@ -417,8 +417,7 @@ static void test_cores(Cpu *c) {
     int now, held_max;
     kern_core_stats(&now, &held_max);
     DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    const char *fc = cfg_get("TOTK_FREE_CORES");
-    int gate = !fc || !strcmp(fc, "0");   // the kernel's own switch
+    int gate = !cfg_bool("TOTK_FREE_CORES");   // the kernel's own switch
     int ok = g_run_max <= 3 && held_max <= 3 && !g_core_clash && (cpus < 4 || g_run_max == 3);
     printf("virtual cores: %d threads x %d runs on %lu host CPUs: at most %ld running guest code at once, at most %d "
            "core holders (kernel count), %ld core-number clashes: %s\n", CORE_WORKERS, CORE_RUNS, cpus, g_run_max,

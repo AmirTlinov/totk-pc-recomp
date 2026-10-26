@@ -193,19 +193,16 @@ static void once(volatile long *flag, const char *fmt, uint32_t v) {
 static float rumble_strength = 1.3f, rumble_curve = 0.6f;
 static volatile long rumble_cfg_logged;
 static unsigned rumble_cfg_seen = ~0u;
-static float cfg_float(const char *name, float def, float lo, float hi) {
-    const char *e = cfg_get(name);
-    char *end;
-    double v = e ? strtod(e, &end) : 0;
-    if (!e || end == e || *end || v != v) return def;
+static float cfg_float(const char *name, float lo, float hi) {
+    double v = cfg_double(name);
     return (float)(v < lo ? lo : v > hi ? hi : v);
 }
 static void rumble_cfg(void) {
     unsigned v = cfg_version();
     if (v == rumble_cfg_seen) return;
     rumble_cfg_seen = v;
-    rumble_strength = cfg_float("TOTK_RUMBLE_STRENGTH", 130, 0, 300) / 100;
-    rumble_curve = cfg_float("TOTK_RUMBLE_CURVE", 0.6f, 0.2f, 1.5f);
+    rumble_strength = cfg_float("TOTK_RUMBLE_STRENGTH", 0, 300) / 100;
+    rumble_curve = cfg_float("TOTK_RUMBLE_CURVE", 0.2f, 1.5f);
     int trig = input_rumble_triggers_enabled();
     if (!InterlockedExchange(&rumble_cfg_logged, 1))
         rt_log("hid: rumble strength %.0f%%, curve %.2f, triggers %s", rumble_strength * 100, rumble_curve, trig ? "on" : "off");

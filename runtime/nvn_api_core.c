@@ -605,8 +605,7 @@ static void obs_release_read(Cpu *c) {
     if (lr != 0x70008c70c8ull) return;
     static int on = -1;
     if (on < 0) {
-        const char *e = cfg_get("TOTK_LOD_GUARD");
-        on = !(e && !strcmp(e, "0"));
+        on = cfg_bool("TOTK_LOD_GUARD");
     }
     if (!on || *(volatile uint8_t *)(uintptr_t)(obj + 0x528) != *(volatile uint8_t *)(uintptr_t)(obj + 0x529)) return;
     uint64_t e = __atomic_load_n(&lod_entered, __ATOMIC_SEQ_CST);

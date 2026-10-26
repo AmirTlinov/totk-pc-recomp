@@ -134,7 +134,7 @@ static void rec_flush_all(void) {
 
 static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
     if (!rec_state) {
-        const char *path = cfg_get("TOTK_INPUT_RECORD");
+        const char *path = cfg_get("TOTK_INPUT_RECORD");   // no default: not recording when unset
         rec = path && *path ? fopen(path, "w") : NULL;
         rec_state = rec ? 1 : -1;
         if (path && *path && !rec) rt_log("input: cannot open TOTK_INPUT_RECORD %s", path);
@@ -203,10 +203,7 @@ static float mouse_sens_get(void) {
     unsigned ver = cfg_version();
     if (mouse_sens >= 0 && ver == mouse_sens_seen) return mouse_sens;
     mouse_sens_seen = ver;
-    const char *e = cfg_get("TOTK_MOUSE_SENS");
-    char *end;
-    double v = e ? strtod(e, &end) : 1;
-    if (!e || end == e || *end || v != v) v = 1;
+    double v = cfg_double("TOTK_MOUSE_SENS");
     mouse_sens = (float)(v < 0 ? 0 : v > 10 ? 10 : v);
     return mouse_sens;
 }
@@ -480,8 +477,7 @@ uint16_t rumble_motor(float a, float curve, float strength) {
 }
 
 int input_rumble_triggers_enabled(void) {
-    const char *e = cfg_get("TOTK_RUMBLE_TRIGGERS");
-    return e && !strcmp(e, "1");
+    return cfg_bool("TOTK_RUMBLE_TRIGGERS");
 }
 
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
@@ -538,8 +534,7 @@ int input_motion_enabled(void) {
     unsigned v = cfg_version();
     if (on < 0 || v != seen) {
         seen = v;
-        const char *e = cfg_get("TOTK_MOTION");
-        on = !(e && !strcmp(e, "0"));
+        on = cfg_bool("TOTK_MOTION");
     }
     return on;
 }

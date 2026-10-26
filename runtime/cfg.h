@@ -41,3 +41,15 @@ int cfg_last_save_ok(void);
 typedef struct { const char *key, *def, *values; int live; } CfgMeta;
 // The row of key (prefix and case ignored); NULL for a key the menu does not show.
 const CfgMeta *cfg_meta(const char *key);
+// The i-th row (0-based, table order); NULL past the last.
+const CfgMeta *cfg_meta_at(int i);
+
+// The setting's value for consumers: the environment or totk.ini value, else the CfgMeta default. name has the TOTK_
+// prefix, like cfg_get; a name without a row is a bug (rt_fatal). A row with an empty default has no fixed value: its
+// consumer reads cfg_get and keeps its own "unset" branch. An empty value counts as unset.
+const char *cfg_value(const char *name);
+// cfg_value parsed. A set value that does not parse (int: whole string; double: strtod) gives the default's number.
+// cfg_bool: "0" is false, anything else true.
+int cfg_int(const char *name);
+double cfg_double(const char *name);
+int cfg_bool(const char *name);

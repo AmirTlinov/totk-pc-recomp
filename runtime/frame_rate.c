@@ -83,8 +83,7 @@ static void frame_limit_live(void) {
     fps60_seen = v;
     if (fps60_set == -2) fps60_set = rt_patch_set("fps60");
     if (fps60_set < 0) return;
-    const char *e = cfg_get("TOTK_FPS60");
-    int on = e && *e ? strcmp(e, "0") != 0 : 1;
+    int on = cfg_bool("TOTK_FPS60");
     if (on == rt_patch_enabled(fps60_set)) return;
     rt_patch_switch(fps60_set, on);
     rt_log("frame rate: limit %d fps (TOTK_FPS60=%d)", on ? 60 : 30, on);

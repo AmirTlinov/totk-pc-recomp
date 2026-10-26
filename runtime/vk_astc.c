@@ -309,8 +309,8 @@ int vk_astc_mode(void) {
     AcquireSRWLockExclusive(&g_lock);
     reset_for(c);
     if (G.mode < 0) {
-        const char *e = cfg_get("TOTK_ASTC");
-        int want = !e || !*e || !strcmp(e, "auto") ? -1 : !strcmp(e, "cpu") ? VK_ASTC_CPU : !strcmp(e, "gpu") ? VK_ASTC_GPU
+        const char *e = cfg_value("TOTK_ASTC");
+        int want = !strcmp(e, "auto") ? -1 : !strcmp(e, "cpu") ? VK_ASTC_CPU : !strcmp(e, "gpu") ? VK_ASTC_GPU
                  : !strcmp(e, "native") ? VK_ASTC_NATIVE : !strcmp(e, "check") ? VK_ASTC_CHECK : -2;
         if (want == -2) rt_log("vk: TOTK_ASTC=%s is not cpu, gpu, native, check or auto: auto", e), want = -1;
         if ((want == -1 || want == VK_ASTC_NATIVE) && native_device(c)) m = VK_ASTC_NATIVE;
