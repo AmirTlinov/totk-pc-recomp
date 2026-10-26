@@ -1,6 +1,7 @@
 // Catalog of the text the host shows the player (ui_text.h). One array per catalog language, indexed by UiTextId: a new
 // string gets an id in ui_text.h and an entry in every language that has one (a missing entry falls back to English).
 // The software keyboard has every language; the menu has English and Russian.
+#include <stdatomic.h>
 #include <string.h>
 
 #include "cfg.h"
@@ -87,8 +88,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_TIMER_1MS] = "1 ms Windows timer",
     [UI_MENU_TIMER_1MS_DESC] = "Raises the system timer resolution to 1 ms for steadier frame pacing.",
     [UI_MENU_PIPE_WAIT] = "Waiting draw handling",
-    [UI_MENU_PIPE_WAIT_DESC] = "What a draw does while its pipeline is still building.",
-    [UI_MENU_PIPE_WAIT_DEFAULT] = "Default", [UI_MENU_PIPE_WAIT_DRAW] = "Draw",
+    [UI_MENU_PIPE_WAIT_DESC] = "Default keeps the current scheduling with a reserved worker for waiting draws; Old (draw) uses the previous scheduling.",
+    [UI_MENU_PIPE_WAIT_DEFAULT] = "Default", [UI_MENU_PIPE_WAIT_DRAW] = "Old (draw)",
     [UI_MENU_PIPE_SKIP] = "Draws skipped while a pipeline builds",
     [UI_MENU_PIPE_SKIP_DESC] = "Which draws are dropped instead of waiting for their pipeline.",
     [UI_MENU_PIPE_SKIP_STRICT] = "Strict", [UI_MENU_PIPE_SKIP_ANY] = "Any",
@@ -109,12 +110,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MEMORY] = "GPU memory mode", [UI_MENU_MEMORY_DESC] = "How game memory is shared with the GPU.",
     [UI_MENU_MEMORY_AUTO] = "Automatic", [UI_MENU_MEMORY_IMPORT] = "Import", [UI_MENU_MEMORY_MIRROR] = "Mirror",
     [UI_MENU_MEMORY_VERIFY] = "Verify",
-    [UI_MENU_TEX_ALIAS] = "Texture aliasing", [UI_MENU_TEX_ALIAS_DESC] = "Lets textures share GPU memory.",
-    [UI_MENU_LOD_GUARD] = "LOD guard", [UI_MENU_LOD_GUARD_DESC] = "Stops texture detail levels from flickering.",
+    [UI_MENU_TEX_ALIAS] = "Texture aliasing", [UI_MENU_TEX_ALIAS_DESC] = "A new texture created over a live texture's memory starts with that content instead of empty.",
+    [UI_MENU_LOD_GUARD] = "LOD guard", [UI_MENU_LOD_GUARD_DESC] = "Prevents objects flashing in the wrong place or a flat far field for a frame, by waiting for the game to finish rewriting level-of-detail data before the GPU reads it.",
     [UI_MENU_FIX_C0] = "Constant buffer fix",
-    [UI_MENU_FIX_C0_DESC] = "Works around a wrong constant buffer read in some shaders.",
-    [UI_MENU_FIX_ZERO] = "Zero value fix",
-    [UI_MENU_FIX_ZERO_DESC] = "Works around shader results that must be exactly zero.",
+    [UI_MENU_FIX_C0_DESC] = "Fills the driver-reserved constant bank c0 (storage sizes, dispatch size, point size, base instance) instead of reading zeros.",
+    [UI_MENU_FIX_ZERO] = "Zero new GPU memory",
+    [UI_MENU_FIX_ZERO_DESC] = "New GPU memory pools start zero-filled, as Switch memory does.",
     [UI_MENU_BIND_SKIP] = "Skip repeated binds",
     [UI_MENU_BIND_SKIP_DESC] = "Optimisation: skips bindings that did not change.",
     [UI_MENU_SHADER_MEMO] = "Shader memo", [UI_MENU_SHADER_MEMO_DESC] = "Optimisation: remembers shader lookups.",
@@ -122,13 +123,13 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_DESC_TEMPLATE_DESC] = "Optimisation: updates descriptors in bulk.",
     [UI_MENU_PUSH_SKIP] = "Skip repeated push constants",
     [UI_MENU_PUSH_SKIP_DESC] = "Optimisation: skips push constants that did not change.",
-    [UI_MENU_SPLIT_DRAWS] = "Split draws",
-    [UI_MENU_SPLIT_DRAWS_DESC] = "Optimisation: size at which long draws are split; 0 turns it off.",
+    [UI_MENU_SPLIT_DRAWS] = "Early GPU submission",
+    [UI_MENU_SPLIT_DRAWS_DESC] = "Submits GPU work in parts every N draws between passes so the GPU starts earlier; 0 turns it off.",
     [UI_MENU_VK_VALIDATION] = "Validation layer",
     [UI_MENU_VK_VALIDATION_DESC] = "Checks every Vulkan call and slows the game down a lot.",
     [UI_MENU_VK_VALIDATION_MISSING] = "The validation layer is not installed.",
     [UI_MENU_VK_DYN_VERTEX] = "Dynamic vertex state",
-    [UI_MENU_VK_DYN_VERTEX_DESC] = "Uses dynamic vertex input when the driver offers it.",
+    [UI_MENU_VK_DYN_VERTEX_DESC] = "Forces dynamic vertex input on or off; the default depends on the GPU.",
     [UI_MENU_VK_SUBGROUP_PIN] = "Pin subgroup size", [UI_MENU_VK_SUBGROUP_PIN_DESC] = "Fixes the shader subgroup size.",
     [UI_MENU_TRACE] = "Performance log", [UI_MENU_TRACE_DESC] = "Writes frame timings to a file.",
     [UI_MENU_FLIGHT] = "Flight recorder",
@@ -168,7 +169,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
 
     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран; F11 переключает режим.",
     [UI_MENU_WINDOW_SIZE] = "Размер окна", [UI_MENU_WINDOW_SIZE_DESC] = "Размер окна игры вне полноэкранного режима.",
-    [UI_MENU_WINDOW_SIZE_CUSTOM] = "Свой",
+    [UI_MENU_WINDOW_SIZE_CUSTOM] = "Другой",
     [UI_MENU_PRESENT] = "Вывод кадров", [UI_MENU_PRESENT_DESC] = "Как готовые кадры попадают на экран.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "Вертикальная синхронизация",
     [UI_MENU_PRESENT_IMMEDIATE] = "Без ожидания",
@@ -179,7 +180,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
 
     [UI_MENU_FPS60] = "Частота кадров", [UI_MENU_FPS60_DESC] = "Игра идёт в 60 кадров в секунду вместо 30.",
-    [UI_MENU_FPS_60] = "60 кадр/с", [UI_MENU_FPS_30] = "30 кадр/с",
+    [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_30] = "30 FPS",
     [UI_MENU_REALTIME] = "Скорость игры по часам",
     [UI_MENU_REALTIME_DESC] = "Игра идёт по реальному времени, медленный кадр её не замедляет.",
     [UI_MENU_CLOTH_REALTIME] = "Ткань по часам",
@@ -214,15 +215,15 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ASYNC_PREEMPT] = "Вытеснение на виртуальных ядрах",
     [UI_MENU_ASYNC_PREEMPT_DESC] = "Позволяет потоку игры прервать другой поток на том же виртуальном ядре.",
     [UI_MENU_PREEMPT_OFF] = "Выкл.", [UI_MENU_PREEMPT_ON] = "Вкл.", [UI_MENU_PREEMPT_INHERIT] = "Только наследование",
-    [UI_MENU_REPLAY_ASYNC] = "Повтор команд в отдельном потоке",
+    [UI_MENU_REPLAY_ASYNC] = "Воспроизведение команд GPU в отдельном потоке",
     [UI_MENU_REPLAY_ASYNC_DESC] = "Записанные команды GPU выполняются в отдельном потоке.",
-    [UI_MENU_FREE_CORES] = "Затвор виртуальных ядер",
+    [UI_MENU_FREE_CORES] = "Ограничение виртуальных ядер",
     [UI_MENU_FREE_CORES_DESC] = "На каждом виртуальном ядре работает один поток, как на консоли.",
     [UI_MENU_TIMER_1MS] = "Таймер Windows 1 мс",
     [UI_MENU_TIMER_1MS_DESC] = "Повышает точность системного таймера до 1 мс для ровного темпа кадров.",
     [UI_MENU_PIPE_WAIT] = "Обработка ожидающих отрисовок",
-    [UI_MENU_PIPE_WAIT_DESC] = "Что делает отрисовка, пока её конвейер ещё собирается.",
-    [UI_MENU_PIPE_WAIT_DEFAULT] = "По умолчанию", [UI_MENU_PIPE_WAIT_DRAW] = "Рисовать",
+    [UI_MENU_PIPE_WAIT_DESC] = "«По умолчанию» — текущее планирование с отдельным потоком для ожидающих отрисовок; «Старый способ» — прежнее планирование.",
+    [UI_MENU_PIPE_WAIT_DEFAULT] = "По умолчанию", [UI_MENU_PIPE_WAIT_DRAW] = "Старый способ",
     [UI_MENU_PIPE_SKIP] = "Пропуск отрисовок при сборке конвейера",
     [UI_MENU_PIPE_SKIP_DESC] = "Какие отрисовки отбрасываются, а не ждут свой конвейер.",
     [UI_MENU_PIPE_SKIP_STRICT] = "Строго", [UI_MENU_PIPE_SKIP_ANY] = "Любые",
@@ -243,12 +244,12 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_MEMORY] = "Режим памяти GPU", [UI_MENU_MEMORY_DESC] = "Как память игры передаётся видеокарте.",
     [UI_MENU_MEMORY_AUTO] = "Автоматически", [UI_MENU_MEMORY_IMPORT] = "Импорт", [UI_MENU_MEMORY_MIRROR] = "Зеркало",
     [UI_MENU_MEMORY_VERIFY] = "Проверка",
-    [UI_MENU_TEX_ALIAS] = "Наложение текстур", [UI_MENU_TEX_ALIAS_DESC] = "Текстуры могут делить память GPU.",
-    [UI_MENU_LOD_GUARD] = "Защита LOD", [UI_MENU_LOD_GUARD_DESC] = "Не даёт уровням детализации текстур мерцать.",
+    [UI_MENU_TEX_ALIAS] = "Наследование содержимого текстур", [UI_MENU_TEX_ALIAS_DESC] = "Новая текстура поверх памяти живой текстуры получает её содержимое, а не пустую.",
+    [UI_MENU_LOD_GUARD] = "Защита LOD", [UI_MENU_LOD_GUARD_DESC] = "Не даёт объектам мелькать не на своём месте, а дальнему плану — на кадр становиться плоским: ждёт, пока игра допишет данные уровней детализации, и только потом их читает GPU.",
     [UI_MENU_FIX_C0] = "Исправление константного буфера",
-    [UI_MENU_FIX_C0_DESC] = "Обходит неверное чтение константного буфера в некоторых шейдерах.",
-    [UI_MENU_FIX_ZERO] = "Исправление нуля",
-    [UI_MENU_FIX_ZERO_DESC] = "Обходит случаи, когда результат шейдера должен быть строго нулём.",
+    [UI_MENU_FIX_C0_DESC] = "Заполняет зарезервированный драйвером банк констант c0 (размеры хранилищ, размер запуска, размер точки, базовый экземпляр) вместо чтения нулей.",
+    [UI_MENU_FIX_ZERO] = "Обнулять новую память GPU",
+    [UI_MENU_FIX_ZERO_DESC] = "Новые пулы памяти GPU заполняются нулями, как память Switch.",
     [UI_MENU_BIND_SKIP] = "Пропуск повторных привязок",
     [UI_MENU_BIND_SKIP_DESC] = "Оптимизация: пропускает неизменившиеся привязки.",
     [UI_MENU_SHADER_MEMO] = "Память шейдеров", [UI_MENU_SHADER_MEMO_DESC] = "Оптимизация: запоминает поиск шейдеров.",
@@ -256,17 +257,17 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_DESC_TEMPLATE_DESC] = "Оптимизация: обновляет дескрипторы пачками.",
     [UI_MENU_PUSH_SKIP] = "Пропуск повторных push-констант",
     [UI_MENU_PUSH_SKIP_DESC] = "Оптимизация: пропускает неизменившиеся push-константы.",
-    [UI_MENU_SPLIT_DRAWS] = "Разбиение отрисовок",
-    [UI_MENU_SPLIT_DRAWS_DESC] = "Оптимизация: размер, с которого длинные отрисовки разбиваются; 0 — выключить.",
+    [UI_MENU_SPLIT_DRAWS] = "Ранняя отправка работы GPU",
+    [UI_MENU_SPLIT_DRAWS_DESC] = "Отправляет работу GPU частями через каждые N отрисовок между проходами, чтобы GPU начинал раньше; 0 — выключено.",
     [UI_MENU_VK_VALIDATION] = "Слой проверки",
     [UI_MENU_VK_VALIDATION_DESC] = "Проверяет каждый вызов Vulkan и сильно замедляет игру.",
     [UI_MENU_VK_VALIDATION_MISSING] = "Слой проверки не установлен.",
     [UI_MENU_VK_DYN_VERTEX] = "Динамическое состояние вершин",
-    [UI_MENU_VK_DYN_VERTEX_DESC] = "Использует динамический ввод вершин, если драйвер его поддерживает.",
+    [UI_MENU_VK_DYN_VERTEX_DESC] = "Принудительно включает или выключает динамический ввод вершин; по умолчанию зависит от GPU.",
     [UI_MENU_VK_SUBGROUP_PIN] = "Фиксировать размер подгруппы",
     [UI_MENU_VK_SUBGROUP_PIN_DESC] = "Фиксирует размер подгруппы шейдера.",
     [UI_MENU_TRACE] = "Журнал производительности", [UI_MENU_TRACE_DESC] = "Пишет время кадров в файл.",
-    [UI_MENU_FLIGHT] = "Бортовой самописец",
+    [UI_MENU_FLIGHT] = "Запись последних кадров (для отчёта о фризе)",
     [UI_MENU_FLIGHT_DESC] = "Хранит короткую историю и сохраняет её, когда кадр подвисает.",
     [UI_MENU_FLIGHT_SPIKE_MS] = "Порог подвисания (мс)",
     [UI_MENU_FLIGHT_SPIKE_MS_DESC] = "Время кадра, которое считается подвисанием.",
@@ -285,7 +286,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OV_GPU] = "GPU", [UI_MENU_OV_CPU] = "ЦП", [UI_MENU_OV_RAM] = "ОЗУ", [UI_MENU_OV_VRAM] = "Видеопамять",
     [UI_MENU_OV_TEMP] = "Температура", [UI_MENU_OV_POWER] = "Мощность", [UI_MENU_OV_CLOCK] = "Частота",
     [UI_MENU_OV_NONE] = "-",
-    [UI_MENU_OV_REPLAY] = "Повтор команд", [UI_MENU_OV_GPU_TIME] = "Время GPU",
+    [UI_MENU_OV_REPLAY] = "Воспроизведение команд GPU", [UI_MENU_OV_GPU_TIME] = "Время GPU",
     [UI_MENU_OV_PIPE_WAIT] = "Ожидания конвейеров",
     [UI_MENU_OV_SHADER_WAIT] = "Ожидания шейдеров", [UI_MENU_OV_TEX_UPLOADS] = "Загрузки текстур",
 };
@@ -348,9 +349,12 @@ static const char *resolve_menu_lang(void) {
 }
 
 const char *menu_text(UiTextId id) {
-    static const char *lang = "en";
-    static unsigned seen = ~0u;
+    static _Atomic(const char *) lang = "en";
+    static _Atomic unsigned seen = ~0u;
     unsigned v = cfg_version();
-    if (v != seen) lang = resolve_menu_lang(), seen = v;
-    return ui_text_in(lang, id);
+    if (v != atomic_load_explicit(&seen, memory_order_relaxed)) {
+        atomic_store_explicit(&lang, resolve_menu_lang(), memory_order_relaxed);
+        atomic_store_explicit(&seen, v, memory_order_relaxed);
+    }
+    return ui_text_in(atomic_load_explicit(&lang, memory_order_relaxed), id);
 }
