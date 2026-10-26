@@ -25,6 +25,7 @@ extern "C" {
 #include "cfg.h"
 #include "input.h"
 #include "input_map.h"
+#include "perfmon.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
 #include "ui_text.h"
@@ -571,8 +572,10 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
 
 static int g_save_pending;   // a changed setting still waits for its write to totk.ini (opt_save_tick)
 
-// ---- the performance overlay (TOTK_PERF_OVERLAY): the frame rate over the presents of the last half second, in "full"
-// also their mean and longest interval, in the top right corner. Off, it costs a cfg_version load per present.
+// ---- the performance overlay (TOTK_PERF_OVERLAY), in the top right corner. "fps": the frame rate over the presents of
+// the last half second. "full": a panel of perfmon.c's numbers, in the style of SavageWindRecomp's perf_overlay_draw
+// (menu.mm): the machine's load and temperatures, the frame rate and frame times with a graph, the render thread's waits.
+// Off, it costs a cfg_version load per present.
 static unsigned g_perf_ver = ~0u;
 static int g_perf_mode;                  // 0 off, 1 fps, 2 full
 static std::atomic<int> g_perf_save;     // F10 changed the mode: totk.ini is written on the present thread
@@ -588,14 +591,34 @@ extern "C" void menu_perf_cycle(void) {
     g_perf_save.store(1);
 }
 
-static void perf_tick(uint64_t now) {
+// The device the game renders on, for perfmon's GPU counters (by LUID) and NVML (by name); once, before full mode.
+static void perf_gpu_once(const MenuTarget *t) {
+    static bool done;
+    if (done) return;
+    done = true;
+    VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+    vkGetPhysicalDeviceProperties2(t->phys, &p2);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(t->phys, &mp);
+    uint64_t vram = 0;
+    for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+        if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[h].size;
+    perfmon_set_gpu(p2.properties.deviceName, id.deviceLUIDValid ? id.deviceLUID : NULL, (float)(vram >> 20));
+}
+
+static void perf_tick(uint64_t now, const MenuTarget *t) {
     if (cfg_version() != g_perf_ver) {
         g_perf_ver = cfg_version();
         int m = perf_mode_of(cfg_value("TOTK_PERF_OVERLAY"));
-        if (m != g_perf_mode) g_perf_last_ns = 0, g_perf_text[0] = 0;
+        if (m != g_perf_mode) {
+            g_perf_last_ns = 0, g_perf_text[0] = 0;
+            if (m == 2) perf_gpu_once(t);
+            perfmon_mode(m);
+        }
         g_perf_mode = m;
     }
-    if (!g_perf_mode) return;
+    if (g_perf_mode != 1) return;
     uint64_t d = now - g_perf_last_ns;
     if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
         g_perf_win_ns = g_perf_max_ns = 0;
@@ -605,12 +628,7 @@ static void perf_tick(uint64_t now) {
         g_perf_frames++;
         if (d > g_perf_max_ns) g_perf_max_ns = d;
         if (g_perf_win_ns >= 500000000ull) {
-            double fps = g_perf_frames * 1e9 / g_perf_win_ns;
-            if (g_perf_mode == 2)
-                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FULL), fps,
-                         g_perf_win_ns / 1e6 / g_perf_frames, g_perf_max_ns / 1e6);
-            else
-                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS), fps);
+            snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS), g_perf_frames * 1e9 / g_perf_win_ns);
             g_perf_win_ns = g_perf_max_ns = 0;
             g_perf_frames = 0;
         }
@@ -618,7 +636,122 @@ static void perf_tick(uint64_t now) {
     g_perf_last_ns = now;
 }
 
+// The panel keeps its width while the numbers change: every column is as wide as the widest text it can show, measured
+// on samples of 8s (Roboto's digits share one width), and the numbers are right-aligned in it.
+struct PerfCol { UiTextId fmt; float sample; };
+
+static float perf_text_w(UiTextId fmt, float v) {
+    char b[64];
+    snprintf(b, sizeof b, menu_text(fmt), v);
+    return ImGui::CalcTextSize(b).x;
+}
+
+// A fixed column as wide as the widest of the formats (with their samples) and labels given.
+static void perf_column(const char *id, const PerfCol *cols, int n, const UiTextId *labels = nullptr, int nl = 0) {
+    float w = ImGui::CalcTextSize(menu_text(UI_MENU_OV_NONE)).x;
+    for (int i = 0; i < n; i++) w = fmaxf(w, perf_text_w(cols[i].fmt, cols[i].sample));
+    for (int i = 0; i < nl; i++) w = fmaxf(w, ImGui::CalcTextSize(menu_text(labels[i])).x);
+    ImGui::TableSetupColumn(id, ImGuiTableColumnFlags_WidthFixed, w);
+}
+
+static void perf_right(const char *s, bool dim) {
+    float pad = ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(s).x;
+    if (pad > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad);
+    if (dim) ImGui::TextDisabled("%s", s);
+    else ImGui::TextUnformatted(s);
+}
+
+// One cell of the full panel's table: fmt (a catalog format, one number) with v, or "-" when the machine gives none.
+static void perf_cell(UiTextId fmt, float v) {
+    ImGui::TableNextColumn();
+    if (v < 0) return perf_right(menu_text(UI_MENU_OV_NONE), true);
+    char b[64];
+    snprintf(b, sizeof b, menu_text(fmt), v);
+    perf_right(b, false);
+}
+
+static void perf_label(UiTextId label, const ImVec4 &c) {
+    ImGui::TableNextColumn();
+    ImGui::TextColored(c, "%s", menu_text(label));
+}
+
+static float perf_gb(float mb) { return mb < 0 ? -1 : mb / 1024; }
+
+static void perf_full_draw(float w, float scale) {
+    PerfStats s;
+    perfmon_snapshot(&s);
+    ImGui::SetNextWindowPos(ImVec2(w - 12 * scale, 12 * scale), ImGuiCond_Always, ImVec2(1, 0));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::Begin("##perf", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                                        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());   // over the menu while it is open
+    ImGui::SetWindowFontScale(0.72f);
+    const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
+        fps_c(0.95f, 0.95f, 0.95f, 1), wait_c(0.93f, 0.76f, 0.33f, 1);
+    if (ImGui::BeginTable("##perft", 4, ImGuiTableFlags_SizingFixedFit)) {
+        static const UiTextId labels[] = {UI_MENU_OV_GPU, UI_MENU_OV_VRAM, UI_MENU_OV_CPU, UI_MENU_OV_RAM};
+        static const PerfCol c0[] = {{UI_MENU_OV_FPS, 888}};
+        static const PerfCol c1[] = {{UI_MENU_OV_FMT_PCT, 100}, {UI_MENU_OV_FMT_GB, 888.8f}, {UI_MENU_OV_FRAME_MS, 888.8f}};
+        static const PerfCol c2[] = {{UI_MENU_OV_FMT_TEMP, 188}, {UI_MENU_OV_FMT_GB_OF, 888.8f}, {UI_MENU_OV_MAX_MS, 8888.8f}};
+        static const PerfCol c3[] = {{UI_MENU_OV_FMT_POWER, 888}, {UI_MENU_OV_FMT_MHZ, 8888}, {UI_MENU_OV_GAME_PCT, 100},
+                                     {UI_MENU_OV_GAME_GB, 888.8f}};
+        perf_column("##c0", c0, 1, labels, 4);
+        perf_column("##c1", c1, 3);
+        perf_column("##c2", c2, 3);
+        perf_column("##c3", c3, 4);
+        perf_label(UI_MENU_OV_GPU, gpu_c);
+        perf_cell(UI_MENU_OV_FMT_PCT, s.gpu_pct);
+        perf_cell(UI_MENU_OV_FMT_TEMP, s.gpu_temp_c);
+        perf_cell(UI_MENU_OV_FMT_POWER, s.gpu_power_w);
+        perf_label(UI_MENU_OV_VRAM, gpu_c);
+        perf_cell(UI_MENU_OV_FMT_GB, perf_gb(s.vram_used_mb));
+        perf_cell(UI_MENU_OV_FMT_GB_OF, perf_gb(s.vram_total_mb));
+        perf_cell(UI_MENU_OV_FMT_MHZ, s.gpu_clock_mhz);
+        perf_label(UI_MENU_OV_CPU, cpu_c);
+        perf_cell(UI_MENU_OV_FMT_PCT, s.cpu_total_pct);
+        perf_cell(UI_MENU_OV_FMT_TEMP, s.cpu_temp_c);
+        perf_cell(UI_MENU_OV_GAME_PCT, s.cpu_game_pct);
+        perf_label(UI_MENU_OV_RAM, ram_c);
+        perf_cell(UI_MENU_OV_FMT_GB, perf_gb(s.ram_used_mb));
+        perf_cell(UI_MENU_OV_FMT_GB_OF, perf_gb(s.ram_total_mb));
+        perf_cell(UI_MENU_OV_GAME_GB, perf_gb(s.ram_game_mb));
+        ImGui::TableNextColumn();   // the frame row: no label, the rate in its place
+        char b[64];
+        snprintf(b, sizeof b, menu_text(UI_MENU_OV_FPS), s.fps);
+        ImGui::TextColored(fps_c, "%s", b);
+        perf_cell(UI_MENU_OV_FRAME_MS, s.frame_ms_avg);
+        perf_cell(UI_MENU_OV_MAX_MS, s.frame_ms_max);
+        ImGui::EndTable();
+    }
+    float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;
+    ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, nullptr, 0, top, ImVec2(330 * scale, 48 * scale));
+    // per frame, averaged over the last half second
+    if (ImGui::BeginTable("##perfw", 2, ImGuiTableFlags_SizingFixedFit)) {
+        static const UiTextId labels[] = {UI_MENU_OV_REPLAY, UI_MENU_OV_GPU_TIME, UI_MENU_OV_PIPE_WAIT,
+                                          UI_MENU_OV_SHADER_WAIT, UI_MENU_OV_TEX_UPLOADS};
+        static const PerfCol c1[] = {{UI_MENU_OV_FMT_MS, 888.88f}, {UI_MENU_OV_PER_FRAME, 888.8f}};
+        perf_column("##w0", nullptr, 0, labels, 5);
+        perf_column("##w1", c1, 2);
+        perf_label(UI_MENU_OV_REPLAY, wait_c);
+        perf_cell(UI_MENU_OV_FMT_MS, s.replay_ms);
+        perf_label(UI_MENU_OV_GPU_TIME, wait_c);
+        perf_cell(UI_MENU_OV_FMT_MS, s.gpu_ms);
+        perf_label(UI_MENU_OV_PIPE_WAIT, wait_c);
+        perf_cell(UI_MENU_OV_FMT_MS, s.pipe_wait_ms);
+        perf_label(UI_MENU_OV_SHADER_WAIT, wait_c);
+        perf_cell(UI_MENU_OV_FMT_MS, s.xlate_ms);
+        perf_label(UI_MENU_OV_TEX_UPLOADS, wait_c);
+        perf_cell(UI_MENU_OV_PER_FRAME, s.tex_uploads);
+        ImGui::EndTable();
+    }
+    if (s.gpu_name[0]) ImGui::TextDisabled("%s", s.gpu_name);
+    if (s.cpu_name[0]) ImGui::TextDisabled("%s", s.cpu_name);
+    ImGui::End();
+}
+
 static void perf_draw(float w, float scale) {
+    if (g_perf_mode == 2) return perf_full_draw(w, scale);
     if (!g_perf_mode || !g_perf_text[0]) return;
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
@@ -633,7 +766,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     if (!g_test.parsed) test_parse();
     if (g_test.next_set < g_test.n_sets && frame >= g_test.sets[g_test.next_set].frame) test_apply_sets(frame);
     if (g_perf_save.exchange(0)) cfg_save();
-    perf_tick(plat_now_ns());
+    perf_tick(plat_now_ns(), t);
     bool open = g_open.load(std::memory_order_relaxed);
     if (!open) {
         if (g_save_pending) g_save_pending = opt_save_tick(1);   // closed: the last change goes to totk.ini now

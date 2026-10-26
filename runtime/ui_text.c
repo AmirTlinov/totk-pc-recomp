@@ -43,11 +43,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "The Vulkan device that draws the game.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate in the top right corner; Full adds the mean and the longest frame time of the "
-                                  "last half second. F10 cycles the modes.",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate in the top right corner. Full adds frame times with a graph, CPU, GPU and "
+                                  "memory load, temperatures and the render thread's waits. F10 cycles the modes.",
     [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full",
-    // printf formats of the overlay line: frame rate; frame rate, mean and longest frame time in ms
-    [UI_PERF_LINE_FPS] = "%.0f fps", [UI_PERF_LINE_FULL] = "%.0f fps   %.1f ms   max %.1f ms",
+    // printf format of the overlay line in FPS mode: the frame rate
+    [UI_PERF_LINE_FPS] = "%.0f fps",
 
     [UI_MENU_FPS_LIMIT] = "Frame rate limit",
     [UI_MENU_FPS_LIMIT_DESC] = "The most frames per second the game draws. Above 60 is experimental and needs Game speed "
@@ -188,10 +188,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Устройство Vulkan, которое рисует игру.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу; «Полный» добавляет среднее и самое долгое время "
-                                  "кадра за последние полсекунды. F10 переключает режимы.",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Полный» добавляет время кадров с графиком, "
+                                  "загрузку ЦП, GPU и памяти, температуры и ожидания потока отрисовки. F10 переключает "
+                                  "режимы.",
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
-    [UI_PERF_LINE_FPS] = "%.0f к/с", [UI_PERF_LINE_FULL] = "%.0f к/с   %.1f мс   макс. %.1f мс",
+    [UI_PERF_LINE_FPS] = "%.0f к/с",
 
     [UI_MENU_FPS_LIMIT] = "Ограничение частоты кадров",
     [UI_MENU_FPS_LIMIT_DESC] = "Наибольшее число кадров в секунду. Выше 60 — экспериментальный режим, нужна «Скорость "
