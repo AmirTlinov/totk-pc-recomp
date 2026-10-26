@@ -874,6 +874,10 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         else memcpy(l, control + 0x748, 12);
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
     }
+    /* Control byte +0x718 of a fragment shader: early fragment tests (the NVN driver's early-Z-force, MacNativeGames
+       ae8f4f4). Without it a shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test
+       after the depth prepass fails along contour lines. Already part of the code hash (the whole control section). */
+    if (!strcmp(stage, "ps") && (control[0x718] & 1)) o += sprintf(o, ",\"early_fragment_tests\":true");
     int si = !strcmp(stage, "vs") ? 0 : !strcmp(stage, "cs") ? 2 : 1;   // gfx_shader_set_host answers
     if (!host_f64) o += sprintf(o, ",\"softfloat64\":true");
     if (host_sbuf) o += sprintf(o, ",\"sbuf_align\":%u", host_sbuf);

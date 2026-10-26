@@ -157,9 +157,13 @@ static struct {
 
 // The bound-slot bytes of VkExec a pipeline's descriptors read, as ranges merged where they touch, built once per
 // pipeline info: c0's storage table, the uniform and storage ranges of the bound slots and the texture and image
-// handles. sup and c0: the support inputs and the base instance count too. ok 0: never skipped (too many descriptors).
+// handles. sup and c0: the support inputs and the base instance count too. p: storage buffers whose address the shader
+// loads from a user uniform block; the address read from the block counts too. ok 0: never skipped (too many
+// descriptors or such buffers).
+#define RS_PTRS 4
 typedef struct { uint32_t off, len; } RsRange;
-typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok; RsRange r[]; } RsList;
+typedef struct { int st; const GfxShaderRes *res; } RsPtr;
+typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; RsRange r[]; } RsList;
 static nvn_hmap rs_lists;                // VkPipeInfo pointer -> RsList, until shutdown
 static const VkPipeInfo *rs_last;        // the last lookup
 static const RsList *rs_last_l;
@@ -776,7 +780,7 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
 // (GfxShaderRes.slot); the NVN slot is the entry of the driver constant buffer c0 that holds the buffer's address
 // (cbuf_slot 0, handle = word offset): 16-byte entries at byte 0x110 (vertex), 0x510 (fragment) and 0x310 (compute).
 // A compute address at c0 0x210..0x30f is uniform block (offset - 0x210) / 16 read as storage: *ubo is set. -1: the
-// address is not in c0 (the shader loads it from a user uniform block, not replayed) or the stage has no known table.
+// address is not in c0 (the shader loads it from a user uniform block: ubo_ptr) or the stage has no known table.
 // Mapping: MacNativeGames games/totk/tools/totk_xlate/Service.cs:206-222 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou).
 static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     *ubo = 0;
@@ -789,12 +793,63 @@ static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     return base >= 0 && off >= base && off < base + 0x100 && (off - base) % 16 == 0 ? (off - base) / 16 : -1;
 }
 
+// 1 when the shader loads the storage buffer's address from a user uniform block (cbuf_slot 3.., NVN uniform slot
+// cbuf_slot - 3, byte offset handle * 4). The Depths terrain reads its vertices through one, about 500 draws a frame;
+// with a zero buffer they collapse and the ground is missing. MacNativeGames resolves these the same way (NVN_RB_SBUFU,
+// games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m @ b75be8cf).
+static int ubo_ptr_res(const GfxShaderRes *r) {
+    return r->cbuf_slot >= 3 && r->cbuf_slot - 3 < 18;
+}
+
+// The inline uniform updates of the submission being replayed, newest last (a ring of UPD_N). op_update_ub writes them
+// into the buffer's GPU copy; guest memory gets them only from the write-back when the submission ends. The terrain
+// rewrites its pointer block this way before every draw, all at one address, so ubo_ptr reads the latest update that
+// covers the pointer, else memory. Payloads stay in the recorded command buffer for the whole replay.
+#define UPD_N 4096
+static struct {
+    uint64_t fence;                      // the submission the entries belong to
+    uint32_t n;                          // updates noted in it
+    struct { uint64_t lo, hi; const uint8_t *data; } u[UPD_N];
+} UPD;
+
+static void upd_note(const VkExec *ex, const p_update_ub *u) {
+    if (UPD.fence != ex->fence) UPD.fence = ex->fence, UPD.n = 0;
+    UPD.u[UPD.n++ % UPD_N] = (typeof(UPD.u[0])){u->dst, u->dst + u->size, u->data};
+}
+
+// 1 when an update of this submission supplied [a, a+n).
+static int upd_read(const VkExec *ex, uint64_t a, void *out, size_t n) {
+    if (UPD.fence != ex->fence) return 0;
+    for (uint32_t i = UPD.n, end = UPD.n > UPD_N ? UPD.n - UPD_N : 0; i-- > end;) {
+        const typeof(UPD.u[0]) *e = &UPD.u[i % UPD_N];
+        if (a >= e->hi || a + n <= e->lo) continue;
+        if (a < e->lo || a + n > e->hi) return 0;   // partly covered: memory
+        memcpy(out, e->data + (a - e->lo), n);
+        return 1;
+    }
+    return 0;
+}
+
+// That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
+// block has no size field.
+static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
+    const p_bind_buf *u = &ex->ubo[st][r->cbuf_slot - 3];
+    uint64_t off = (uint64_t)r->handle * 4, a = 0;
+    VkMemSpan sp;
+    if (!u->addr || u->size < off + 8 || upd_read(ex, u->addr + off, &a, 8)) return a;
+    if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
+    return a;
+}
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     uint64_t max = vk_ctx()->props.limits.maxStorageBufferRange, align = vk_ctx()->props.limits.minStorageBufferOffsetAlignment;
     VkDescriptorBufferInfo bi;
     int ubo, slot = ssbo_slot(r, st, &ubo);
-    if (slot >= 0 && slot < 16) {
-        const p_bind_buf *b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
+    p_bind_buf up = {0};
+    const p_bind_buf *b = NULL;
+    if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
+    else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
+    if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
@@ -923,7 +978,14 @@ static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage,
         if (img) view = get_view(ex, img, &v, hv, r->type, storage);
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
-        if (!storage && !separate) samp = vk_sampler_by_id_locked((int)(h >> 20 & 0xfff));
+        if (!storage && !separate) {
+            // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
+            // blending neighbouring depths puts reconstructed positions in mid-air at object edges (shadow masks).
+            int sid = (int)(h >> 20 & 0xfff);
+            int point = img && (img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(r->type & 0x400) &&
+                        vk_exec_view_aspect(img, &v, hv) != VK_IMAGE_ASPECT_STENCIL_BIT;
+            samp = point ? vk_sampler_point_by_id_locked(sid) : vk_sampler_by_id_locked(sid);
+        }
     }
     if (!view) {
         int di = dummy_index(res_view_type(r->type), ms);
@@ -1056,7 +1118,9 @@ static int push_skip_on(void) {   // TOTK_PUSH_SKIP=0: every graphics draw pushe
 // - vk_mem_gen (buffer and offset of a span, mirror creation and per-submission sync);
 // - the images in the feedback layout (the sampled layout);
 // - per binding: the support inputs, c0's storage table and base instance, the bound uniform and storage ranges, the
-//   texture and image handles (RsList; compared only when a bind op ran since the last draw, bind_gen).
+//   texture and image handles (RsList; compared only when a bind op ran since the last draw, bind_gen);
+// - storage buffer addresses read from user uniform blocks (RsList.p, ubo_ptr): compared on every draw, since the
+//   block's contents change without a bind op.
 // The side effects of a build repeat as no-ops in the same command buffer and submission: c0 and support buffers kept
 // in B, note_written's ranges, vk_mem_gpu_wrote's write-backs, the per-submission mirror sync and dirty census note,
 // the views cached per submission. The census counts are added again. A build that copied guest bytes into transient
@@ -1085,7 +1149,8 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
     RsList *l = nvn_hm_get(&rs_lists, &info);
     if (!l) {
         static RsRange tmp[MAX_DESC];
-        uint32_t n = 0, nd = 0;
+        RsPtr ptr[RS_PTRS];
+        uint32_t n = 0, nd = 0, np = 0;
         int sup = 0, c0 = 0, ok = 1;
         for (uint32_t i = 0; i < info->n_bindings && ok; i++) {
             const VkPipeBinding *b = &info->bindings[i];
@@ -1103,7 +1168,13 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                 }   // slot 1: the program (bind_sig); others: the zero buffer
             } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
                 int ubo, slot = ssbo_slot(r, st, &ubo);
-                if (slot >= 0 && slot < 16) rs_add(tmp, &n, ex, ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot], sizeof(p_bind_buf));
+                if (slot >= 0 && slot < 16) {
+                    rs_add(tmp, &n, ex, ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot], sizeof(p_bind_buf));
+                } else if (ubo_ptr_res(r)) {
+                    if (np == RS_PTRS) { ok = 0; break; }
+                    rs_add(tmp, &n, ex, &ex->ubo[st][r->cbuf_slot - 3], sizeof(p_bind_buf));
+                    ptr[np++] = (RsPtr){st, r};
+                }
             } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
                        b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
                 int img = b->kind == GFX_RES_IMG, cap = img ? 32 : 128;
@@ -1119,6 +1190,8 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
         l = malloc(sizeof *l + sizeof *tmp * n);
         if (!l) rt_fatal("vk: out of memory");
         l->n = n, l->bytes = (uint32_t)bytes, l->sup = (uint8_t)sup, l->c0 = (uint8_t)c0, l->ok = (uint8_t)ok;
+        l->np = (uint8_t)np;
+        memcpy(l->p, ptr, sizeof *ptr * np);
         memcpy(l->r, tmp, sizeof *tmp * n);
         nvn_hm_put(&rs_lists, &info, l);
     }
@@ -1152,6 +1225,7 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
         PUT(ps);
     }
     if (l->c0) PUT(c0_binst);
+    for (int i = 0; i < l->np; i++) PUT(ubo_ptr(ex, l->p[i].st, l->p[i].res));
 #undef PUT
     diff |= n != RS.hn;
     RS.hn = n;
@@ -1508,6 +1582,12 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
     cb_res(ex);
     dummies_init();
+    if (ex->pass_noatt) {   // no attachment: the pass covers this draw's viewport or scissor, reopened when it needs more
+        uint32_t w, h;
+        vk_exec_noatt_dims(ex, &w, &h);
+        if (ex->in_pass && (w > ex->pass_w || h > ex->pass_h)) vk_exec_pass_end(ex);
+        if (!ex->in_pass) ex->rt_resolved = 0;
+    }
     if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
     vk_exec_pass_begin(ex);
     VkRect2D sc = vk_exec_scissor(ex);
@@ -1800,6 +1880,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
     note_written(ex, u->dst, u->size);
+    upd_note(ex, u);
 }
 
 // ---- bind ops

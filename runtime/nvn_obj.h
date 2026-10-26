@@ -17,7 +17,7 @@
 typedef struct {
     int target, format, flags, samples;   // NVNtextureTarget / NVNformat / NVNtextureFlags / sample count (0 or 1 = single-sampled)
     uint32_t width, height, depth, levels, stride;
-    signed int pkg_block_h:8; unsigned int swizzle_r:3,swizzle_g:3,swizzle_b:3,swizzle_a:3,swizzle_pad:12;                      // Byte 0 of the packaged texture layout parameters (log2 of block height) + 1; 0 = use the automatic algorithm
+    signed int pkg_block_h:8; unsigned int swizzle_r:3,swizzle_g:3,swizzle_b:3,swizzle_a:3,swizzle_pad:12;                      // Byte 0 of the packaged texture layout parameters + 1 (low nibble log2 block height, high nibble log2 block depth); 0 = use the automatic algorithm
 } nvn_texdesc;
 
 typedef struct {

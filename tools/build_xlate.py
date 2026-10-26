@@ -1,7 +1,7 @@
 """Build the shader translator: build/xlate/totk_xlate.exe (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies tools/xlate/patches/*.patch there (tools/vendor stays
-byte-identical; 0001-0004 are MNG's, 0005 and 0006 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK, the MSVC build
+byte-identical; 0001-0004 are MNG's, 0005-0009 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK, the MSVC build
 tools and vswhere.exe (docs/toolchain-windows.md). Run with .venv.
 
 Next to the exe it writes totk_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
@@ -9,7 +9,9 @@ Program.cs, the csproj, the patches, the vendor tree). runtime/gfx_shader.c puts
 translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-only writes it for the exe already built
 (the caller vouches that the exe matches the sources).
 
-  python tools/build_xlate.py [--id-only]
+  python tools/build_xlate.py [--id-only] [--out DIR]
+
+--out builds into DIR instead of build/xlate (a task build dir: totk.exe takes the translator next to it).
 """
 
 import argparse
@@ -42,12 +44,44 @@ def tree_hashes(base: Path) -> dict[str, str]:
     }
 
 
+def mng_pin() -> str:
+    """The MacNativeGames commit tools/fetch_refs.sh pins."""
+    for line in (ROOT / "tools" / "fetch_refs.sh").read_text(encoding="utf-8").splitlines():
+        f = line.split()
+        if len(f) == 4 and f[:2] == ["fetch", "MacNativeGames"]:
+            return f[3]
+    sys.exit("tools/fetch_refs.sh pins no MacNativeGames commit")
+
+
+def pinned_blobs() -> dict[str, str]:
+    """Git blob ids of MNG's vendor/ryujinx at the pinned commit. The checkout itself may be newer than the pin or
+    carry CRLF line ends (core.autocrlf), so its files are not compared."""
+    out = subprocess.run(["git", "-C", str(MNG_VENDOR.parent.parent), "ls-tree", "-r", mng_pin(), "vendor/ryujinx"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"git ls-tree of the MacNativeGames pin failed: {out.stderr.strip()}")
+    blobs = {}
+    for line in out.stdout.splitlines():
+        meta, path = line.split("\t", 1)
+        blobs[path.removeprefix("vendor/ryujinx/")] = meta.split()[2]
+    return blobs
+
+
+def blob_ids(base: Path) -> dict[str, str]:
+    """Git blob ids of the source files tree_hashes() hashes."""
+    ids = {}
+    for rel in tree_hashes(base):
+        data = (base / rel).read_bytes()
+        ids[rel] = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    return ids
+
+
 def verify_vendor() -> None:
-    """tools/vendor/ryujinx must be byte-identical to MNG's copy (when refs/ is present)."""
+    """tools/vendor/ryujinx must be byte-identical to MNG's copy at the pinned commit (when refs/ is present)."""
     if not MNG_VENDOR.is_dir():
         print("refs/MacNativeGames missing: vendor comparison skipped")
         return
-    ours, theirs = tree_hashes(VENDOR), tree_hashes(MNG_VENDOR)
+    ours, theirs = blob_ids(VENDOR), pinned_blobs()
     if ours != theirs:
         diff = sorted(k for k in ours.keys() | theirs.keys() if ours.get(k) != theirs.get(k))
         sys.exit(f"tools/vendor/ryujinx differs from MNG in {len(diff)} files, first: {diff[:5]}")
@@ -62,8 +96,8 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 8:
-        sys.exit(f"expected 8 patches, found {len(patches)}")
+    if len(patches) != 9:
+        sys.exit(f"expected 9 patches, found {len(patches)}")
     for patch in patches:
         # git apply works outside a repository when given a directory; --check first so a failure names the patch.
         for extra in (["--check"], []):
@@ -98,7 +132,11 @@ def write_identity(exe: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--id-only", action="store_true", help="write totk_xlate.id for the exe already built")
+    parser.add_argument("--out", type=Path, help="build directory instead of build/xlate")
     a = parser.parse_args()
+    if a.out:
+        global BUILD
+        BUILD = a.out.resolve()
     if a.id_only:
         write_identity(BUILD / "totk_xlate.exe")
         return

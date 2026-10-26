@@ -12,6 +12,7 @@
 // full barrier before each pass), the scissor clip and attachment clears follow LAS Recomp
 // runtime/nvn/vulkan/exec.c:855-1149, 3553-3778 (https://github.com/peiikai/LASRecomp @
 // da35b83a9611d046a9a681aae668d7085954d37f, MIT, Copyright (c) 2026 Peiikai).
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,6 +205,21 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
     if (!o->aspect) o->image = VK_NULL_HANDLE;
 }
 
+/* The size of a pass without attachments: the far corner of viewport 0, else of the scissor, 1..16384 (MacNativeGames
+   62da927, nxnative 7ed061f). TotK draws a fragment shader that only writes a storage buffer into a 1x1 viewport; a
+   pass sized by the viewport's width alone puts an offset viewport outside the scissor, and the cave rock loses its
+   ambient light. */
+void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h) {
+    double x1 = 0, y1 = 0;
+    if (ex->has_vp) {
+        x1 = ceil(fmax(ex->vp[0][0], ex->vp[0][0] + ex->vp[0][2]));
+        y1 = ceil(fmax(ex->vp[0][1], ex->vp[0][1] + ex->vp[0][3]));
+    }
+    if ((x1 < 1 || y1 < 1) && ex->has_scissor) x1 = (double)ex->scissor.x + ex->scissor.w, y1 = (double)ex->scissor.y + ex->scissor.h;
+    *w = x1 < 1 ? 1 : x1 > 16384 ? 16384 : (uint32_t)x1;
+    *h = y1 < 1 ? 1 : y1 > 16384 ? 16384 : (uint32_t)y1;
+}
+
 // Resolves ex->rt to this command buffer's images and derives the pass parameters and the pipeline's target formats.
 static void resolve_rt(VkExec *ex) {
     if (ex->rt_resolved) return;
@@ -233,10 +249,14 @@ static void resolve_rt(VkExec *ex) {
         if (d->layers < layers) layers = d->layers;
         if (!samples) samples = d->samples;
     }
-    if (w == UINT32_MAX) {   // no attachment: the area of viewport 0
-        w = ex->has_vp && ex->vp[0][2] >= 1 ? (uint32_t)ex->vp[0][2] : 16;
-        h = ex->has_vp && ex->vp[0][3] >= 1 ? (uint32_t)ex->vp[0][3] : 16;
+    ex->pass_noatt = w == UINT32_MAX;
+    if (ex->pass_noatt) {
+        vk_exec_noatt_dims(ex, &w, &h);
         layers = 1;
+        static int logged;
+        if (logged < 8 && ex->has_vp && (ex->vp[0][0] != 0 || ex->vp[0][1] != 0 || ex->vp[0][2] != w || ex->vp[0][3] != h))
+            logged++, rt_log("vk_exec: pass without attachments %ux%u for viewport %g,%g %gx%g", w, h, ex->vp[0][0],
+                             ex->vp[0][1], ex->vp[0][2], ex->vp[0][3]);
     }
     ex->pass_w = w, ex->pass_h = h, ex->pass_layers = layers;
     ex->pass_ncolor = (uint32_t)n;
