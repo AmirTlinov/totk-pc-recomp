@@ -548,12 +548,38 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
     return 0;
 }
 
-// Texture and image types of a stage's first 32 slots, kept while every slot's resolution (vk_texture_slots_gen)
-// stays the same: only slots whose handle changed are looked up again, each lookup being a hash probe.
-static struct { int valid; uint32_t gen; uint64_t tex[32], img[32]; uint8_t tt[32], it[32]; } AC[6];
+// Texture and image types of a stage's first 32 slots, each kept with the handle and the resolution generation
+// (vk_texture_slots_gen) it was looked up under: a slot is looked up again, a hash probe, only when either changed.
+static struct { uint64_t tex[32], img[32]; uint32_t tgen[32], igen[32]; uint8_t tv[32], iv[32], tt[32], it[32]; } AC[6];
 static int shader_memo_on(void);
 
-static void answers_for(VkExec *ex, int st, const uint8_t *ctl, GfxShaderAnswers *a) {
+// The slots of (program, stage) whose types its translation reads (gfx_shader_slot_mask), learned from its first
+// shader; ~0u while unknown. The types of other slots select the same shader, so answers_for leaves them zero instead
+// of looking up all 64 handles. Direct-mapped by serial and stage; a collision only relearns.
+#define SLOTM_N 4096
+static struct { uint64_t serial; int st; uint32_t m; } slotm[SLOTM_N];
+
+static uint32_t slotm_idx(uint64_t serial, int st) { return (uint32_t)((serial * 8 + (uint64_t)st) * 0x9E3779B97F4A7C15ull >> 52); }
+
+static uint32_t slot_mask_of(uint64_t serial, int st) {
+    const typeof(slotm[0]) *e = &slotm[slotm_idx(serial, st)];
+    return serial && e->serial == serial && e->st == st ? e->m : ~0u;
+}
+
+static void slot_mask_learn(uint64_t serial, int st, const GfxShader *s) {
+    if (!serial || slot_mask_of(serial, st) != ~0u) return;
+    slotm[slotm_idx(serial, st)] = (typeof(slotm[0])){serial, st, gfx_shader_slot_mask(s)};
+}
+
+static uint8_t type_of_handle(uint64_t h) {   // texture lock held
+    view_t v;
+    int hv;
+    const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
+    return img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+}
+
+// The answers of stage st for the slots in mask; the types of other slots stay zero.
+static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, GfxShaderAnswers *a) {
     memset(a, 0, sizeof *a);
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
     else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
@@ -564,44 +590,23 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, GfxShaderAnswers
             a->local[k] = (uint16_t)(l ? l : 1);
         }
     typeof(AC[0]) *c = &AC[st];
-    vk_texture_lock();
-    uint32_t gen = vk_texture_slots_gen();   // before the lookups: one that creates an entry bumps it
-    int all = !c->valid || c->gen != gen;
-    if (all || memcmp(c->tex, ex->tex[st], sizeof c->tex) || memcmp(c->img, ex->img[st], sizeof c->img)) {
-        for (int slot = 0; slot < 32; slot++) {
-            view_t v;
-            int hv;
-            uint64_t h = ex->tex[st][slot];
-            if (all || h != c->tex[slot]) {
-                const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-                c->tt[slot] = img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
-            }
-            h = ex->img[st][slot];
-            if (all || h != c->img[slot]) {
-                const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-                c->it[slot] = img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
-            }
-        }
-        memcpy(c->tex, ex->tex[st], sizeof c->tex);
-        memcpy(c->img, ex->img[st], sizeof c->img);
-        c->gen = gen, c->valid = 1;
-        BS.ac_miss++;
+    // Read before the lookups (one that creates an entry bumps it) and unlocked: a registration racing with it is
+    // ordered after this draw, and a slot stored under an older generation is only looked up again.
+    uint32_t gen = vk_texture_slots_gen();
+    int locked = 0, check = shader_memo_on() == 2;
+    for (uint32_t m = mask; m; m &= m - 1) {
+        int slot = __builtin_ctz(m);
+        uint64_t h = ex->tex[st][slot], hi = ex->img[st][slot];
+        int tmiss = !c->tv[slot] || c->tgen[slot] != gen || c->tex[slot] != h;
+        int imiss = !c->iv[slot] || c->igen[slot] != gen || c->img[slot] != hi;
+        if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
+        if (tmiss) c->tt[slot] = type_of_handle(h), c->tex[slot] = h, c->tgen[slot] = gen, c->tv[slot] = 1;
+        if (imiss) c->it[slot] = type_of_handle(hi), c->img[slot] = hi, c->igen[slot] = gen, c->iv[slot] = 1;
+        if (check && (type_of_handle(h) != c->tt[slot] || type_of_handle(hi) != c->it[slot]))   // TOTK_SHADER_MEMO=check
+            rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
+        a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot];
     }
-    if (shader_memo_on() == 2)   // check mode: every slot looked up again
-        for (int slot = 0; slot < 32; slot++) {
-            view_t v;
-            int hv;
-            uint64_t h = ex->tex[st][slot], hi = ex->img[st][slot];
-            const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-            int tt = img ? gfx_type_of(img, &v, hv) : 0;
-            img = hi ? vk_texture_by_id_locked((int)(hi & 0xfffff), &v, &hv) : NULL;
-            int it = img ? gfx_type_of(img, &v, hv) : 0;
-            if (tt != c->tt[slot] || it != c->it[slot])
-                rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
-        }
-    vk_texture_unlock();
-    memcpy(a->tex_type, c->tt, sizeof c->tt);
-    memcpy(a->img_type, c->it, sizeof c->it);
+    if (locked) vk_texture_unlock();
 }
 
 // *present: the program has this stage. Returns NULL when it has not or the translation failed. pending (graphics
@@ -615,8 +620,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     if (!ex->prog || !find_stage(ex->prog, st, &ctl, &code, &len)) return NULL;
     *present = 1;
     GfxShaderAnswers a;
-    answers_for(ex, st, ctl, &a);
     uint64_t serial = ex->prog->serial;
+    answers_for(ex, st, ctl, slot_mask_of(serial, st), &a);
     ShaderEnt *set = NULL;
     if (serial) {
         uint64_t h = (serial * 0x9E3779B97F4A7C15ull ^ (uint64_t)st) ^ nvn_hm_hash(&a, sizeof a);   // a is zero-padded
@@ -637,6 +642,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
     if (pending && *pending) return NULL;
+    if (s) slot_mask_learn(serial, st, s);
     if (!s) warn_once(W_SHADER, "a stage %d shader of program %llu failed to translate: draws with it are skipped", st,
                       (unsigned long long)serial);
     else if (set) {   // in front, the least recently used way drops out
@@ -1580,6 +1586,13 @@ static int shader_memo_on(void) {
     return SM.on;
 }
 
+static struct { int on, valid; VkPipeState s; const VkPipeInfo *info; } PM = {-1};
+
+static int pipe_memo_on(void) {
+    if (PM.on < 0) PM.on = cfg_bool("TOTK_PIPE_MEMO");
+    return PM.on;
+}
+
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
@@ -1652,19 +1665,33 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         wait_ms = (uint32_t)(wait_left_ns / 1000000);
         if (wait_ms) t0 = kern_now_ns();
     }
-    uint64_t w0 = kern_now_ns();
-    VkPipeline p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
-    if (t0) {
-        uint64_t spent = kern_now_ns() - t0;
-        wait_left_ns = spent < wait_left_ns ? wait_left_ns - spent : 0;
+    // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
+    // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
+    // from the info the cache entry keeps.
+    VkPipeline p;
+    const char *why = NULL;
+    uint64_t w0 = 0;
+    if (pipe_memo_on() && PM.valid && !memcmp(&PM.s, &s, sizeof s)) {
+        info = PM.info, pending = 0;
+        p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
+    } else {
+        w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
+        p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        if (t0) {
+            uint64_t spent = kern_now_ns() - t0;
+            wait_left_ns = spent < wait_left_ns ? wait_left_ns - spent : 0;
+        }
+        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
+        if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
+            perf_count(PERF_CNT_ONESHOT_WAIT);
+            why = "one-shot";
+            if (!w0) w0 = kern_now_ns();
+            p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
+        }
+        PM.valid = !pending && p && info;
+        if (PM.valid) PM.s = s, PM.info = info;
     }
-    const char *why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
-    if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
-        perf_count(PERF_CNT_ONESHOT_WAIT);
-        why = "one-shot";
-        p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
-    }
-    uint64_t waited = kern_now_ns() - w0;
+    uint64_t waited = w0 ? kern_now_ns() - w0 : 0;
     static int wait_logs;
     if (why && waited >= 2000000 && wait_logs < 200) {
         char tg[512];
