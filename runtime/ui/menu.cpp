@@ -444,7 +444,9 @@ static void tab_screen(float scale) {
     opt_choice("TOTK_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC);
     row_gpu();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
+    ImGui::BeginDisabled();   // no overlay draws yet (docs/backlog.md, in-game menu)
     opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
+    ImGui::EndDisabled();
     opt_end();
 }
 
