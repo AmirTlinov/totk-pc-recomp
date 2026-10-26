@@ -999,7 +999,48 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
         if (ex->color[i].image && !(ex->fb_dirty >> i & 1) && vk_pipeline_target_wmask(s, (int)i)) ex->fb_dirty |= 1u << i;
 }
 
+static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
+                          VkDescriptorImageInfo *out);
+
+// Sampled-texture descriptors per (handle, resource type, separate), kept while nothing they derive from changed: every
+// slot's resolution and texture entry (vk_texture_slots_gen), the samplers (vk_sampler_gen), the submission
+// (vk_texture_epoch: the first binding of a slot in a submission checks its storage) and, in a pass with images in the
+// feedback layout, the pass. Draws bind the same textures thousands of times a frame; a hit skips the slot lookup, the
+// view key with its hash probe and the sampler lookup. Storage images, which note their binding per submission, are
+// not kept. Direct-mapped; texture lock held. TOTK_TEX_MEMO=0 turns it off; =check computes every hit again and stops
+// on a difference.
+#define TD_N 4096
+static struct { uint64_t h; uint32_t gen, epoch, sgen, pass; uint16_t type; uint8_t separate, valid; VkDescriptorImageInfo out; } TD[TD_N];
+static int td_on = -1;
+
 static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out) {
+    if (td_on < 0) {
+        const char *e = cfg_value("TOTK_TEX_MEMO");
+        td_on = !strcmp(e, "check") ? 2 : strcmp(e, "0") != 0;
+    }
+    if (!h || storage || !td_on) return tex_info_full(ex, r, h, storage, separate, out);
+    uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();   // before any lookup
+    uint32_t pass = ex->nfbl ? ex->pass_serial | 0x80000000u : 0;
+    typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 52];
+    if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->gen == gen && m->epoch == ep &&
+        m->sgen == sg && m->pass == pass) {
+        *out = m->out;
+        if (td_on == 2) {
+            VkDescriptorImageInfo full;
+            tex_info_full(ex, r, h, storage, separate, &full);
+            if (full.sampler != out->sampler || full.imageView != out->imageView || full.imageLayout != out->imageLayout)
+                rt_fatal("vk_exec: texture descriptor memo of handle %#llx type %#x differs from a lookup",
+                         (unsigned long long)h, r->type);
+        }
+        return;
+    }
+    tex_info_full(ex, r, h, storage, separate, out);
+    *m = (typeof(*m)){.h = h, .gen = gen, .epoch = ep, .sgen = sg, .pass = pass, .type = r->type,
+                      .separate = (uint8_t)separate, .valid = 1, .out = *out};
+}
+
+static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
+                          VkDescriptorImageInfo *out) {
     int ms = (r->type & 0x200) != 0;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler samp = VK_NULL_HANDLE;
