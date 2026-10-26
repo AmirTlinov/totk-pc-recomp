@@ -261,6 +261,9 @@ VkSampler vk_sampler_by_id_locked(int id);
 uint32_t vk_texture_slots_gen(void);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
+void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
+uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
+size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
 int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
 void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
@@ -268,6 +271,7 @@ int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the d
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                           uint64_t img);            // always from the image (GPU copy, waited for); 0 on failure
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
+uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size);   // newest recorded writer of such a texture; 0: none
 void vk_texture_write_back(uint64_t addr, uint64_t size);   // writes those images back into their storage (waits)
 void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   // vk_pool_fini: drop the images there
 void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
@@ -286,6 +290,7 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
+uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
@@ -308,6 +313,7 @@ void rdoc_init(void);                     // runtime/rdoc_win.c: TOTK_RDOC debug
 int rdoc_active(void);
 void rdoc_after_present(uint64_t frame);
 void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
+int vk_replay_async(void);                 // TOTK_REPLAY_ASYNC (default 1): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: pipelines (T6b); weak no-op in vk_backend.c
 void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
 

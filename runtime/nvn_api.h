@@ -51,6 +51,11 @@ void nvn_guest_written(uint64_t addr, uint64_t size);      // the host or the ga
 // CPU class (0 CPU_CACHED, 1 CPU_UNCACHED, 2 other) since the previous call.
 void nvn_flush_stats(uint64_t out[2][3][2]);
 void nvn_submit_prepare(const uint64_t *handles, int n);   // weak no-op; the command-buffer slice reads deferred binds
+// Asynchronous replay: as nvn_submit_prepare, writing the handles to replay to out (a clone where a still queued
+// submission uses the same recording with other deferred binds)
+void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n);
+int gfx_replay_async(void);                                // 1: the back end replays submissions on its own thread
+uint64_t gfx_replayed_submits(void);                       // newest submit number (nvn_submit_count) replayed
 #define NVN_HANDLE_TEX(h) ((int)((h) & 0xfffff))           // combined texture handle = texture id | sampler id << 20
 #define NVN_HANDLE_SAMP(h) ((int)(((h) >> 20) & 0xfff))
 extern GfxStats gfx_counters;                              // behind gfx_stats(); add with __atomic_fetch_add. frames:
