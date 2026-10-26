@@ -399,6 +399,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (state > 0) {
+        if (state == 1) pad_read(&b, sl, sr);
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
             uint8_t down[KEY_COUNT] = {0};
