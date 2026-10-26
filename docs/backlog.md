@@ -106,7 +106,7 @@ Worked in this order.
 22. Shader census for the open graphics lessons (port-lessons G3, G6), offline with no game run: how many TotK shaders
     fetch from buffer textures and how many clears use a partial mask.
 23. Image aliasing over GPU-only pool memory (Maxwell 2.3 / check 7): count distinct texture keys per address per
-    frame; the flight recorder counts new aliases. Likely the cause of item 2.
+    frame; the flight recorder counts new aliases.
 24. `VK_KHR_index_type_uint8` (Maxwell check 9): drops the CPU widening of 130-170 byte-index draws per frame.
 25. Texture gather rounding on AMD (Maxwell 2.10): yuzu's sub-pixel offset at `ImageGather` fixed BotW shadow edges.
 26. Horizon scheduling fidelity (port-lessons S1, S2, S3, S5, S6): wake a better-priority thread on the signaller's core
