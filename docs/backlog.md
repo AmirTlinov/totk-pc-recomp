@@ -177,11 +177,13 @@ Each platform item gets a written design first, agreed with the maintainer.
     load) runs at 60 fps with game speed 1.000, REV15 audio without underruns, 0 unimplemented NVN calls, 0 validation
     errors; every probe passes on 1.4.3 and on 1.2.1; the jump-table check reports 0 disagreements on both; the
     installer takes either update. Open:
-    1. Shader preparation: the MacNativeGames list at our pin has 134 keys of 1.4.3 (its compiler changed every
-       binary), so 1.4.3 translates nearly every shader on first sight in play. A list recorded from our own 1.4.3
-       play, or a newer pin, would fill it.
-    2. Not played beyond the field save and the opening cutscene: combat, abilities, cutscenes, menus, saving; whether
-       1.2.1 loads saves that 1.4.3 wrote.
+    1. Shader preparation is done: `prepare_shaders.py` seeds every shader's default variant, as MacNativeGames'
+       seed does, and reads the list with the V rows its history dropped (`tools/shader_list.py`; the current list
+       alone has 134 rows of 1.4.3 shaders). 29,587 variants, and all 1,095 that the field and intro runs met in play
+       are among them. Not ported: MacNativeGames types vertex inputs and colour outputs by the bound format, so a
+       variant serves any format; ours still differ by those types.
+    2. Not played beyond the field save and the opening cutscene: combat, abilities, cutscenes, menus, saving. Saves
+       carry over both ways (the user's saves were written by 1.4.3 and load on 1.2.1).
     3. The installer end-to-end test (`tests/installer_e2e.py`) runs only on 1.2.1.
     4. MacNativeGames' 1.4.3 output, render and fixed resolution patches (`game_patches_v143.c`) are not ported; 1.2.1
        has none of them either.

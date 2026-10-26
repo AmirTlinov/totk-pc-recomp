@@ -27,6 +27,7 @@ from .runner import InstallError, Step
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
 import extract  # noqa: E402
+import shader_list  # noqa: E402
 from extract_exefs import (common_tickets, container_entries, load_keys, nca_ctr_key, nca_inventory,  # noqa: E402
                            program_nca)
 
@@ -150,12 +151,10 @@ def expected_update(ctx):
 def shader_list_text(layout):
     if layout.shader_list:
         return layout.shader_list.read_text(encoding='utf-8')
-    refs = layout.root / 'refs' / 'MacNativeGames'
-    r = subprocess.run(['git', '-C', str(refs), 'show', 'origin/HEAD:games/totk/assets/shader_list.tsv'],
-                       capture_output=True, encoding='utf-8')
-    if r.returncode:
+    try:
+        return shader_list.history(layout.root / 'refs' / 'MacNativeGames')
+    except subprocess.CalledProcessError:
         raise InstallError('prepare.shader_list_missing')
-    return r.stdout
 
 
 class Watch(threading.Thread):

@@ -29,7 +29,6 @@ from pathlib import Path
 
 EXE = '.exe' if os.name == 'nt' else ''
 UCRT = Path(r'C:\msys64\ucrt64\bin')
-SHADER_LIST_REF = 'origin/HEAD:games/totk/assets/shader_list.tsv'   # dev: tools/prepare_shaders.py LIST_REF
 SUPPORTED = ('1.2.1', '1.4.3')   # updates the installer builds; the check identifies the player's by hash
 
 

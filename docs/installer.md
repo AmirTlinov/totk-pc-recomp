@@ -34,7 +34,7 @@ The player runs a newer installer on the same folder. It reads `totk-install.jso
 release that changes nothing game-derived skips the rebuild.
 
 Given another update file than the recorded one (1.2.1, then 1.4.3), the installer extracts and builds again from it and
-keeps `profile/`. Whether 1.2.1 loads the saves 1.4.3 wrote is not checked: back the profile up before switching.
+keeps `profile/`. Saves carry over both ways: 1.4.3 converts a 1.2.1 save on load, and 1.2.1 loads the saves 1.4.3 wrote.
 
 ## Setup steps
 
