@@ -173,19 +173,20 @@ Each platform item gets a written design first, agreed with the maintainer.
     every render target ourselves); MacNativeGames has neither. The software keyboard could move onto
     SavageWindRecomp's `osk.mm`.
 
-39. **Game version 1.4.3** (branch `task/v143`, paused). The 1.4.3 files extract and verify, and the generator runs on
-    them unchanged. Estimate: one day to the title screen, two to three to play at 60 fps. Steps:
-    1. `stg` no-op lift, DT_RELR in `recomp/nso.py` and `runtime/loader.c`, symbol count from DT_GNU_HASH for `sdk`
-       and `subsdk0`.
-    2. Jump tables: 26 disagreements and 83 unresolved sites down to 0 unexplained, with 1.2.1 still at 0.
-    3. Tools take a version instead of `v121`; re-measure the `--probe-loader` table (`loader.c` `expect[]`) and
-       `boot.c` `expected_inits`; new boot anchors (`boot.c` `CHECKPOINT_RET`, `NVN_RET`).
-    4. RELRO (`nn::ro::ProtectRelro`) and the new SDK imports; run to the title screen.
-    5. `recomp/patches-v143.txt` from MacNativeGames `game_patches_v143.c` (fps60, bounce, cloth; the real-time step
-       rewritten for the `sys+0x1da` coefficient); the player position of `frame_rate.c` `player_pos`;
-       `make_romfs_patches.py --version` (`Common.Product.140`).
-    6. Audio REV15 is mostly in place (`audren.c`, `audio_mixer.c`): fix the REV11 self-test, check the override
-       signatures (biquad, font decode), and listen for render differences in play.
+39. **Game version 1.4.3** (branch `task/v143`). Builds, boots and plays: the field save (a 1.2.1 save, converted on
+    load) runs at 60 fps with game speed 1.000, REV15 audio without underruns, 0 unimplemented NVN calls, 0 validation
+    errors; every probe passes on 1.4.3 and on 1.2.1; the jump-table check reports 0 disagreements on both; the
+    installer takes either update. Open:
+    1. Shader preparation: the MacNativeGames list at our pin has 134 keys of 1.4.3 (its compiler changed every
+       binary), so 1.4.3 translates nearly every shader on first sight in play. A list recorded from our own 1.4.3
+       play, or a newer pin, would fill it.
+    2. Not played beyond the field save and the opening cutscene: combat, abilities, cutscenes, menus, saving; whether
+       1.2.1 loads saves that 1.4.3 wrote.
+    3. The installer end-to-end test (`tests/installer_e2e.py`) runs only on 1.2.1.
+    4. MacNativeGames' 1.4.3 output, render and fixed resolution patches (`game_patches_v143.c`) are not ported; 1.2.1
+       has none of them either.
+    5. The opening cutscene (Zelda under Hyrule Castle) shows hard light bands on 1.4.3 and on 1.2.1 alike; whether
+       that is the game's look or ours is not checked.
 40. **Community ExeFS patches** (`.ips`, `.pchtxt` for 1.2.1): apply them through the generator's patch table
     (`recomp/patches.py`). RomFS mods already load (`romfs.c`, `TOTK_ROMFS_MODS`). Code-module mods (exlaunch
     `subsdk9`) need porting one by one.
