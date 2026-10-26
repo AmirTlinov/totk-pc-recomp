@@ -9,7 +9,7 @@ holds only the game; the installer and its tools stay outside it.
 1. Downloads `TotK-Setup-<version>-windows.zip` from GitHub Releases (none is published yet), unpacks it anywhere and
    starts `TotK-Setup.exe`.
 2. Picks:
-   - the base game (XCI or NSP) and the 1.2.1 update (NSP);
+   - the base game (XCI or NSP) and the 1.2.1 or 1.4.3 update (NSP);
    - their `prod.keys`;
    - the game language and the install folder.
 3. Waits for the setup, one time. The window shows each step and its progress.
@@ -33,14 +33,18 @@ The player runs a newer installer on the same folder. It reads `totk-install.jso
 `profile/` and `totk.ini` after checking their hashes, rebuilds `totk.exe` and re-prepares the shaders. A newer
 release that changes nothing game-derived skips the rebuild.
 
+Given another update file than the recorded one (1.2.1, then 1.4.3), the installer extracts and builds again from it and
+keeps `profile/`. Whether 1.2.1 loads the saves 1.4.3 wrote is not checked: back the profile up before switching.
+
 ## Setup steps
 
-1. **Check** before writing anything: the files open with the keys, the update is 1.2.1 (by hash, as
+1. **Check** before writing anything: the files open with the keys, the update is 1.2.1 or 1.4.3 (by hash, as
    `tools/extract.py`), the keys are new enough for the update, enough space is free on the target disk (about 36 GiB at the peak of a
    first install, 20 GiB after it), the CPU has
    AVX2 (`-march=x86-64-v3`), a Vulkan 1.3 GPU exists. Each failure is one clear message.
 2. **Extract** ExeFS and RomFS into the install folder and verify the hashes.
-3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt`) into a temp folder next to the installer.
+3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt` or `patches-v143.txt`) into a temp folder next
+   to the installer.
 4. **Compile** the generated C, `modules.c` and `romfs.c` (they bake per-install layout and RomFS hashes) and link
    them with the prebuilt runtime library into `totk.exe` (`build_game.py --runtime-lib`; about 3 min on 24 cores).
 5. **Prepare** the RomFS patches and the shaders (`tools/make_romfs_patches.py`, `tools/prepare_shaders.py`,

@@ -4,7 +4,8 @@ Release (docs/installer.md "Release layout"), root = the unpacked folder:
 
     python/python.exe       runs every tool (numpy, lz4, cryptography, compression.zstd); its ._pth puts .., ../tools
                             and ../recomp on sys.path, so `python -m installer` imports from the release folder
-    recomp/, tools/         the lifter and the scripts; recomp/patches-v121.txt, tools/data/expected-v1.2.1.json
+    recomp/, tools/         the lifter and the scripts; recomp/patches-<v>.txt, tools/data/expected-v<version>.json for
+                            each supported update (SUPPORTED)
     llvm/                   llvm-mingw (bin/clang.exe)
     runtime/                libtotkrt.a, the headers, install-side sources (romfs.c) and totk.ico; runtime/deps/ holds
                             include/ + lib/ of Vulkan, SDL3, Opus, libvpx and VMA (build_game.py --deps)
@@ -29,6 +30,12 @@ from pathlib import Path
 EXE = '.exe' if os.name == 'nt' else ''
 UCRT = Path(r'C:\msys64\ucrt64\bin')
 SHADER_LIST_REF = 'origin/HEAD:games/totk/assets/shader_list.tsv'   # dev: tools/prepare_shaders.py LIST_REF
+SUPPORTED = ('1.2.1', '1.4.3')   # updates the installer builds; the check identifies the player's by hash
+
+
+def version_tag(version):
+    """'1.4.3' -> 'v143': the version name of build_game.py, make_romfs_patches.py and the patch tables."""
+    return 'v' + version.replace('.', '')
 
 
 @dataclass(frozen=True)
@@ -39,8 +46,6 @@ class Layout:
     python: Path          # runs the tools
     tools: Path
     recomp: Path
-    patches: Path         # code patch table for recomp/gen.py
-    expected: Path        # expected hashes of the supported update
     llvm: Path            # llvm-mingw tree
     deps: Path            # include/ and lib/ for the link
     runtime: Path         # runtime headers and install-side sources
@@ -57,12 +62,20 @@ class Layout:
     def clang(self):
         return self.llvm / 'bin' / ('clang' + EXE)
 
+    def patches(self, version):
+        """The code patch table for recomp/gen.py."""
+        return self.recomp / f'patches-{version_tag(version)}.txt'
+
+    def expected(self, version):
+        """The expected hashes of the update."""
+        return self.tools / 'data' / f'expected-v{version}.json'
+
     def missing(self):
         """Paths the steps need that do not exist."""
         need = [self.python, self.tools / 'extract.py', self.tools / 'build_game.py', self.tools / 'prepare_shaders.py',
-                self.tools / 'make_romfs_patches.py', self.recomp / 'gen.py', self.patches, self.expected, self.clang,
+                self.tools / 'make_romfs_patches.py', self.recomp / 'gen.py', self.clang,
                 self.deps / 'include', self.deps / 'lib', self.runtime, self.runtime_lib, self.ninja, self.hactool,
-                self.xlate, *self.dlls]
+                self.xlate, *self.dlls, *(f(v) for v in SUPPORTED for f in (self.patches, self.expected))]
         if self.shader_list:
             need.append(self.shader_list)
         return [str(p) for p in need if not p.exists()]
@@ -78,8 +91,7 @@ def release_layout(root):
         root=root, dev=False,
         release=version.read_text(encoding='utf-8').strip() if version.is_file() else 'unknown',
         python=root / 'python' / ('python' + EXE),
-        tools=root / 'tools', recomp=root / 'recomp', patches=root / 'recomp' / 'patches-v121.txt',
-        expected=root / 'tools' / 'data' / 'expected-v1.2.1.json',
+        tools=root / 'tools', recomp=root / 'recomp',
         llvm=root / 'llvm', deps=root / 'runtime' / 'deps', runtime=root / 'runtime',
         runtime_lib=root / 'runtime' / 'libtotkrt.a',
         ninja=root / 'bin' / ('ninja' + EXE), hactool=root / 'bin' / ('hactool' + EXE),
@@ -97,8 +109,7 @@ def dev_layout(root):
     return Layout(
         root=root, dev=True, release=f'dev-{commit or "unknown"}',
         python=embed if embed.is_file() else Path(sys.executable),
-        tools=root / 'tools', recomp=root / 'recomp', patches=root / 'recomp' / 'patches-v121.txt',
-        expected=root / 'tools' / 'data' / 'expected-v1.2.1.json',
+        tools=root / 'tools', recomp=root / 'recomp',
         llvm=trees[-1] if trees else root / 'toolchain' / 'llvm-mingw-missing', deps=deps,
         runtime=root / 'runtime', runtime_lib=root / 'build' / 'install-rtlib' / 'libtotkrt.a',
         ninja=UCRT / ('ninja' + EXE), hactool=root / 'toolchain' / 'hactool' / ('hactool' + EXE),

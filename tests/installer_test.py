@@ -76,7 +76,7 @@ class Bed:
 
     def run(self, release='1.0', inputs=None, fail=None, verify_ok=None, verify=False):
         layout = Layout(root=Path('.'), dev=True, release=release, python=Path('python'), tools=Path('tools'),
-                        recomp=Path('recomp'), patches=Path('p'), expected=Path('e'), llvm=Path('llvm'),
+                        recomp=Path('recomp'), llvm=Path('llvm'),
                         deps=Path('deps'), runtime=Path('rt'), runtime_lib=Path('lib'), ninja=Path('ninja'),
                         hactool=Path('hactool'), xlate=Path('xlate'))
         options = SimpleNamespace(inputs=inputs or {}, fail=dict(fail or {}), verify_ok=verify_ok or {}, ran=[],

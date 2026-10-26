@@ -587,7 +587,7 @@ def main():
                                                '(default build/extracted/<version>/romfs)')
     ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile for v121, "
                                                  "build/profile-<version> otherwise: a newer game version rewrites the "
-                                                 "saves it loads, and an older one cannot read them back)")
+                                                 "saves it loads, and whether an older one reads them is not checked)")
     ap.add_argument('--toolchain', type=Path, help='llvm-mingw directory (with bin/clang.exe) to build with instead of '
                                                    'MSYS2 UCRT64 clang')
     ap.add_argument('--ninja', type=Path, help='ninja.exe to build with (default: MSYS2 UCRT64, else bin/ninja.exe of the '
