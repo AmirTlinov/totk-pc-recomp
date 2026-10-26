@@ -157,8 +157,8 @@ Each platform item gets a written design first, agreed with the maintainer.
     says "after restart". Dear ImGui is drawn after the blit into the swapchain image (`runtime/ui/menu.cpp`).
 
     Left to do, in this order (unfinished work on branch `task/menu-advanced`):
-    1. Performance overlay (`TOTK_PERF_OVERLAY`, off, fps or full, F10 cycles; SavageWindRecomp `runtime/perfmon.c`):
-       frame rate, frame time, CPU and GPU load through PDH and NVML. Its menu row is greyed out until then.
+    1. Performance overlay: `TOTK_PERF_OVERLAY` (F10 cycles) shows the frame rate, and in `full` the mean and longest
+       frame time. Left: CPU and GPU load through PDH and NVML (SavageWindRecomp `runtime/perfmon.c`).
     2. Advanced tab: the remaining `cfg` keys (scheduling, replay thread, pipeline and shader switches), reset of all
        settings, and a system information block (`sysinfo.c`) with copy to clipboard and open the log folder.
     3. Game language list without Portuguese (TotK ships ja, en, fr, de, it, es, nl, ru, zh-CN, zh-TW, ko).

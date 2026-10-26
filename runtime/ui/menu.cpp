@@ -444,9 +444,7 @@ static void tab_screen(float scale) {
     opt_choice("TOTK_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC);
     row_gpu();
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
-    ImGui::BeginDisabled();   // no overlay draws yet (docs/backlog.md, in-game menu)
     opt_choice("TOTK_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
-    ImGui::EndDisabled();
     opt_end();
 }
 
@@ -556,17 +554,81 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
 
 static int g_save_pending;   // a changed setting still waits for its write to totk.ini (opt_save_tick)
 
+// ---- the performance overlay (TOTK_PERF_OVERLAY): the frame rate over the presents of the last half second, in "full"
+// also their mean and longest interval, in the top right corner. Off, it costs a cfg_version load per present.
+static unsigned g_perf_ver = ~0u;
+static int g_perf_mode;                  // 0 off, 1 fps, 2 full
+static std::atomic<int> g_perf_save;     // F10 changed the mode: totk.ini is written on the present thread
+static uint64_t g_perf_last_ns, g_perf_win_ns, g_perf_max_ns;
+static int g_perf_frames;
+static char g_perf_text[96];
+
+static int perf_mode_of(const char *s) { return !strcmp(s, "full") ? 2 : !strcmp(s, "fps") ? 1 : 0; }
+
+extern "C" void menu_perf_cycle(void) {
+    static const char *const modes[] = {"off", "fps", "full"};
+    cfg_set("TOTK_PERF_OVERLAY", modes[(perf_mode_of(cfg_value("TOTK_PERF_OVERLAY")) + 1) % 3]);
+    g_perf_save.store(1);
+}
+
+static void perf_tick(uint64_t now) {
+    if (cfg_version() != g_perf_ver) {
+        g_perf_ver = cfg_version();
+        int m = perf_mode_of(cfg_value("TOTK_PERF_OVERLAY"));
+        if (m != g_perf_mode) g_perf_last_ns = 0, g_perf_text[0] = 0;
+        g_perf_mode = m;
+    }
+    if (!g_perf_mode) return;
+    uint64_t d = now - g_perf_last_ns;
+    if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
+        g_perf_win_ns = g_perf_max_ns = 0;
+        g_perf_frames = 0;
+    } else {
+        g_perf_win_ns += d;
+        g_perf_frames++;
+        if (d > g_perf_max_ns) g_perf_max_ns = d;
+        if (g_perf_win_ns >= 500000000ull) {
+            double fps = g_perf_frames * 1e9 / g_perf_win_ns;
+            if (g_perf_mode == 2)
+                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FULL), fps,
+                         g_perf_win_ns / 1e6 / g_perf_frames, g_perf_max_ns / 1e6);
+            else
+                snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS), fps);
+            g_perf_win_ns = g_perf_max_ns = 0;
+            g_perf_frames = 0;
+        }
+    }
+    g_perf_last_ns = now;
+}
+
+static void perf_draw(float w, float scale) {
+    if (!g_perf_mode || !g_perf_text[0]) return;
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
+    float pad = 6 * scale;
+    ImVec2 p(w - 12 * scale - sz.x - pad * 2, 12 * scale);   // the top right corner: the game's HUD leaves it empty
+    dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 2, p.y + sz.y + pad * 2), IM_COL32(0, 0, 0, 150), 4 * scale);
+    dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), g_perf_text);
+}
+
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {
     *shot = NULL;
     if (!g_test.parsed) test_parse();
     if (g_test.next_set < g_test.n_sets && frame >= g_test.sets[g_test.next_set].frame) test_apply_sets(frame);
-    if (!g_open.load(std::memory_order_relaxed)) {
+    if (g_perf_save.exchange(0)) cfg_save();
+    perf_tick(plat_now_ns());
+    bool open = g_open.load(std::memory_order_relaxed);
+    if (!open) {
         if (g_save_pending) g_save_pending = opt_save_tick(1);   // closed: the last change goes to totk.ini now
-        if (!g_test.at || g_test.opened || frame < g_test.at) return 0;
-        g_test.opened = frame;
-        g_test.page = 0;
-        g_tab_request = 0;
-        set_open(1);
+        if (g_test.at && !g_test.opened && frame >= g_test.at) {
+            g_test.opened = frame;
+            g_test.page = 0;
+            g_tab_request = 0;
+            set_open(1);
+            open = true;
+        } else if (!g_perf_mode) {
+            return 0;
+        }
     }
     if (g_failed_flag()) {
         set_open(0);
@@ -599,7 +661,8 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     double dt = g_last_ns ? (t0 - g_last_ns) / 1e9 : 1 / 60.0;
     io.DeltaTime = (float)(dt < 1e-4 ? 1e-4 : dt > 0.1 ? 0.1 : dt);
     g_last_ns = t0;
-    if (g_test.page < 0) {
+    if (!open) {   // the overlay alone: no input reaches ImGui
+    } else if (g_test.page < 0) {
         drain_events(io);
         pad_events(io, reset);
     } else {   // the test hook's pages: the user's input in a background test window must not change settings
@@ -609,9 +672,10 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     }
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
-    layout_menu(t->width, t->height, scale);
+    if (open) layout_menu(t->width, t->height, scale);
+    perf_draw((float)t->width, scale);
     ImGui::Render();
-    g_save_pending = opt_save_tick(0);
+    if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;
     if (g_test.page >= 0 && frame >= g_test.opened + g_test.per_page * (uint64_t)(g_test.page + 1)) {
         static char path[512];   // this frame's image goes to a file; then the next tab, or the menu closes

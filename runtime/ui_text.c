@@ -42,8 +42,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "The Vulkan device that draws the game.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate and system numbers over the picture; F10 cycles the modes.",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate in the top right corner; Full adds the mean and the longest frame time of the "
+                                  "last half second. F10 cycles the modes.",
     [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full",
+    // printf formats of the overlay line: frame rate; frame rate, mean and longest frame time in ms
+    [UI_PERF_LINE_FPS] = "%.0f fps", [UI_PERF_LINE_FULL] = "%.0f fps   %.1f ms   max %.1f ms",
 
     [UI_MENU_FPS60] = "Frame rate", [UI_MENU_FPS60_DESC] = "Runs the game at 60 frames per second instead of 30.",
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_30] = "30 FPS",
@@ -176,8 +179,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Устройство Vulkan, которое рисует игру.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров и данные о системе поверх картинки; F10 переключает режимы.",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу; «Полный» добавляет среднее и самое долгое время "
+                                  "кадра за последние полсекунды. F10 переключает режимы.",
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
+    [UI_PERF_LINE_FPS] = "%.0f к/с", [UI_PERF_LINE_FULL] = "%.0f к/с   %.1f мс   макс. %.1f мс",
 
     [UI_MENU_FPS60] = "Частота кадров", [UI_MENU_FPS60_DESC] = "Игра идёт в 60 кадров в секунду вместо 30.",
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_30] = "30 FPS",
