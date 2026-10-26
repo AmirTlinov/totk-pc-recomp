@@ -6,7 +6,8 @@
 //
 // The patch page is the first 4 KiB page after main's image, inside the module window memory.c reserved: replacement
 // code reaches it with one adrp, as MacNativeGames' data page after main (games/totk/runtime/game_patches.c). Its
-// layout belongs to the sets that use it (frame_rate.c: +0 the 30 Hz ratio, +4 the frame step in seconds).
+// layout belongs to the sets that use it (frame_rate.c: +0 the 30 Hz ratio, +4 the frame step in seconds, +8 the
+// step in 60 Hz ticks).
 // Probe modes never call rt_patches_init: every set stays off.
 #include "cfg.h"
 #include "platform/platform.h"

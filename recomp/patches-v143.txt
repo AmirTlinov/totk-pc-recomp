@@ -1,0 +1,46 @@
+# Code patches for TotK 1.4.3 main (recomp/patches.py). Ported from MacNativeGames
+# games/totk/runtime/game_patches_v143.c (MIT, Copyright (c) 2026 MacNativeGames contributors) at upstream 73c4821,
+# each original word checked against the 1.4.3 main. MacNativeGames branches to veneers after the text; here a
+# veneer's body is the site's replacement. The patch page holds three floats the runtime writes at every present
+# (frame_rate.c): +0 the 30 Hz ratio (seconds * 30), +4 the frame step in seconds, +8 the step in 60 Hz ticks.
+
+set fps60    TOTK_FPS60          1
+set realtime TOTK_REALTIME       1
+set cloth    TOTK_CLOTH_REALTIME 1
+set bounce   TOTK_HIGHFPS_FIX    1
+
+# 60 fps: the adaptive present-interval controller (main+0x2db174, 1.2.1 0x8f26c8) gets the minimum interval 1.
+site fps60 main 2db204 6b08015f 7100055f   # clamp: cmp w10, #1 (was cmp w10, w8 = minimum)
+site fps60 main 2db208 1a89b10a 1a9fa52a   # clamp: csinc w10, w9, wzr, ge (desired = max(desired, 1))
+site fps60 main 2db22c b940468a d503201f   # lower trigger: nop the stored-candidate load
+site fps60 main 2db360 6b0801bf 710005bf   # raise path: cmp w13, #1
+site fps60 main 2db36c 1a88c1ac 1a9fc5ac   # raise path: csinc w12, w13, wzr, gt (next lower candidate floors at 1)
+site fps60 main 2db340 b9400288 52800028   # lower path: mov w8, #1 (minimum interval 1)
+site fps60 main 2db34c 2a0a03f5 1a9fa555   # lower path: csinc w21, w10, wzr, ge (result never below 1)
+
+# Real-time step. The frame-step producer feeds both FrameRateMgr call sites with s8 = nominal interval * a 0.5/1.0
+# coefficient (sys+0x1da bit 0, fcsel above the site); the nominal interval comes from the patch page, the coefficient
+# and FrameRateMgr's own arithmetic stay. x8 is free: the ldxr after the site loads it. The global ratio after the
+# controller call (1.2.1 0x8f2394) reads the ratio from the page instead of 60 / interval * 0.5.
+site realtime main 3e5658 1e210808 @page:x8 bd400900 1e210808   # fmul s8, s0, s1: s0 = [page+8] first
+site realtime main 2daa54 bd425260 @page:x9   # ldr s0, [x19, #0x250] -> adrp x9, page
+site realtime main 2daa58 52a84e08 bd400120   # mov w8, #60.0 -> ldr s0, [x9] (global ratio)
+site realtime main 2daa6c 5e21d800 d503201f   # scvtf s0, s0 -> nop
+site realtime main 2daa70 1e201820 d503201f   # fdiv s0, s1, s0 -> nop
+site realtime main 2daa74 1e2c1001 d503201f   # fmov s1, #0.5 -> nop
+site realtime main 2daa78 1e210800 d503201f   # fmul s0, s0, s1 -> nop
+
+# Hair and cloth: the actor animation update builds a second clock {seconds = factor / 30, ratio = factor} per
+# rendered frame. 1.4.3 inlines it in two actor paths, where the factor was just stored to the ratio slot: the
+# replacement stores measured ratio * factor there and computes measured seconds * factor. Two other callers share the
+# out-of-line update (main+0x2a0e40), whose s2 (seconds) and s3 (ratio) are scaled by the measured ratio; its third
+# caller already passes measured time and stays. x8 and s4 are free at all four sites.
+site cloth main 246eac 1e200940 @page:x8 bd400100 1e200940 bd0367e0 bd400500 1e200940   # fmul s0, s10, s0
+site cloth main 345904 1e210801 @page:x8 bd400101 1e210801 bd0117e1 bd400501 1e210801   # fmul s1, s0, s1
+site cloth main 24944c 94015e7d @page:x8 bd400104 1e240842 1e240863 94015e7d   # bl 0x2a0e40
+site cloth main 28bc98 9400546a @page:x8 bd400104 1e240842 1e240863 9400546a   # bl 0x2a0e40
+
+# Trampolines: the contact code scales the bounce vector by 0.1 when time object +0x28 (30 / (ratio * time scale)) is
+# over 100; compare +0x28 * +0x38 (30 / time scale) instead, the same value at 30 Hz and independent of the frame rate.
+# s1 is set again by the fmov two instructions on.
+site bounce main 562a64 bd402920 bd402920 bd403921 1e210800   # ldr s0, [x9, #0x28]; ldr s1, [x9, #0x38]; fmul s0, s0, s1

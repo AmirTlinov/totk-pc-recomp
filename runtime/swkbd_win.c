@@ -30,12 +30,14 @@
 #include "ui_text.h"
 #include "vk.h"
 
-// KeyboardConfig (0x4d0 bytes) then the work buffer {pointer, size}: offsets read from the SDK setters (MNG) and
-// checked against the 1.2.1 SDK by --probe-services.
+// KeyboardConfig then the work buffer {pointer, size}: offsets read from the SDK setters (MNG) and checked against
+// the SDK by --probe-services. SDK 20.5 (1.4.3) put a text-check callback at +0x4c8 and grew KeyboardConfig from
+// 0x4d0 to 0x518 bytes (SetInitialText, SetUserWordList read the work buffer there); the fields below +0x3d8 stay.
+#define ARG_WORK (RT_V143 ? 0x518 : 0x4d0)
+#define ARG_WORK_SIZE (ARG_WORK + 8)
 enum {
     KB_TYPE = 0x00, KB_OK_TEXT = 0x04, KB_DISABLED = 0x1c, KB_HEADER = 0x24, KB_SUB = 0xa6, KB_GUIDE = 0x1a8,
     KB_MAX_LEN = 0x3ac, KB_MIN_LEN = 0x3b0, KB_PASSWORD = 0x3b4, KB_UTF8 = 0x3bd, KB_INIT_OFF = 0x3c0, KB_INIT_LEN = 0x3c4,
-    ARG_WORK = 0x4d0, ARG_WORK_SIZE = 0x4d8,
     KB_TYPE_NUMPAD = 1, KB_LIMIT = 500, SWKBD_CANCELED = 0x29f,
 };
 enum { B_A = 0, B_B = 1, B_PLUS = 10 };   // input.h bits

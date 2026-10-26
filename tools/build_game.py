@@ -213,7 +213,8 @@ def module_glue(layout, linked, hashes, paths, version):
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
-    out += [f'const int rt_game_version = {int(DISPLAY_VERSIONS[version].replace(".", "")) if version in DISPLAY_VERSIONS else 0};', '']
+    number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
+    out += [f'const int rt_game_version = {number};', '']
     return '\n'.join(out)
 
 
@@ -584,7 +585,9 @@ def main():
                     help="totk.exe's default ExeFS directory (default build/extracted/<version>/exefs)")
     ap.add_argument('--romfs', type=Path, help="totk.exe's default RomFS directory with romfs.bin and index.json "
                                                '(default build/extracted/<version>/romfs)')
-    ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile)")
+    ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile for v121, "
+                                                 "build/profile-<version> otherwise: a newer game version rewrites the "
+                                                 "saves it loads, and an older one cannot read them back)")
     ap.add_argument('--toolchain', type=Path, help='llvm-mingw directory (with bin/clang.exe) to build with instead of '
                                                    'MSYS2 UCRT64 clang')
     ap.add_argument('--ninja', type=Path, help='ninja.exe to build with (default: MSYS2 UCRT64, else bin/ninja.exe of the '
@@ -604,7 +607,8 @@ def main():
     extracted = ROOT / 'build' / 'extracted' / args.version
     paths = {'exefs': (args.exefs or extracted / 'exefs').resolve(),
              'romfs': (args.romfs or extracted / 'romfs').resolve(),
-             'profile': (args.profile or ROOT / 'build' / 'profile').resolve()}
+             'profile': (args.profile or ROOT / 'build' / ('profile' if args.version == 'v121'
+                                                           else f'profile-{args.version}')).resolve()}
     expected = args.expected
     if not expected:
         if args.version not in DISPLAY_VERSIONS:

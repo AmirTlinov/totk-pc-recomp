@@ -2,22 +2,23 @@
 // contributors): runtime_frame_step_update (2338bb0: no 1/120 s floor) and the speed survey's player chain
 // (world_survey.c player_actor).
 // Frame rate: 60 fps and the real-time frame step, the host half of the patch sets fps60, realtime and cloth
-// (build table patches-v121.txt; docs/research/macnativegames.md section 6.2).
+// (build tables patches-v121.txt, patches-v143.txt; docs/research/macnativegames.md section 6.2).
 //
 // TotK's adaptive present-interval controller (main+0x8f26c8) turns the main thread's measured work into a number of
 // 60 Hz ticks clamped to [minimum, maximum]; shipping data sets the minimum to 2 (30 fps), the set fps60 lowers it to
 // 1. The controller still raises the interval when a frame does not fit. Shipping code then steps the game by whole
 // vsyncs (VFR step main+0x7ede6c: ratio = interval * 0.5, seconds = interval / 60; global ratio at main+0x8f2394), so
 // game speed is right only when frames take exactly their interval. With the set realtime both read the patch page
-// instead: +0 ratio = seconds * 30, +4 seconds, the moving average of the last 5 display intervals, at most 1/15 s
+// instead: +0 ratio = seconds * 30, +4 seconds (1.4.3: +8 interval = seconds * 60, the producer's nominal interval
+// before its half-step coefficient), the moving average of the last 5 display intervals, at most 1/15 s
 // (slower frames slow the game down, as on the console), no lower bound, so a higher frame-rate cap only changes the
 // pacer (nvn_api_obj.c VSYNC_HZ). The set cloth gives hair and cloth the same clock and needs realtime.
 //
 // The sample is the display time the pacer gives each present (nvnQueuePresentTexture), so the step follows the
 // frames as shown, pacing waits included. With the step on, the pacer ignores the game's interval and holds a frame
 // only to the frame-rate cap (nvn_api_obj.c present_period): the controller's 2 or 3 vsyncs would only add latency.
-// One 64-bit store per present; the guest reads the two floats on its own
-// threads, and both stay finite and in range whichever store they see.
+// One 64-bit and one 32-bit store per present; the guest reads the floats on its own threads, and each stays finite
+// and in range whichever store it sees.
 //
 // TOTK_TRACE=perf adds a line per 120 presents: fps, the game seconds stepped against wall seconds, and with
 // TOTK_SPEED_PROBE=1 the player's position and ground speed (an independent check: Link runs at the same speed at
@@ -40,16 +41,19 @@
 #define STEP_FIRST_S (1.0 / 60.0)
 
 static _Atomic uint64_t *step_word;   // patch page +0: ratio (low float), seconds (high float)
+static _Atomic uint32_t *step_interval;   // patch page +8: seconds * 60 (patches-v143.txt realtime)
 static uint64_t last_ns;
 static double samples[STEP_SAMPLES];
 static unsigned sample_count, sample_next;
 
-static uint64_t step_bits(float seconds) {
-    float ratio = seconds * 30.0f;
-    uint32_t lo, hi;
+static void step_store(float seconds) {
+    float ratio = seconds * 30.0f, interval = seconds * 60.0f;
+    uint32_t lo, hi, iv;
     memcpy(&lo, &ratio, 4);
     memcpy(&hi, &seconds, 4);
-    return (uint64_t)lo | (uint64_t)hi << 32;
+    memcpy(&iv, &interval, 4);
+    atomic_store_explicit(step_word, (uint64_t)lo | (uint64_t)hi << 32, memory_order_release);
+    atomic_store_explicit(step_interval, iv, memory_order_release);
 }
 
 void frame_step_init(void) {
@@ -64,7 +68,8 @@ void frame_step_init(void) {
     }
     if (rt_patch_enabled(realtime)) {
         step_word = (_Atomic uint64_t *)rt_patch_page();
-        atomic_store(step_word, step_bits((float)STEP_FIRST_S));
+        step_interval = (_Atomic uint32_t *)((uint8_t *)rt_patch_page() + 8);
+        step_store((float)STEP_FIRST_S);
     }
     rt_log("frame rate: present interval %s, %s", rt_patch_enabled(fps60) ? "1..3 (60 fps)" : "2..3 (shipping 30 fps)",
            step_word ? "real-time step (5-frame average of display intervals, at most 1/15 s)" : "whole-vsync steps");
@@ -177,7 +182,7 @@ void frame_step_present(uint64_t display_ns, int interval) {
             double sum = 0;
             for (unsigned i = 0; i < sample_count; i++) sum += samples[i];
             step = sum / sample_count;
-            atomic_store_explicit(step_word, step_bits((float)step), memory_order_release);
+            step_store((float)step);
         }
     }
     last_ns = display_ns;

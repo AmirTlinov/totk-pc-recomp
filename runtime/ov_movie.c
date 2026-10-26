@@ -854,6 +854,8 @@ static void ov_get_output_md(Cpu *c) {
 
 HOST_OVERRIDE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeEi", ov_ctor);
 HOST_OVERRIDE("_ZN5movie7DecoderD2Ev", ov_d2);
+// 1.4.3's vtable and a PLT call name the complete-object destructor; without virtual bases it is D2.
+HOST_OVERRIDE("_ZN5movie7DecoderD1Ev", ov_d2);
 HOST_OVERRIDE("_ZN5movie7DecoderD0Ev", ov_d0);
 HOST_OVERRIDE("_ZN5movie7Decoder9ConfigureEPNS_9MediaDataE", ov_configure);
 HOST_OVERRIDE("_ZN5movie7Decoder20RegisterClientEventsEPNS_13DecoderEventsE", ov_register_events);
