@@ -72,6 +72,35 @@ uint32_t plat_thread_id(void);                            // id of the calling t
 // A system font file with the glyphs of a catalog language ("ja", "ko", "zh-Hans", "zh-Hant"): the menu shows each
 // language's name in its own script. Copies the UTF-8 path into out; 0 when the system has none.
 int plat_font_path(const char *lang, char *out, size_t cap);
+// The operating system and its build ("Windows 10.0.28000") into out; 0 when unknown.
+int plat_os_version(char *out, size_t cap);
+// The file the process's stderr (the log) goes to, as a UTF-8 path; 0 when stderr is not a file (a console, a pipe).
+int plat_stderr_path(char *out, size_t cap);
+
+// ---- desktop: the in-game menu's "Copy system info" and "Open log folder"
+int plat_clipboard_set(const char *utf8);                 // replaces the clipboard's text; 1 on success
+int plat_open_folder(const char *path);                   // shows the folder in the file manager; 1 on success
+
+// ---- dynamic libraries: a library some machines lack (a GPU vendor's), loaded at run time. A bare name is searched
+// in the system directories only. NULL when missing.
+void *plat_lib_open(const char *name);
+void *plat_lib_sym(void *lib, const char *name);
+
+// ---- machine load for the performance overlay (perfmon.c's sampling thread; each call can take milliseconds). A number
+// the system does not give is -1.
+typedef struct PlatLoad PlatLoad;
+// Opens the counters: CPU times, the thermal zones, and the GPU engine and memory counters of the adapter whose LUID is
+// gpu_luid (8 bytes, Vulkan's deviceLUID; NULL: the busiest adapter). Never NULL.
+PlatLoad *plat_load_open(const uint8_t *gpu_luid);
+void plat_load_close(PlatLoad *l);
+// Since the previous call on l (the first call gives -1): CPU use of the machine and of this process, percent of all
+// logical processors, and the hottest ACPI thermal zone in degrees Celsius.
+void plat_cpu_load(PlatLoad *l, float *total_pct, float *proc_pct, float *temp_c);
+// Since the previous call on l: the busiest GPU engine type in percent (as Task Manager shows it), and the adapter's
+// dedicated memory in use in MB. Any GPU vendor.
+void plat_gpu_load(PlatLoad *l, float *load_pct, float *vram_used_mb);
+// Physical memory in MB: in use and installed on the machine, and this process's working set.
+void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;

@@ -15,7 +15,7 @@ typedef struct { const char *lang; const char *const *text; } Row;
 #define LANG_NAMES \
     [UI_MENU_LANGNAME_EN] = "English", [UI_MENU_LANGNAME_JA] = "日本語", [UI_MENU_LANGNAME_FR] = "Français", \
     [UI_MENU_LANGNAME_DE] = "Deutsch", [UI_MENU_LANGNAME_IT] = "Italiano", [UI_MENU_LANGNAME_ES] = "Español", \
-    [UI_MENU_LANGNAME_NL] = "Nederlands", [UI_MENU_LANGNAME_PT] = "Português", [UI_MENU_LANGNAME_RU] = "Русский", \
+    [UI_MENU_LANGNAME_NL] = "Nederlands", [UI_MENU_LANGNAME_RU] = "Русский", \
     [UI_MENU_LANGNAME_ZH_HANS] = "简体中文", [UI_MENU_LANGNAME_ZH_HANT] = "繁體中文", [UI_MENU_LANGNAME_KO] = "한국어"
 
 // SWKBD: TITLE, PROMPT, DEFAULT_NAME (at most 9 UTF-16 units, no '@' '%' '\'), OK, CANCEL, PAD_HINT.
@@ -39,14 +39,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_WINDOW_SIZE_CUSTOM] = "Custom",
     [UI_MENU_PRESENT] = "Presentation", [UI_MENU_PRESENT_DESC] = "How finished frames reach the screen.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "VSync", [UI_MENU_PRESENT_IMMEDIATE] = "Immediate",
+    [UI_MENU_PRESENT_IN_USE] = "in use: %s",
     [UI_MENU_GPU] = "Graphics card", [UI_MENU_GPU_DESC] = "The Vulkan device that draws the game.",
     [UI_MENU_GPU_AUTO] = "Automatic",
     [UI_MENU_PERF_OVERLAY] = "Performance overlay",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate in the top right corner; Full adds the mean and the longest frame time of the "
-                                  "last half second. F10 cycles the modes.",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Frame rate in the top right corner. Full adds frame times with a graph, CPU, GPU and "
+                                  "memory load, temperatures and the render thread's waits. F10 cycles the modes.",
     [UI_MENU_PERF_OFF] = "Off", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Full",
-    // printf formats of the overlay line: frame rate; frame rate, mean and longest frame time in ms
-    [UI_PERF_LINE_FPS] = "%.0f fps", [UI_PERF_LINE_FULL] = "%.0f fps   %.1f ms   max %.1f ms",
+    // printf format of the overlay line in FPS mode: the frame rate
+    [UI_PERF_LINE_FPS] = "%.0f fps",
 
     [UI_MENU_FPS_LIMIT] = "Frame rate limit",
     [UI_MENU_FPS_LIMIT_DESC] = "The most frames per second the game draws. Above 60 is experimental and needs Game speed "
@@ -104,11 +105,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_LIB_PREBUILD] = "Stage library prebuild",
     [UI_MENU_LIB_PREBUILD_DESC] = "Builds shader stage libraries ahead of time in the background.",
     [UI_MENU_LIB_PREBUILD_THREADS] = "Stage library prebuild threads",
-    [UI_MENU_LIB_PREBUILD_THREADS_DESC] = "Threads used for the prebuild; empty picks a number from your CPU.",
+    [UI_MENU_LIB_PREBUILD_THREADS_DESC] = "Threads used for the prebuild; Automatic picks a number from your CPU.",
     [UI_MENU_PIPE_PREBUILD] = "Pipeline prebuild",
     [UI_MENU_PIPE_PREBUILD_DESC] = "Builds known pipelines ahead of time.",
     [UI_MENU_PREWARM_XLATE] = "Translator prewarm",
-    [UI_MENU_PREWARM_XLATE_DESC] = "Threads that translate known shaders at start; empty picks a number.",
+    [UI_MENU_PREWARM_XLATE_DESC] = "Threads that translate known shaders at start; Automatic takes half the CPU threads, at most 16.",
     [UI_MENU_GPL] = "Graphics pipeline library",
     [UI_MENU_GPL_DESC] = "Uses the Vulkan pipeline library extension; turn off if your driver misbehaves with it.",
     [UI_MENU_ASTC] = "ASTC texture decoding", [UI_MENU_ASTC_DESC] = "Where compressed ASTC textures are decoded.",
@@ -148,7 +149,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OPEN_LOG] = "Open log folder", [UI_MENU_OPEN_LOG_DESC] = "Shows the folder with the log files.",
     [UI_MENU_COPY_INFO] = "Copy system info",
     [UI_MENU_COPY_INFO_DESC] = "Copies GPU, driver, CPU, RAM and changed settings to the clipboard.",
-    [UI_MENU_COPY_INFO_DONE] = "Copied",
+    [UI_MENU_COPY_INFO_DONE] = "Copied", [UI_MENU_ACTION_FAILED] = "did not work",
     [UI_MENU_RESET] = "Reset all settings to defaults", [UI_MENU_RESET_DESC] = "Applies to every tab.",
     [UI_MENU_RESET_CONFIRM] = "Reset every setting to its default?", [UI_MENU_RESET_YES] = "Reset",
     [UI_MENU_RESET_NO] = "Cancel",
@@ -160,6 +161,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OV_NONE] = "-",
     [UI_MENU_OV_REPLAY] = "Replay", [UI_MENU_OV_GPU_TIME] = "GPU time", [UI_MENU_OV_PIPE_WAIT] = "Pipeline waits",
     [UI_MENU_OV_SHADER_WAIT] = "Shader waits", [UI_MENU_OV_TEX_UPLOADS] = "Texture uploads",
+    [UI_MENU_OV_FMT_PCT] = "%.0f%%", [UI_MENU_OV_FMT_TEMP] = "%.0f °C", [UI_MENU_OV_FMT_POWER] = "%.0f W",
+    [UI_MENU_OV_FMT_MHZ] = "%.0f MHz", [UI_MENU_OV_FMT_GB] = "%.1f GB", [UI_MENU_OV_FMT_GB_OF] = "/ %.1f GB",
+    [UI_MENU_OV_GAME_GB] = "game %.1f GB", [UI_MENU_OV_FMT_MS] = "%.2f ms", [UI_MENU_OV_PER_FRAME] = "%.1f per frame",
 };
 
 static const char *const text_ru[UI_TEXT_COUNT] = {
@@ -180,13 +184,15 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PRESENT] = "Вывод кадров", [UI_MENU_PRESENT_DESC] = "Как готовые кадры попадают на экран.",
     [UI_MENU_PRESENT_MAILBOX] = "Mailbox", [UI_MENU_PRESENT_VSYNC] = "Вертикальная синхронизация",
     [UI_MENU_PRESENT_IMMEDIATE] = "Без ожидания",
+    [UI_MENU_PRESENT_IN_USE] = "сейчас: %s",
     [UI_MENU_GPU] = "Видеокарта", [UI_MENU_GPU_DESC] = "Устройство Vulkan, которое рисует игру.",
     [UI_MENU_GPU_AUTO] = "Автоматически",
     [UI_MENU_PERF_OVERLAY] = "Индикатор производительности",
-    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу; «Полный» добавляет среднее и самое долгое время "
-                                  "кадра за последние полсекунды. F10 переключает режимы.",
+    [UI_MENU_PERF_OVERLAY_DESC] = "Частота кадров в правом верхнем углу. «Полный» добавляет время кадров с графиком, "
+                                  "загрузку ЦП, GPU и памяти, температуры и ожидания потока отрисовки. F10 переключает "
+                                  "режимы.",
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
-    [UI_PERF_LINE_FPS] = "%.0f к/с", [UI_PERF_LINE_FULL] = "%.0f к/с   %.1f мс   макс. %.1f мс",
+    [UI_PERF_LINE_FPS] = "%.0f к/с",
 
     [UI_MENU_FPS_LIMIT] = "Ограничение частоты кадров",
     [UI_MENU_FPS_LIMIT_DESC] = "Наибольшее число кадров в секунду. Выше 60 — экспериментальный режим, нужна «Скорость "
@@ -243,11 +249,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_LIB_PREBUILD] = "Предсборка библиотек стадий",
     [UI_MENU_LIB_PREBUILD_DESC] = "Заранее собирает библиотеки стадий шейдеров в фоне.",
     [UI_MENU_LIB_PREBUILD_THREADS] = "Потоки предсборки библиотек",
-    [UI_MENU_LIB_PREBUILD_THREADS_DESC] = "Сколько потоков занято предсборкой; пусто — по числу ядер процессора.",
+    [UI_MENU_LIB_PREBUILD_THREADS_DESC] = "Сколько потоков занято предсборкой; «Автоматически» — по числу ядер процессора.",
     [UI_MENU_PIPE_PREBUILD] = "Предсборка конвейеров",
     [UI_MENU_PIPE_PREBUILD_DESC] = "Заранее собирает известные конвейеры.",
     [UI_MENU_PREWARM_XLATE] = "Прогрев транслятора",
-    [UI_MENU_PREWARM_XLATE_DESC] = "Потоки, которые при запуске переводят известные шейдеры; пусто — выбрать самому.",
+    [UI_MENU_PREWARM_XLATE_DESC] = "Потоки, которые при запуске переводят известные шейдеры; «Автоматически» — половина потоков процессора, не больше 16.",
     [UI_MENU_GPL] = "Библиотека графических конвейеров",
     [UI_MENU_GPL_DESC] = "Использует расширение Vulkan для библиотек конвейеров; выключите, если драйвер с ним сбоит.",
     [UI_MENU_ASTC] = "Распаковка текстур ASTC", [UI_MENU_ASTC_DESC] = "Где распаковываются сжатые текстуры ASTC.",
@@ -288,7 +294,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OPEN_LOG] = "Открыть папку журналов", [UI_MENU_OPEN_LOG_DESC] = "Показывает папку с файлами журнала.",
     [UI_MENU_COPY_INFO] = "Копировать сведения о системе",
     [UI_MENU_COPY_INFO_DESC] = "Копирует в буфер обмена видеокарту, драйвер, процессор, память и изменённые настройки.",
-    [UI_MENU_COPY_INFO_DONE] = "Скопировано",
+    [UI_MENU_COPY_INFO_DONE] = "Скопировано", [UI_MENU_ACTION_FAILED] = "не получилось",
     [UI_MENU_RESET] = "Сбросить все настройки", [UI_MENU_RESET_DESC] = "Действует на все вкладки.",
     [UI_MENU_RESET_CONFIRM] = "Сбросить все настройки к значениям по умолчанию?", [UI_MENU_RESET_YES] = "Сбросить",
     [UI_MENU_RESET_NO] = "Отмена",
@@ -301,6 +307,9 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OV_REPLAY] = "Воспроизведение команд GPU", [UI_MENU_OV_GPU_TIME] = "Время GPU",
     [UI_MENU_OV_PIPE_WAIT] = "Ожидания конвейеров",
     [UI_MENU_OV_SHADER_WAIT] = "Ожидания шейдеров", [UI_MENU_OV_TEX_UPLOADS] = "Загрузки текстур",
+    [UI_MENU_OV_FMT_PCT] = "%.0f%%", [UI_MENU_OV_FMT_TEMP] = "%.0f °C", [UI_MENU_OV_FMT_POWER] = "%.0f Вт",
+    [UI_MENU_OV_FMT_MHZ] = "%.0f МГц", [UI_MENU_OV_FMT_GB] = "%.1f ГБ", [UI_MENU_OV_FMT_GB_OF] = "/ %.1f ГБ",
+    [UI_MENU_OV_GAME_GB] = "игра %.1f ГБ", [UI_MENU_OV_FMT_MS] = "%.2f мс", [UI_MENU_OV_PER_FRAME] = "%.1f за кадр",
 };
 
 #define SWKBD_ONLY(name, ...) static const char *const name[UI_TEXT_COUNT] = {SWKBD(__VA_ARGS__)}

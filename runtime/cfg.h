@@ -34,6 +34,9 @@ int cfg_save_to(const char *path);
 int cfg_reset(const char *const *keys, int n);
 // 0 when the last cfg_save / cfg_save_to failed to write (the values stay set in memory, the next save tries again).
 int cfg_last_save_ok(void);
+// Every setting with a value, for a bug report ("Copy system info"): the totk.ini and cfg_set keys (name without
+// TOTK_, upper case; from_env 0), then the known TOTK_ variables the environment sets (from_env 1).
+void cfg_each_active(void (*cb)(const char *key, const char *value, int from_env, void *ctx), void *ctx);
 
 // What the menu knows about a setting. key: without TOTK_, upper case. def: what the consumer uses when the key is
 // unset ("" = no fixed default, the consumer picks per machine). values: "0|1", "mailbox|fifo|immediate", a range

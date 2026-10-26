@@ -62,9 +62,9 @@ static int ts_cur = -1;                    // the pair of the part being recorde
 static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
 static volatile LONG64 ts_busy_ns, ts_parts, ts_missed;
 
+// On the first submission that wants timing (perf_gpu_timing: TOTK_TRACE=perf or the full performance overlay).
 static void ts_setup(VkCtx *c) {
     ts_state = -1;
-    if (!(rt_trace & RT_TRACE_PERF)) return;
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, NULL);
     VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
@@ -99,7 +99,11 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
         uint64_t s = v[0] & ts_mask, e = v[1] & ts_mask;
         if (e >= s) {
             uint64_t from = s > ts_last_end ? s : ts_last_end;
-            if (e > from) InterlockedAdd64(&ts_busy_ns, (LONG64)((double)(e - from) * ts_period));
+            if (e > from) {
+                LONG64 ns = (LONG64)((double)(e - from) * ts_period);
+                InterlockedAdd64(&ts_busy_ns, ns);
+                perf_gpu_busy((uint64_t)ns);
+            }
             if (e > ts_last_end) ts_last_end = e;
             InterlockedIncrement64(&ts_parts);
         } else InterlockedIncrement64(&ts_missed);   // the counter wrapped
@@ -110,7 +114,11 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
 
 // At the start of a command buffer (sub_lock held): the pair it times, -1 untimed.
 static int ts_open(VkCommandBuffer cb) {
-    if (ts_state != 1) return -1;
+    if (ts_state != 1 || !perf_gpu_timing()) {
+        if (ts_state || !perf_gpu_timing()) return -1;
+        ts_setup(vk_ctx());   // the overlay turned full: timestamps from now on
+        if (ts_state != 1) return -1;
+    }
     uint32_t p = ts_next % TS_PAIRS;
     if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { InterlockedIncrement64(&ts_missed); return -1; }
     ts_next++;
@@ -212,7 +220,7 @@ void vk_sync_start(void) {
                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                       .queueFamilyIndex = c->gfx_family};
         if (vkCreateCommandPool(c->device, &pi, NULL, &cmd_pool) != VK_SUCCESS) rt_fatal("vk: submission command pool");
-        if (!ts_state) ts_setup(c);
+        if (!ts_state && perf_gpu_timing()) ts_setup(c);
         perf_gpu_stats = gpu_stats;
         uint64_t now = 0;
         vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
