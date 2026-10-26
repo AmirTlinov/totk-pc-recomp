@@ -281,7 +281,11 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources += [out / 'modules.c']
     for src in sources:
         o = runtime_object(out, src)
-        lines.append(f'build {ninja_path(o)}: {"rc" if src.suffix == ".rc" else "cc_rt"} {ninja_path(src)}')
+        if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
+            lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "totk.manifest")} '
+                         f'{ninja_path(RUNTIME / "totk.ico")}')
+        else:
+            lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}')
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]

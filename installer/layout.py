@@ -6,7 +6,7 @@ Release (docs/installer.md "Release layout"), root = the unpacked folder:
                             and ../recomp on sys.path, so `python -m installer` imports from the release folder
     recomp/, tools/         the lifter and the scripts; recomp/patches-v121.txt, tools/data/expected-v1.2.1.json
     llvm/                   llvm-mingw (bin/clang.exe)
-    runtime/                libtotkrt.a, the headers and install-side sources (romfs.c); runtime/deps/ holds
+    runtime/                libtotkrt.a, the headers, install-side sources (romfs.c) and totk.ico; runtime/deps/ holds
                             include/ + lib/ of Vulkan, SDL3, Opus, libvpx and VMA (build_game.py --deps)
     bin/                    totk_xlate.exe (+ totk_xlate.id), hactool.exe, ninja.exe, SDL3.dll, libopus-0.dll
     data/shader_list.tsv    the MacNativeGames shader list

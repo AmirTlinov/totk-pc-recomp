@@ -2,7 +2,8 @@
 
    No console window. The two message strings come from the catalog (installer/text/<lang>.json, ids launcher.title and
    launcher.python_missing); tools/make_release.py writes them into launcher_text.h before it compiles this file.
-   Build: llvm/bin/clang -O2 -mwindows launcher.c -o TotK-Setup.exe */
+   Build: llvm/bin/llvm-windres -I runtime -O coff launcher.rc -o launcher_rc.o, then
+   llvm/bin/clang -O2 -mwindows launcher.c launcher_rc.o -o TotK-Setup.exe */
 #include <windows.h>
 #include <wchar.h>
 
