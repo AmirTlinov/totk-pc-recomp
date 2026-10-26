@@ -84,11 +84,16 @@ static int64_t read_at(HANDLE f, void *buf, uint32_t n, uint64_t off) {
         rt_fatal("RomFS: CreateEvent failed (%lu)", GetLastError());
     OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32), .hEvent = ev};
     DWORD got = 0;
+    mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
     if (!ReadFile(f, buf, n, &got, &ov)) {
         DWORD e = GetLastError();
         if (e == ERROR_HANDLE_EOF) return 0;
-        if (e != ERROR_IO_PENDING) return -1;
-        if (!GetOverlappedResult(f, &ov, &got, TRUE)) return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+        if (e == ERROR_IO_PENDING && !GetOverlappedResult(f, &ov, &got, TRUE)) e = GetLastError();
+        else if (e == ERROR_IO_PENDING) return got;
+        if (e == ERROR_HANDLE_EOF) return 0;
+        if (e == ERROR_NOACCESS)   // a read-only page in the buffer: a frozen region missed its thaw
+            rt_log("RomFS: read of %u bytes into %p refused: the buffer is not writable", n, buf);
+        return -1;
     }
     return got;
 }

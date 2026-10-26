@@ -24,6 +24,7 @@ int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly);
 // releases the cursor around an F11 window change, (0) captures it again once the client area has its new size.
 #ifdef _WIN32
 int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
+int input_cursor_released(void);   // Esc or a non-client activation released the cursor (probe)
 // The menu's Win32 adapter (ui/menu_win.cpp), called next: F1 / Esc open or close the menu; while it is open, keys,
 // mouse and focus go to it. Returns 1 with *res set when the message is fully handled.
 int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);

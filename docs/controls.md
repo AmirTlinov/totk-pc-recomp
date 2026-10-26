@@ -20,13 +20,32 @@ Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into
 | Plus | Start | Tab | menu, inventory |
 | Minus | Back | M | map |
 
-Esc is free. Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are one table, `input_bindings` in `runtime/input_map.c` (platform-neutral key ids; `runtime/input_win.c` translates Win32 virtual keys), so a remapping page can edit it later.
+Esc is unbound in the game; it releases the mouse cursor (see Mouse camera). Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are two tables in `runtime/input_map.c`, `input_bindings` (platform-neutral key ids) and `input_pad_bindings` (gamepad inputs by position); `runtime/input_win.c` translates Win32 virtual keys and SDL buttons, so a remapping page can edit both later.
+
+## Remapping
+
+`totk.ini` rebinds the buttons, one line per Switch button: `bind_<button> = <entry>, <entry>, ...`. The button is `A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LCLICK RCLICK`. An entry is `pad:<name>` or `key:<name>`:
+
+- pad names: `south east west north l r zl zr start back lstick rstick dpad_left dpad_up dpad_right dpad_down` (`zl`, `zr` are the triggers)
+- key names: `a` to `z`, `0` to `9`, `space tab lshift lctrl up down left right mouse_l mouse_r mouse_m`
+- `none` leaves the button unbound.
+
+A line replaces every default of that button, pad and keyboard, so list the keys you still want. Buttons without a line keep the table above. Names are case-insensitive. An invalid entry logs one `input: bind ...` line and is skipped; a line without a valid entry changes nothing. The sticks and the mouse camera are not remappable. The `TOTK_BIND_<button>` environment variables work like any other setting. Bindings are read once at start.
+
+A pad that reports its face buttons swapped (A/B and X/Y, as some GuliKit models do) is fixed with:
+
+```
+bind_A = pad:south, key:E
+bind_B = pad:east, key:lshift
+bind_X = pad:west, key:space
+bind_Y = pad:north, key:mouse_l
+```
 
 ## Mouse camera
 
 Mouse motion (raw input) becomes right-stick deflection. Each presented frame takes the counts moved since the last frame, divides by the frame time and sets the deflection to `counts per second * TOTK_MOUSE_SENS / 3000` of full, held for that frame, so the turn rate does not depend on the frame rate. This is not mouselook: the game's stick curve and dead zone still apply, so very slow movements do nothing and a fast flick saturates. The mouse deflection competes with the gamepad and arrow keys by the larger-deflection rule.
 
-`TOTK_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. To resize or move the window by hand, alt-tab away first or use F11. `TOTK_INPUT=none` disables the capture too.
+`TOTK_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `TOTK_INPUT=none` disables the capture too.
 
 The stick direction bits (`StickLLeft` to `StickRDown`) are derived from the sticks at 50% deflection. A gamepad plugged in later is picked up within one second; with none connected the log says `input: no gamepad`.
 

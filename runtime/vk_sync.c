@@ -42,9 +42,116 @@ static SRWLOCK st_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE cv_work = CONDITION_VARIABLE_INIT;   // a submission, a callback or stop
 static CONDITION_VARIABLE cv_done = CONDITION_VARIABLE_INIT;   // done advanced
 static uint64_t issued, done;     // newest submitted value; newest value whose side effects ran
+static uint64_t reserved;         // asynchronous replay: newest value handed out before its submission (>= issued)
 static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
+
+// ---- GPU time (TOTK_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
+// ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
+// part's interval to the busy time, counting overlap with the previous part once. Off (one log line) when the queue
+// family has no timestamp bits or the period is 0. Upload batches (vk_memory.c) are not timed.
+#define TS_PAIRS 1024
+static VkQueryPool ts_pool;
+static int ts_state;                       // 0 not set up, 1 on, -1 off
+static double ts_period;                   // ns per tick
+static uint64_t ts_mask;                   // valid bits of a timestamp
+static uint32_t ts_next;                   // submitting thread (sub_lock): next pair
+static volatile uint8_t ts_busy[TS_PAIRS]; // written until the completion thread read the pair
+static int ts_cur = -1;                    // the pair of the part being recorded, -1 untimed
+static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
+static volatile LONG64 ts_busy_ns, ts_parts, ts_missed;
+
+static void ts_setup(VkCtx *c) {
+    ts_state = -1;
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, NULL);
+    VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
+    if (!qp) return;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, qp);
+    uint32_t bits = c->gfx_family < nq ? qp[c->gfx_family].timestampValidBits : 0;
+    free(qp);
+    float period = c->props.limits.timestampPeriod;
+    if (!bits || period <= 0) {
+        rt_log("vk: no GPU timestamps on this queue (valid bits %u, period %.3f ns): the perf line shows no GPU time", bits, period);
+        return;
+    }
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = 2 * TS_PAIRS};
+    VkResult r = vkCreateQueryPool(c->device, &qi, NULL, &ts_pool);
+    if (r != VK_SUCCESS) {
+        rt_log("vk: timestamp query pool failed (%d): the perf line shows no GPU time", (int)r);
+        return;
+    }
+    ts_period = period;
+    ts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    ts_state = 1;
+}
+
+typedef struct { uint32_t pair; } TsRead;
+
+static void ts_read_cb(void *arg) {   // completion thread, in submission order
+    TsRead *t = arg;
+    VkCtx *c = vk_ctx();
+    uint64_t v[2];
+    if (vkGetQueryPoolResults(c->device, ts_pool, 2 * t->pair, 2, sizeof v, v, sizeof v[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        uint64_t s = v[0] & ts_mask, e = v[1] & ts_mask;
+        if (e >= s) {
+            uint64_t from = s > ts_last_end ? s : ts_last_end;
+            if (e > from) InterlockedAdd64(&ts_busy_ns, (LONG64)((double)(e - from) * ts_period));
+            if (e > ts_last_end) ts_last_end = e;
+            InterlockedIncrement64(&ts_parts);
+        } else InterlockedIncrement64(&ts_missed);   // the counter wrapped
+    } else InterlockedIncrement64(&ts_missed);
+    __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
+    free(t);
+}
+
+// At the start of a command buffer (sub_lock held): the pair it times, -1 untimed.
+static int ts_open(VkCommandBuffer cb) {
+    if (ts_state != 1) return -1;
+    uint32_t p = ts_next % TS_PAIRS;
+    if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { InterlockedIncrement64(&ts_missed); return -1; }
+    ts_next++;
+    ts_busy[p] = 1;
+    vkCmdResetQueryPool(cb, ts_pool, 2 * p, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool, 2 * p);
+    return (int)p;
+}
+
+// At its end, before vkEndCommandBuffer; fence: the value whose completion covers it.
+static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence) {
+    if (pair < 0) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)pair + 1);
+    TsRead *t = malloc(sizeof *t);
+    if (!t) rt_fatal("vk: out of memory");
+    t->pair = (uint32_t)pair;
+    vk_completion_add(fence, ts_read_cb, t);
+}
+
+// The pair of the part being recorded.
+static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); }
+
+static void ts_end(VkCommandBuffer cb, uint64_t fence) {
+    ts_close(cb, ts_cur, fence);
+    ts_cur = -1;
+}
+
+// An empty submission records no command buffer: its pair is never written.
+static void ts_drop(void) {
+    if (ts_cur < 0) return;
+    __atomic_store_n(&ts_busy[ts_cur], 0, __ATOMIC_RELEASE);
+    ts_cur = -1;
+}
+
+static void gpu_stats(PerfGpu *g) {
+    g->have_gpu = ts_state == 1;
+    g->gpu_ns = (uint64_t)InterlockedExchange64(&ts_busy_ns, 0);
+    g->gpu_parts = (uint64_t)InterlockedExchange64(&ts_parts, 0);
+    g->gpu_missed = (uint64_t)InterlockedExchange64(&ts_missed, 0);
+    g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);
+}
 
 // Without the replay (T6c) only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
 WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
@@ -105,6 +212,8 @@ void vk_sync_start(void) {
                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                       .queueFamilyIndex = c->gfx_family};
         if (vkCreateCommandPool(c->device, &pi, NULL, &cmd_pool) != VK_SUCCESS) rt_fatal("vk: submission command pool");
+        if (!ts_state) ts_setup(c);
+        perf_gpu_stats = gpu_stats;
         uint64_t now = 0;
         vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
         if (issued > now) {   // a new device after vk_shutdown: values keep increasing for the front end
@@ -115,46 +224,72 @@ void vk_sync_start(void) {
         }
         AcquireSRWLockExclusive(&st_lock);
         issued = done = now;
+        if (reserved < now) reserved = now;
         stop = 0;
         ReleaseSRWLockExclusive(&st_lock);
         vk_mem_note_submit(now);
         completion_thread = CreateThread(NULL, 0, completion_main, c, 0, NULL);
         if (!completion_thread) rt_fatal("vk: cannot start the completion thread (error %lu)", GetLastError());
         __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
+        vk_astc_mode();   // decides TOTK_ASTC and builds the ASTC decoder now, not at the first ASTC upload
     }
     ReleaseSRWLockExclusive(&start_lock);
 }
 
-// A command buffer the GPU no longer uses, claimed for value `fence`. Called with sub_lock held.
-static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
+// The index of a command buffer the GPU no longer uses, claimed for value `fence`. Called with sub_lock held; may move
+// slots[].
+static int claim_slot(VkCtx *c, uint64_t fence) {
     uint64_t gpu = 0;
     vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
     for (int i = 0; i < nslots; i++)
         if (slots[i].fence <= gpu) {
             slots[i].fence = fence;
-            cur_slot = i;
-            return &slots[i];
+            return i;
         }
     CmdSlot *n = realloc(slots, sizeof *n * (size_t)(nslots + 1));
     if (!n) rt_fatal("vk: out of memory (command buffers)");
     slots = n;
     CmdSlot *s = &slots[nslots];
-    cur_slot = nslots;
     VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cmd_pool,
                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     if (vkAllocateCommandBuffers(c->device, &ai, &s->cb) != VK_SUCCESS) rt_fatal("vk: command buffer allocation");
     s->fence = fence;
-    nslots++;
-    return s;
+    return nslots++;
+}
+
+static CmdSlot *take_slot(VkCtx *c, uint64_t fence) {
+    cur_slot = claim_slot(c, fence);
+    return &slots[cur_slot];
+}
+
+// The copies the replay's first accesses to VRAM mirrors queued (vk_memory.c), in a command buffer of their own that is
+// submitted right before the part that needs them and timed like a part; VK_NULL_HANDLE when there are none. After the
+// part was recorded, sub_lock held; may move slots[].
+static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
+    if (!vk_mem_mirror_pending()) return VK_NULL_HANDLE;
+    int i = claim_slot(c, fence);   // before reading slots: the claim may move it
+    VkCommandBuffer cb = slots[i].cb;
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    int pair = ts_open(cb);
+    vk_mem_mirror_prologue(cb);
+    ts_close(cb, pair, fence);
+    vkEndCommandBuffer(cb);
+    return cb;
 }
 
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    ts_end(cb, cur_fence);
     vkEndCommandBuffer(cb);
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
-    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi};
+    VkCommandBuffer pro = prologue(c, cur_fence);
+    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
+                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1};
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
@@ -164,13 +299,26 @@ VkCommandBuffer vk_sync_split(void) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(s->cb, &bi);
+    ts_begin(s->cb);
     return s->cb;
+}
+
+// Asynchronous replay (vk_backend.c): the value the next queued submission or present will signal. Values are handed
+// out in queue order and the replay thread submits them in that order, so each vk_sync_submit gets exactly its value.
+uint64_t vk_sync_reserve(void) {
+    vk_sync_start();
+    AcquireSRWLockExclusive(&st_lock);
+    if (reserved < issued) reserved = issued;
+    uint64_t v = ++reserved;
+    ReleaseSRWLockExclusive(&st_lock);
+    return v;
 }
 
 uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_sync_start();
     VkCtx *c = vk_ctx();
     AcquireSRWLockExclusive(&sub_lock);
+    vk_mem_dirty_submit();   // TOTK_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
     CmdSlot *s = take_slot(c, fence);
@@ -178,17 +326,25 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     uint64_t t0 = perf_begin();
     vkBeginCommandBuffer(s->cb, &bi);
+    ts_begin(s->cb);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
+    if (recorded) ts_end(s->cb, fence);
+    else ts_drop();
     vkEndCommandBuffer(s->cb);
     perf_replay(t0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
     vk_upload_flush(0);
-    VkCommandBufferSubmitInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb};
+    VkCommandBuffer pro = prologue(c, fence);
+    s = &slots[cur_slot];
+    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
+                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = c->timeline,
                                  .value = fence, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = recorded ? 1 : 0,
-                        .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
+                        .pSignalSemaphoreInfos = &sig};
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
@@ -227,6 +383,7 @@ int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns) {
     uint64_t p0 = perf_begin();
     int ok = fence_wait_impl(value, timeout_ns);
     perf_end(PERF_FENCE, p0);
+    perf_gpu_wait(p0);
     return ok;
 }
 
@@ -234,8 +391,8 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     vk_sync_start();
     AcquireSRWLockExclusive(&st_lock);
     int ok;
-    if (value > issued) {
-        ok = 0;   // never submitted: never reached (as in the null back end)
+    if (value > issued && value > reserved) {
+        ok = 0;   // never submitted nor queued: never reached (as in the null back end)
     } else {
         uint64_t t0 = kern_now_ns();
         while (done < value) {
@@ -255,6 +412,8 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
 }
 
 uint64_t vk_sync_fence_done(void) { return __atomic_load_n(&done, __ATOMIC_ACQUIRE); }
+
+uint64_t vk_sync_issued(void) { return __atomic_load_n(&issued, __ATOMIC_ACQUIRE); }
 
 void vk_sync_finish(void) {
     vk_sync_start();
@@ -279,6 +438,12 @@ void vk_sync_shutdown(void) {
         AcquireSRWLockExclusive(&sub_lock);
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
+        perf_gpu_stats = NULL;
+        if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);
+        ts_pool = VK_NULL_HANDLE;
+        ts_state = 0;
+        ts_last_end = 0;
+        memset((void *)ts_busy, 0, sizeof ts_busy);
         cmd_pool = VK_NULL_HANDLE;
         free(slots);
         slots = NULL;

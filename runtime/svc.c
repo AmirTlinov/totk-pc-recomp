@@ -138,8 +138,24 @@ static void get_info(Cpu *c, uint64_t pc) {
     c->x[1] = v;
 }
 
+static void svc_body(Cpu *c, uint32_t imm, uint64_t pc);
+
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     kern_checkpoint();
+    if (__builtin_expect(!kern_host_track || !c->thread, 1)) {
+        svc_body(c, imm, pc);
+        return;
+    }
+    void *t = c->thread;   // kern_host_track: the SVC counted in the thread's host depth (hostfn.c hostfn_tracked)
+    int *d = kern_host_depth(t);
+    __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
+    svc_body(c, imm, pc);
+    int n = *d - 1;
+    __atomic_store_n(d, n, __ATOMIC_RELAXED);
+    if (!n && kern_preempt_pending(t)) kern_host_left(t);
+}
+
+static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
     __atomic_fetch_add(&g_svcs, 1, __ATOMIC_RELAXED);
     if (rt_trace & RT_TRACE_SVC) {
         char at[160];
@@ -200,11 +216,12 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
         return;
     }
     case 0x29: get_info(c, pc); return;
-    case 0x07: {   // ExitProcess, as closing the window (gfx_window.c WM_CLOSE): pipeline cache and shader records
-                   // saved, logs flushed, exit code 0
+    case 0x07: {   // ExitProcess, as closing the window (gfx_window.c WM_CLOSE): pipeline cache, shader records and
+                   // profile saved, logs flushed, exit code 0
         char at[160];
         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
         vk_pipeline_save();
+        prof_write();
         fflush(NULL);
         if (svc_test_exit_hook) return svc_test_exit_hook(0);
         ExitProcess(0);

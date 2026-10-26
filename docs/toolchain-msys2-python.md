@@ -95,6 +95,15 @@ Applied the portable part of MacNativeGames `build_app.py:build_hactool()` (diff
 2. BKTR: allow 0x200-aligned padding after the subsection table (`nca.c`).
 3. BKTR: accept the subsection total-size layout of newer cumulative updates (`nca.c`).
 
+Ours (`toolchain\hactool\unicode-patches.diff`): `hactool.manifest` with `<activeCodePage>UTF-8</activeCodePage>`,
+embedded through `hactool.rc` (Makefile rule `hactool.res.o`, `windres`). hactool converts argv, `HOME` and
+`USERPROFILE` from UTF-8 to UTF-16 (`filepath.c`); without the manifest they arrive in the ANSI code page, and a
+non-ASCII user profile or path stops it with `Failed to convert ... to UTF-16!`. Needs Windows 10 1903 or later.
+
+Rebuild: in an MSYS2 UCRT64 shell (`MSYSTEM=UCRT64 C:\msys64\usr\bin\bash.exe -lc ...`) in `toolchain\src\hactool`,
+`make clean && make -j8`, then copy `hactool.exe` to `toolchain\hactool\`. gcc writes temporary files to `TMP`; where
+it cannot (sandboxed shells), point `TMP` and `TEMP` at a writable folder.
+
 Not applied: the `MNG_BASE_RANGE_OFFSET/SIZE` base-file hook. It uses `funopen` (BSD/macOS only); on Windows the
 base NCA must be extracted to a file first.
 

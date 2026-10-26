@@ -47,7 +47,15 @@ uint64_t nvn_new_serial(void);                             // next tex_t / prog_
 uint64_t nvn_fence_last(void);                             // fence value of the newest submit (0 before the first)
 int nvn_depth_minus_w(void);                               // 1 after DeviceSetDepthMode(NEAR_IS_MINUS_W), else 0
 void nvn_guest_written(uint64_t addr, uint64_t size);      // the host or the game wrote pool storage: back end re-reads
+// TOTK_TRACE=perf: MemoryPoolFlushMappedRange [0] and BufferFlushMappedRange [1] calls [0] and bytes [1] by the pool's
+// CPU class (0 CPU_CACHED, 1 CPU_UNCACHED, 2 other) since the previous call.
+void nvn_flush_stats(uint64_t out[2][3][2]);
 void nvn_submit_prepare(const uint64_t *handles, int n);   // weak no-op; the command-buffer slice reads deferred binds
+// Asynchronous replay: as nvn_submit_prepare, writing the handles to replay to out (a clone where a still queued
+// submission uses the same recording with other deferred binds)
+void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n);
+int gfx_replay_async(void);                                // 1: the back end replays submissions on its own thread
+uint64_t gfx_replayed_submits(void);                       // newest submit number (nvn_submit_count) replayed
 #define NVN_HANDLE_TEX(h) ((int)((h) & 0xfffff))           // combined texture handle = texture id | sampler id << 20
 #define NVN_HANDLE_SAMP(h) ((int)(((h) >> 20) & 0xfff))
 extern GfxStats gfx_counters;                              // behind gfx_stats(); add with __atomic_fetch_add. frames:
@@ -96,3 +104,6 @@ const char *nvn_op_name(uint32_t op);                      // "DRAW_IDX", ...; "
 // MemoryPoolInvalidateMappedRange: the CPU is about to read pool storage the GPU wrote. Weak no-op in nvn_ext.c; a back
 // end that renders into host-side copies defines it and writes them back.
 void nvn_pool_invalidate(const pool_t *p, uint64_t off, uint64_t size);
+// MemoryPoolFlushMappedRange: the CPU wrote [mem + off, mem + off + size). Weak no-op in nvn_ext.c; a back end that keeps
+// device-side copies of pool memory (vk_memory.c's VRAM mirror) defines it and copies the range again.
+void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size);

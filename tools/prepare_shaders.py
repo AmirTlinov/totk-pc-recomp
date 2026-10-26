@@ -16,10 +16,12 @@ pipeline once, so the GPU driver's own disk cache holds them (vk_pipeline.c "sta
 a 12-core machine (inventory 1, translation 3, library builds 0.6) and 1.3 GB of shader cache; the seed files can be
 deleted afterwards.
 
-Game-derived output stays in the build directory (ignored). The list is read from refs/ at preparation time; nothing
-of it is copied into the repository. Needs Python 3.14 (compression.zstd), so run it in .venv-py314:
+Game-derived output stays in the build directory (ignored). The list is read at preparation time from tools/data/shader_list.tsv when that file exists (the installer archive
+bundles it; it stays out of the repository), else from refs/ through git; nothing of it is copied into the
+repository. Needs Python 3.14 (compression.zstd), so run it in .venv-py314 or the embeddable 3.14:
 
     .venv-py314\\Scripts\\python tools\\prepare_shaders.py build\\v121 [--version v121] [--list <tsv>] [--no-run]
+                                                     [--romfs DIR --exefs DIR]   # instead of build\\extracted\\<version>
 """
 import argparse
 import hashlib
@@ -50,9 +52,16 @@ CONTROL = 0x880
 ANS_REC = 4 + 32 + 32 + 147 + 1
 
 
+BUNDLED_LIST = ROOT / 'tools' / 'data' / 'shader_list.tsv'   # the installer archive carries a copy (no git, no refs/)
+if not BUNDLED_LIST.is_file():
+    BUNDLED_LIST = ROOT / 'data' / 'shader_list.tsv'          # release folder layout (tools/make_release.py)
+
+
 def read_list(path):
     if path:
         return Path(path).read_text(encoding='utf-8')
+    if BUNDLED_LIST.is_file():
+        return BUNDLED_LIST.read_text(encoding='utf-8')
     return subprocess.run(['git', '-C', str(ROOT / 'refs' / 'MacNativeGames'), 'show', ':'.join(LIST_REF)],
                           check=True, capture_output=True, encoding='utf-8').stdout
 
@@ -85,7 +94,8 @@ def answers(deps, stage, control):
     """GfxShaderAnswers in gfx_shader.c pack_answers layout (147 bytes) from the list's deps JSON."""
     tex, img, fmt, attr, fout = bytearray(32), bytearray(32), bytearray(32), bytearray(32), bytearray(8)
     for slot, t in deps.get('tex', {}).items():
-        tex[int(slot)] = TEX.index(t.removesuffix('_depth'))
+        t = t.removesuffix('_depth')
+        tex[int(slot)] = TEX.index('2d' if t == '*' else t)   # "*": any kind, translated as the plain 2D it stands for
     for slot, o in deps.get('img', {}).items():
         img[int(slot)] = TEX.index(o['type'])
         fmt[int(slot)] = FMT.index(o['fmt']) if o.get('fmt') in FMT else 0
@@ -111,13 +121,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('build', type=Path, help='build directory holding totk.exe (build\\v121)')
     ap.add_argument('--version', default='v121', help='build/extracted/<version>')
-    ap.add_argument('--list', help='a shader_list.tsv instead of the one in refs/MacNativeGames')
+    ap.add_argument('--romfs', type=Path, help='RomFS directory (default build/extracted/<version>/romfs)')
+    ap.add_argument('--exefs', type=Path, help='ExeFS directory (default build/extracted/<version>/exefs)')
+    ap.add_argument('--list', help='a shader_list.tsv instead of tools/data/shader_list.tsv or refs/MacNativeGames')
     ap.add_argument('--no-run', action='store_true', help='write the seed files only')
     a = ap.parse_args()
     t0 = time.monotonic()
     variants, prio = parse_list(read_list(a.list))
     extracted = ROOT / 'build' / 'extracted' / a.version
-    shaders, _ = inventory(extracted / 'romfs', extracted / 'exefs')
+    shaders, _ = inventory(a.romfs or extracted / 'romfs', a.exefs or extracted / 'exefs')
     t1 = time.monotonic()
     progs, recs, skipped = {}, [], {'not in this version': 0, 'stage': 0}
     for key, deps in variants:

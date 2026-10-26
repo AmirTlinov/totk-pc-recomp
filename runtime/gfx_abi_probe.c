@@ -5,6 +5,7 @@
 // Needs no game files.
 #include <stddef.h>
 #include <stdio.h>
+#include <windows.h>
 
 #include "gfx.h"
 
@@ -59,6 +60,22 @@ static void check_write_watch(void) {
     uint64_t m = mem_written_pages(heap, 0x200000, pages + 2, 6);
     printf("write-watch: three pages written, max 2: %llu then %llu\n", (unsigned long long)n, (unsigned long long)m);
     CHECK(n == 2 && m == 1, "max 2 reported %llu, then %llu (want 2, 1)", (unsigned long long)n, (unsigned long long)m);
+
+    // Frozen region: read-only until the first write thaws it (the write lands and is reported); mem_thaw (a file
+    // read) thaws it and holds it thawed; SetHeapSize below decommits it.
+    mem_written_pages(heap, 0x200000, pages, 8);
+    CHECK(mem_freeze(heap) == 1 && mem_frozen(heap), "freeze of an idle committed 2 MiB region");
+    MEMORY_BASIC_INFORMATION mbi;
+    CHECK(VirtualQuery((void *)(uintptr_t)heap, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY, "frozen region is not read-only");
+    p[0x3000] = 7;
+    CHECK(!mem_frozen(heap) && p[0x3000] == 7, "a write into a frozen region did not thaw it");
+    n = mem_written_pages(heap, 0x200000, pages, 8);
+    CHECK(n == 1 && pages[0] == heap + 0x3000, "write after a thaw: %llu pages reported (want 1)", (unsigned long long)n);
+    CHECK(mem_freeze(heap) == 1, "refreeze after a write thaw");
+    mem_thaw(heap + 0x6000, 0x1000);
+    CHECK(!mem_frozen(heap) && mem_freeze(heap) == 0, "mem_thaw did not thaw and hold the region");
+    p[0x6000] = 8;
+    printf("write-watch: frozen region thawed by a write (reported once) and by mem_thaw (held)\n");
 
     uint64_t a = g->alias.base + 0x10000;
     CHECK(mem_map_physical(a, 0x4000) == 0, "MapPhysicalMemory");

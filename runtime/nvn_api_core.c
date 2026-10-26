@@ -58,6 +58,11 @@ static void ov_memcpy(Cpu *c) {
 HOST_OVERRIDE("memcpy", ov_memcpy);
 
 __attribute__((weak)) void nvn_submit_prepare(const uint64_t *handles, int n) { (void)handles, (void)n; }
+__attribute__((weak)) void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
+    memcpy(out, handles, sizeof *out * (size_t)n);
+}
+__attribute__((weak)) int gfx_replay_async(void) { return 0; }
+__attribute__((weak)) uint64_t gfx_replayed_submits(void) { return nvn_submit_count(); }
 
 // ---------- pools: GPU window (section 3.1) and the address index
 static SRWLOCK pool_lock = SRWLOCK_INIT;   // guards gva and index
@@ -287,8 +292,31 @@ NVN_API(nvnMemoryPoolFinalize) {
     o->span = 0;
     o->magic = 0;
 }
-// void nvnMemoryPoolFlushMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size): storage is coherent
-NVN_API(nvnMemoryPoolFlushMappedRange) { (void)c; }
+static uint64_t flush_stat[2][3][2];   // nvn_flush_stats
+
+static void flush_note(int kind, const pool_t *p, uint64_t size) {
+    uint32_t f = p ? p->flags : 0;
+    int k = f & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? 2 : f & NVN_MEMORY_POOL_FLAGS_CPU_CACHED ? 0
+          : f & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? 1 : 2;
+    __atomic_fetch_add(&flush_stat[kind][k][0], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&flush_stat[kind][k][1], size, __ATOMIC_RELAXED);
+}
+
+void nvn_flush_stats(uint64_t out[2][3][2]) {
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 3; k++)
+            for (int j = 0; j < 2; j++) out[i][k][j] = __atomic_exchange_n(&flush_stat[i][k][j], 0, __ATOMIC_RELAXED);
+}
+
+// void nvnMemoryPoolFlushMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size): storage is coherent; a
+// back end with device-side copies hears of it (nvn_pool_flushed)
+NVN_API(nvnMemoryPoolFlushMappedRange) {
+    const pool_t *p = arg_p(c, 0);
+    int64_t off = (int64_t)arg_x(c, 1);
+    uint64_t size = arg_x(c, 2);
+    if (rt_trace & RT_TRACE_PERF) flush_note(0, p, size);
+    if (p && off >= 0 && (uint64_t)off < p->size) nvn_pool_flushed(p, (uint64_t)off, size < p->size - (uint64_t)off ? size : p->size - (uint64_t)off);
+}
 // NVNmemoryPoolFlags nvnMemoryPoolGetFlags(const NVNmemoryPool *p)
 NVN_API(nvnMemoryPoolGetFlags) { ret_x(c, ((const pool_t *)arg_p(c, 0))->flags); }
 // void *nvnMemoryPoolMap(const NVNmemoryPool *p): NULL for CPU_NO_ACCESS
@@ -402,6 +430,7 @@ NVN_API(nvnBufferFlushMappedRange) {
     if (off < 0 || (uint64_t)off > o->size || size > o->size - (uint64_t)off)
         rt_fatal("nvn: BufferFlushMappedRange %#llx+%#llx outside the buffer (%#llx bytes)", (unsigned long long)off,
                  (unsigned long long)size, (unsigned long long)o->size);
+    if (rt_trace & RT_TRACE_PERF) flush_note(1, o->pool, size);
     uint64_t a = buf_address(o);
     if (a && !nvn_gpu_only(a)) nvn_guest_written(a + (uint64_t)off, size);
 }
@@ -429,12 +458,13 @@ NVN_API(nvnSyncWait) {
     uint64_t timeout = arg_x(c, 1);
     if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     const GfxBackend *b = gfx_backend();
-    if (b->fence_done() >= s->fence) { ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     int ok;
     {
         NVN_BLOCKING();
         ok = b->fence_wait(s->fence, timeout);
     }
+    if (ok) b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
 // void nvnEventBuilderSetDefaults(NVNeventBuilder *b)
@@ -516,8 +546,11 @@ NVN_API(nvnQueueGetError) {
 NVN_API(nvnQueueFlush) { (void)c; }
 // void nvnQueueFinish(NVNqueue *q)
 NVN_API(nvnQueueFinish) {
-    NVN_BLOCKING();
-    gfx_backend()->finish();
+    {
+        NVN_BLOCKING();
+        gfx_backend()->finish();
+    }
+    gfx_backend()->cpu_synced(gfx_backend()->fence_done());
 }
 // ---------- Submit latency guard for TotK 1.2.1's per-object uniform double buffer
 // NVN starts the GPU when QueueSubmitCommands returns, within microseconds; here the replay into Vulkan takes 15-30 ms
@@ -532,7 +565,9 @@ NVN_API(nvnQueueFinish) {
 static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 
 // void nvnQueueSubmitCommands(NVNqueue *q, int n, const NVNcommandHandle *handles): replayed on this thread with its
-// core given up (section 2.2); the newest fence value is what QueueFenceSync records
+// core given up (section 2.2), or queued for the replay thread (TOTK_REPLAY_ASYNC, vk_backend.c); the newest fence
+// value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
+// for both.
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
@@ -541,8 +576,22 @@ NVN_API(nvnQueueSubmitCommands) {
     NVN_BLOCKING();
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
     q->submits++;
-    nvn_submit_prepare(h, n);
-    uint64_t f = gfx_backend()->submit(h, n), prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
+    uint64_t f;
+    if (gfx_replay_async()) {
+        // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
+        static SRWLOCK submit_lock = SRWLOCK_INIT;
+        uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
+        if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
+        AcquireSRWLockExclusive(&submit_lock);
+        nvn_submit_prepare_async(h, hs, n);
+        f = gfx_backend()->submit(hs, n);
+        ReleaseSRWLockExclusive(&submit_lock);
+        if (hs != local) free(hs);
+    } else {
+        nvn_submit_prepare(h, n);
+        f = gfx_backend()->submit(h, n);
+    }
+    uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     __atomic_store_n(&lod_fence[no % LOD_RING], f, __ATOMIC_RELAXED);
     __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);

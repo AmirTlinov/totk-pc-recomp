@@ -691,7 +691,13 @@ static File *file_of(uint64_t h, HANDLE *fh, int *mode) {
 static int64_t host_read_at(HANDLE f, void *buf, uint32_t n, uint64_t off) {
     OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
     DWORD got = 0;
-    if (!ReadFile(f, buf, n, &got, &ov)) return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+    mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
+    if (!ReadFile(f, buf, n, &got, &ov)) {
+        DWORD e = GetLastError();
+        if (e == ERROR_NOACCESS)   // a read-only page in the buffer: a frozen region missed its thaw
+            rt_log("fs: read of %u bytes into %p refused: the buffer is not writable", n, buf);
+        return e == ERROR_HANDLE_EOF ? 0 : -1;
+    }
     return got;
 }
 

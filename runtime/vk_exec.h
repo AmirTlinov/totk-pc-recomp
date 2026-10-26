@@ -123,9 +123,11 @@ void vk_exec_draw_new_cb(void);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
-// 1: every target of the current pass was rendered in the previous presented frame (per-frame targets); 0 when one
-// was not, or the pass has none.
-int vk_exec_targets_recent(VkExec *ex);
+// 1: every target of the current pass (any 1: at least one) was rendered in the previous presented frame (per-frame
+// targets); 0 otherwise, or when the pass has none.
+int vk_exec_targets_recent(VkExec *ex, int any);
+// The current pass's targets with their formats, extents and the frames they were last rendered in (diagnostics).
+void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap);
 
 // TOTK_TRACE=gfx: replay counters of the current frame, logged and reset at each present (vk_exec_frame_log).
 typedef struct {
@@ -136,6 +138,7 @@ typedef struct {
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
+uint64_t vk_exec_recording_fence(void);                        // fence of the submission this thread records, else 0
 void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 
 // TOTK_DUMP=<frame> (vk_dump.c): between presents frame-1 and frame, every pass's targets and every dispatch's storage

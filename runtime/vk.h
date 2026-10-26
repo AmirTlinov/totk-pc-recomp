@@ -37,7 +37,8 @@ typedef struct VkCtx {
     int validation;                         // layer active
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
-        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock;
+        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock,
+        has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -114,13 +115,65 @@ void vk_guest_written(uint64_t addr, uint64_t size);   // a host write write-wat
 
 // GPU address -> backing (section 3.1). avail: bytes from offset that stay contiguous in buffer. alloc/alloc_offset:
 // the device-local memory behind physical and (through the page table) virtual pool addresses, NULL for imported pools.
+// cls: the pool class of the backing (VK_MCLS_*), for the traffic census.
 typedef struct {
     VkBuffer buffer;
     VkDeviceSize offset, avail;
     VmaAllocation alloc;
     VkDeviceSize alloc_offset;
+    int cls;
+    void *pool;   // the imported pool record behind the span (NULL for device memory), for VK_MEM_BOUND
 } VkMemSpan;
+// Traffic census (vk_memory.c vk_mem_census): bytes the replay binds or copies, by pool class and use. Imported pools by
+// their CPU access flag; DEVICE is physical memory (directly or through a virtual pool); SCRATCH the replay's transient
+// copies. CPU_READ counts bytes host code reads from pool storage in place of the GPU (misaligned binds, byte indices,
+// counter words); GPU_WRITE what copies, fills, counter reports and uniform updates write.
+enum { VK_MCLS_NONE, VK_MCLS_HOST_NOACC, VK_MCLS_HOST_UNC, VK_MCLS_HOST_CACHED, VK_MCLS_DEVICE, VK_MCLS_SCRATCH, VK_MCLS_N };
+enum { VK_MUSE_VB, VK_MUSE_IB, VK_MUSE_UBO, VK_MUSE_SSBO, VK_MUSE_IND, VK_MUSE_COPY_SRC, VK_MUSE_GPU_WRITE,
+       VK_MUSE_CPU_READ, VK_MUSE_N };
+void vk_mem_count(int cls, int use, uint64_t bytes);
+// TOTK_TRACE=perf dirty census (vk_memory.c): the replay notes each imported pool it binds as a vertex, index, uniform,
+// storage or indirect buffer; at the start of every submit the pages the CPU wrote in such pools since the previous
+// submit are counted from the shared page generations and logged as `mem: dirty` every 60 frames. Nothing when tracing
+// is off: VK_MEM_BOUND is one flag test at the call site.
+void vk_mem_bound_note(void *pool);
+#define VK_MEM_BOUND(sp) do { if ((rt_trace & RT_TRACE_PERF) && (sp).pool) vk_mem_bound_note((sp).pool); } while (0)
+void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its lock, before the replay
+// VRAM mirror of buffer-bound pools (vk_memory.c, build/mem-plan.md). vk_mirror_on: TOTK_MEMORY=mirror|verify, or the
+// device class is discrete and TOTK_MEMORY is unset or auto; set at device selection. The replay (submitting thread
+// under vk_sync_submit's lock) calls:
+// - VK_MEM_USE at a vertex, index, uniform, storage or indirect binding of a span vk_mem_resolve returned: the pool's
+//   mirror is created on first use and sp.buffer becomes it (same offsets); a pool that stays imported keeps its buffer.
+// - VK_MEM_PICK where a copy, fill or update reads or writes a span: the mirror if the pool has one, never a new one.
+// - vk_mem_gpu_wrote after recording a GPU write of [sp.offset, sp.offset + size) into sp.buffer: a mirror's bytes go
+//   back to guest memory at the end of the submission. No-op for imported buffers.
+// - vk_mem_mirror_begin at the start of a submission's recording, vk_mem_mirror_end (records the write-backs; returns
+//   the commands recorded) after its last barrier.
+// vk_sync.c records the copies the mirrors' first accesses queued (vk_mem_mirror_pending) into a prologue command
+// buffer with vk_mem_mirror_prologue and submits it right before each part.
+extern int vk_mirror_on;
+void vk_mem_use(VkMemSpan *sp);
+void vk_mem_pick(VkMemSpan *sp);
+#define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
+#define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
+void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
+void vk_mem_mirror_begin(void);
+int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
+int vk_mem_mirror_pending(void);
+void vk_mem_mirror_prologue(VkCommandBuffer cb);
+int vk_mem_mirror_probe(uint64_t addr);   // --probe-vkexec: the pool at addr gets its mirror as on a first buffer use;
+                                          // 1 when it has one
+void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m);   // once
+int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
+void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
+                                                  // with TOTK_TRACE=perf, every 1800 frames
+// VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
+// 0: this allocator's own allocations against the heap sizes. 0 when unknown.
+int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
+// mapped, a mirror created, refused or forgotten, a submission started.
+uint64_t vk_mem_gen(void);
 // Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
 // range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
 // *now is the generation to pass next time.
@@ -146,6 +199,27 @@ uint64_t vk_upload_flush(int wait);
 void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
 void vk_defer_view(VkImageView view);
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+// ---- ASTC (vk_astc.c). TOTK_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
+enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
+int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
+int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
+int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
+// One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
+// after the other), w x h texels and slices deep, written at offset of level / layer.
+typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
+// Records into cb, the open upload batch (between vk_upload_begin and vk_upload_end): src (TRANSFER_SRC, src_size
+// bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
+// into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
+// call. readback (optional, host-visible, TRANSFER_DST): also gets the decoded texels, the regions one after the other.
+// 0 when the decoder is unavailable or the scratch buffer cannot be allocated (nothing recorded).
+int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
+                   uint32_t bh, int srgb, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
+void vk_astc_stats(uint64_t *dispatches, uint64_t *texels);   // since start
+// TOTK_ASTC_TIME=1: GPU timestamps around each vk_astc_record's dispatches (logged per footprint and the largest one)
+void vk_astc_time_enable(int on);
+int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us);   // totals so far
+void vk_astc_time_summary(void);        // logs the totals
+void vk_astc_release(void);             // vk_device.c, before the device goes: frees the decoder's objects
 void vk_mem_note_submit(uint64_t timeline_value);  // T6: after each submit that signals ctx->timeline with this value
 void vk_mem_collect(void);                         // frees what has completed
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
@@ -185,17 +259,25 @@ void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 VkSampler vk_sampler_by_id_locked(int id);
 uint32_t vk_texture_slots_gen(void);
+uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
+void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
+uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
+size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
+int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
+void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
 int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the descriptor in slot id
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                           uint64_t img);            // always from the image (GPU copy, waited for); 0 on failure
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
+uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size);   // newest recorded writer of such a texture; 0: none
 void vk_texture_write_back(uint64_t addr, uint64_t size);   // writes those images back into their storage (waits)
 void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   // vk_pool_fini: drop the images there
 void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
+uint32_t vk_texture_epoch(void);                    // the write-watch snapshot epoch vk_texture_new_submit started
 VkSampler vk_sampler_by_id(int id);                 // VK_NULL_HANDLE for an empty slot
 VkSampler vk_sampler_for(const samp_par *s);        // cached by content
 int vk_sampler_params(int id, samp_par *out);       // parameters of a sampler slot; 0 for an empty slot
@@ -208,8 +290,10 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
+uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 uint64_t vk_sync_fence_done(void);         // highest done value
+uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c: T6c): records the command handles of one submission into cb, which the caller has
@@ -229,6 +313,7 @@ void rdoc_init(void);                     // runtime/rdoc_win.c: TOTK_RDOC debug
 int rdoc_active(void);
 void rdoc_after_present(uint64_t frame);
 void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
+int vk_replay_async(void);                 // TOTK_REPLAY_ASYNC (default 1): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: pipelines (T6b); weak no-op in vk_backend.c
 void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
 
@@ -290,7 +375,13 @@ typedef struct {
     VkDescriptorSetLayout set_layout1;
     int push1;
     uint32_t n_sets;
+    // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
+    // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
+    VkDescriptorUpdateTemplate tpl[2];
 } VkPipeInfo;
+// One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
+// bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
+typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBufferView view; uint64_t w[3]; } VkDescSlot;
 // Both return the cached pipeline (created on first use; failures are cached and logged once). info: may be NULL.
 // Valid until vk_pipeline_shutdown; thread-safe.
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
@@ -324,6 +415,10 @@ VkPrimitiveTopology vk_pipeline_topology(int nvn_prim);   // quads -> triangle l
                                                           // rewrites those draws; polygon -> fan
 VkFormat vk_vertex_format(int nvn_format, int *type);     // attribute format (supported fallback), GFX_TYPE_* in *type
 PFN_vkCmdPushDescriptorSetKHR vk_pipeline_push_fn(void);  // after the first vk_pipeline_* call
+// Descriptor update templates (after the first vk_pipeline_* call): NULL when templates are off (TOTK_DESC_TEMPLATE=0,
+// a device below Vulkan 1.1) or, for the push variant, vkCmdPushDescriptorSetWithTemplateKHR is missing.
+PFN_vkCmdPushDescriptorSetWithTemplateKHR vk_pipeline_push_tpl_fn(void);
+PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void);
 // Probe only: 1 selects stage-independent layouts for pipelines looked up from now on, 0 the shared set 0; returns
 // the previous mode. 1 needs vk_caps.gpl (the independent-sets flag comes with the extension).
 int vk_pipeline_set_indep(int on);

@@ -1,5 +1,5 @@
 // Vulkan textures of the M4 graphics layer: a VkImage cache keyed by storage
-// GPU address plus descriptor, uploads through staging buffers with block-linear deswizzle and CPU ASTC decode,
+// GPU address plus descriptor, uploads through staging buffers with block-linear deswizzle and ASTC decode (vk_astc.c),
 // re-uploads when page write generations (vk_memory.c) show the storage written, ReadTexels / WriteTexels, the texture
 // and sampler descriptor slots, and VkSamplers.
 //
@@ -51,7 +51,11 @@ typedef struct Tex {
     uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
+    uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
+    uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
+                                  // storage binding); ReadTexels waits for it instead of draining the replay queue
     uint8_t listed;               // in owned[]
+    uint32_t wt_n;                // WriteTexels into the storage since the last upload
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -79,6 +83,8 @@ static int nsslots;
 static nvn_hmap samplers = {.klen = sizeof(samp_par)};
 static int nreleased;
 static uint64_t n_uploads, n_reuploads;
+// Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
+static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
 // TOTK_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
 static int tex_alias = -1;
@@ -96,6 +102,7 @@ static uint64_t gpu_writes;  // GPU writes into mirrored textures so far: Tex.gp
 static uint32_t tex_gen = 1;
 // Bumped with tex_gen and whenever a slot is registered: what vk_texture_by_id returns for any slot may have changed.
 static uint32_t slots_gen = 1;
+static uint32_t samp_gen = 1;   // bumped whenever a sampler slot is registered: vk_sampler_by_id may answer otherwise
 static uint64_t n_checks;    // draw-binding storage checks (make_fresh_snap) since the last perf line
 
 static void tex_gen_bump(void) {
@@ -465,45 +472,91 @@ static void shrink_rgb(int format, const uint8_t *src, uint8_t *dst, size_t n) {
     for (size_t i = 0; i < n; i++, src += 4 * e, dst += 3 * e) memcpy(dst, src, 3 * e);
 }
 
+// TOTK_ASTC=check: the compute decoder's texels of n regions (gpu: the regions one after the other) against
+// astc_decode_ldr of the same raw blocks (raw: the staging bytes the regions point into).
+static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar, int n, const uint8_t *gpu) {
+    static volatile long n_bad;
+    static uint64_t n_tex, n_texels, n_diff_tex;
+    uint32_t bw = e->f.astc_bw, bh = e->f.astc_bh;
+    uint64_t diff = 0, first = UINT64_MAX;
+    uint32_t want = 0, got = 0;
+    int first_k = 0;
+    for (int k = 0; k < n; k++) {
+        const VkAstcRegion *r = &ar[k];
+        size_t sb = (size_t)((r->w + bw - 1) / bw) * ((r->h + bh - 1) / bh) * 16, st = (size_t)r->w * r->h * 4;
+        uint8_t *cpu = malloc(st);
+        for (uint32_t z = 0; z < r->slices; z++, gpu += st) {
+            astc_decode_ldr(raw + r->src + z * sb, r->w, r->h, bw, bh, e->f.astc_srgb, cpu);
+            if (!memcmp(cpu, gpu, st)) continue;
+            for (size_t i = 0; i < st / 4; i++)
+                if (memcmp(cpu + 4 * i, gpu + 4 * i, 4)) {
+                    if (first == UINT64_MAX) {
+                        first = i, first_k = k;
+                        memcpy(&want, cpu + 4 * i, 4), memcpy(&got, gpu + 4 * i, 4);
+                    }
+                    diff++;
+                }
+        }
+        free(cpu);
+        n_texels += (uint64_t)r->w * r->h * r->slices;
+    }
+    n_tex++;
+    if (diff) {
+        n_diff_tex++;
+        log_limited(&n_bad, "ASTC check: texture %#llx fmt %#x %ux%u: %llu texels differ, first region %d texel %llu "
+                    "cpu %08x gpu %08x", (unsigned long long)e->pub.addr, e->t.d.format, bw, bh,
+                    (unsigned long long)diff, first_k, (unsigned long long)first, want, got);
+    }
+    if (n_tex == 1 || !(n_tex & 63) || diff)
+        rt_log("vk: ASTC check: %llu textures, %llu texels compared, %llu textures differ", (unsigned long long)n_tex,
+               (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
+}
+
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
-    static volatile long n_bad;
+    static volatile long n_bad, n_undecoded;
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     if (!bpb || !t->mem) return;
-    uint64_t p0 = perf_begin();
+    uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
+    int agpu = astc && vk_astc_gpu(), acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK;   // raw blocks to the GPU
     uint32_t n = levels * layers, k = 0;
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
-    VkDeviceSize total = 0;
+    VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
+    VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
             uint32_t w = mip(d->width, lv), h = one_d ? 1 : mip(d->height, lv), sl = is3d ? mip(d->depth, lv) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
-            uint64_t out = astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
+            uint64_t out = agpu ? raw : astc ? texels * 4 : rgb ? texels * (uint64_t)bpb / 3 * 4 : raw;
             rg[k++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv, ly, 1},
                                           .imageExtent = {w, h, sl}};
             total += (out + 15) & ~15ull;
+            decoded += texels * 4;
         }
     VkCommandBuffer cb = vk_upload_begin();
-    VkBuffer sb;
-    uint8_t *stg = vk_staging(total, &sb, NULL);
+    VkBuffer sb, rbuf = VK_NULL_HANDLE;
+    VmaAllocation ralloc = NULL;
+    uint8_t *stg = vk_staging(total, &sb, NULL), *rmap = acheck ? vk_staging(decoded, &rbuf, &ralloc) : NULL;
     k = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++, k++) {
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
-            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = astc || rgb ? malloc(raw) : NULL;
+            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
             if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
             }
-            if (astc) {
+            if (agpu) {
+                ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
+            } else if (astc) {
                 uint64_t a0 = perf_begin();
                 for (uint32_t z = 0; z < sl; z++)
                     astc_decode_ldr_mt(tmp + (size_t)z * rb * rows, w, h, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb,
@@ -518,13 +571,49 @@ static void upload(Tex *e) {
             }
             free(tmp);
         }
+    uint8_t *raw_copy = acheck ? malloc(total) : NULL;
+    if (raw_copy) memcpy(raw_copy, stg, total);
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+    int checked = 0;
+    if (agpu) {
+        uint64_t a0 = perf_begin();
+        checked = vk_astc_record(cb, sb, total, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->pub.image,
+                                 e->pub.aspect, rbuf);
+        perf_end(PERF_ASTC, a0);
+        if (!checked)
+            log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
+                        (unsigned long long)e->pub.addr, d->format, d->width, d->height);
+    } else {
+        vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+    }
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_upload_end();
+    if (acheck) {   // waits for the GPU
+        vk_upload_flush(1);
+        if (checked) {
+            vmaInvalidateAllocation(vk_ctx()->vma, ralloc, 0, VK_WHOLE_SIZE);
+            astc_check(e, raw_copy, ar, (int)n, rmap);
+        }
+        vmaDestroyBuffer(vk_ctx()->vma, rbuf, ralloc);
+    }
+    free(raw_copy);
+    free(ar);
     free(rg);
-    if (e->uploaded) n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
-    else n_uploads++, perf_count(PERF_CNT_TEX_UP);
+    uint64_t dt = kern_now_ns() - u0;
+    if (e->uploaded) {
+        n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
+        ru_n++, ru_bytes += t->L.size, ru_ns += dt;
+        if (e->wt_n) {
+            ru_wt_n++, ru_wt_bytes += t->L.size, ru_wt_ns += dt;
+            if (rt_trace & RT_TRACE_PERF)
+                rt_log("perf: frame %llu: re-upload after %u WriteTexels: texture %#llx fmt %#x %ux%u, %.1f KiB, %.3f ms",
+                       (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), e->wt_n,
+                       (unsigned long long)e->pub.addr, d->format, d->width, d->height, t->L.size / 1024.0, dt / 1e6);
+        }
+    } else {
+        n_uploads++, perf_count(PERF_CNT_TEX_UP);
+    }
+    e->wt_n = 0;
     e->uploaded = 1;
     e->n_up++;
     perf_end(PERF_TEX, p0);
@@ -719,6 +808,11 @@ const VkTexImage *vk_texture_get(const tex_t *t) {
     return e ? &e->pub : NULL;
 }
 
+// Small render targets the CPU reads without NVN's invalidate (vk_texture_write_back_small); small_pending: one may be
+// dirty.
+enum { WB_SMALL = 64 << 10 };
+static int small_pending;
+
 void vk_texture_gpu_written(const tex_t *t) {
     if (!t || !t->mem) return;
     vk_exec_frame_written(t);
@@ -727,10 +821,14 @@ void vk_texture_gpu_written(const tex_t *t) {
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
         e->pub.gpu_owned = 1;
+        uint64_t f = vk_exec_recording_fence();
+        if (f > e->wr_fence) e->wr_fence = f;
         if (e->pub.mirrored) {
             e->gpu_dirty = 1;
             storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
             e->gpu_seq = ++gpu_writes;
+            e->gpu_fence = vk_exec_recording_fence();
+            if (e->t.L.size <= WB_SMALL) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
             own_add(e);
         }
     }
@@ -832,6 +930,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
+uint32_t vk_sampler_gen(void) { return __atomic_load_n(&samp_gen, __ATOMIC_RELAXED); }
 
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
     lock();
@@ -880,6 +979,8 @@ int vk_texture_slot_swz(int id, uint8_t swz[4]) {
     return ok;
 }
 
+uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC_RELAXED); }
+
 void vk_texture_new_submit(void) {
     lock();
     if (!++submit_epoch) submit_epoch = 1;
@@ -891,6 +992,10 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)n_alias_copied, (unsigned long long)n_alias_upload,
                (unsigned long long)n_alias_uninit);
         n_alias_copied = n_alias_upload = n_alias_uninit = 0;
+        rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms)",
+               (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
+               (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6);
+        ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = 0;
         uint64_t ck, calls, untr;
         vk_mem_snap_stats(&ck, &calls, &untr);
         rt_log("perf: frame %llu: binding storage checks %llu (texture %llu), write-watch snapshot queries %llu, untracked %llu",
@@ -922,29 +1027,18 @@ static int region_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
     return 1;
 }
 
-// Pool bytes <-> caller rows through a linear copy of the level (MNG nvn_mtl.m:10121-10132, 10158-10170).
+// Pool bytes <-> caller rows of the region alone (nvn_texels_box). MNG nvn_mtl.m:10121-10132, 10158-10170 go through a
+// linear copy of the whole level; for a small region of a large texture that cost tens of milliseconds while the guest
+// thread held its virtual core and the caller the texture lock (monsters2 replay, frames 765-790).
 static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
-    const nvn_texdesc *d = &t->d;
-    uint32_t lw = mip(d->width, g->level), lh = d->target == 0 || d->target == 3 ? 1 : mip(d->height, g->level);
-    uint32_t lz = g->is3d ? mip(d->depth, g->level) : 1;
-    size_t lp = (size_t)((lw + g->bw - 1) / g->bw) * (size_t)g->bpb, lr = (lh + g->bh - 1) / (uint32_t)g->bh;
-    if (g->x0 + g->wb > lp || g->y0 + g->hb > lr || (g->is3d && (uint32_t)(r->zoffset + g->nz) > lz)) return 0;
-    uint8_t *lin = malloc(lp * lr * lz);
-    if (!lin) rt_fatal("vk: out of memory for texels");
-    int ok = 1;
-    for (int z = 0; z < g->nz && ok; z++) {
+    for (int z = 0; z < g->nz; z++) {
         unsigned layer = g->is3d ? 0 : g->layer0 + (unsigned)r->zoffset + (unsigned)z;
-        if ((!g->is3d || z == 0) && nvn_deswizzle(d, g->level, layer, t->mem, lin, lp)) { ok = 0; break; }
-        uint8_t *slice = lin + (g->is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
-        for (size_t y = 0; y < g->hb; y++) {
-            uint8_t *p = slice + (g->y0 + y) * lp + g->x0, *q = mem + (size_t)z * g->img + y * g->row;
-            if (write) memcpy(p, q, g->wb);
-            else memcpy(q, p, g->wb);
-        }
-        if (write && (!g->is3d || z == g->nz - 1) && nvn_swizzle(d, g->level, layer, lin, lp, t->mem)) ok = 0;
+        uint32_t slice = g->is3d ? (uint32_t)(r->zoffset + z) : 0;
+        if (nvn_texels_box(&t->d, g->level, layer, (uint32_t)g->x0, (uint32_t)g->y0, slice, (uint32_t)g->wb,
+                           (uint32_t)g->hb, t->mem, mem + (size_t)z * g->img, g->row, !write))
+            return 0;
     }
-    free(lin);
-    return ok;
+    return 1;
 }
 
 static int read_aspect(const Tex *e, VkImageAspectFlags *a) {
@@ -972,9 +1066,9 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     }
     if (g->level >= e->pub.levels) return 0;
     uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
-    int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0;
-    size_t texels = (size_t)w * h, ib = astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
-    size_t slice = ib ? texels * ib : g->wb * g->hb;
+    int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0, agpu = astc && write && vk_astc_gpu();
+    size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
+    size_t slice = ib ? texels * ib : g->wb * g->hb;   // agpu: the raw blocks, decoded by vk_astc_record
     VkBuffer sb;
     VmaAllocation sa;
     uint8_t *stg = vk_staging(slice * (size_t)g->nz, &sb, &sa);
@@ -983,7 +1077,9 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         uint8_t *s = stg + slice * (size_t)z;
         const uint8_t *m = mem + (size_t)z * g->img;
         if (write) {
-            if (astc) {
+            if (agpu) {
+                for (size_t y = 0; y < g->hb; y++) memcpy(s + y * g->wb, m + y * g->row, g->wb);
+            } else if (astc) {
                 uint8_t *tight = malloc(g->wb * g->hb);
                 for (size_t y = 0; y < g->hb; y++) memcpy(tight + y * g->wb, m + y * g->row, g->wb);
                 uint64_t a0 = perf_begin();
@@ -1005,7 +1101,21 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     if (write) {
         vmaFlushAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
         barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
+        int done = 0;
+        if (agpu) {
+            VkAstcRegion *ar = calloc((size_t)g->nz, sizeof *ar);
+            for (int z = 0; z < g->nz; z++)
+                ar[z] = (VkAstcRegion){.src = slice * (size_t)z, .w = w, .h = h, .slices = 1, .level = rg[z].imageSubresource.mipLevel,
+                                       .layer = rg[z].imageSubresource.baseArrayLayer, .offset = rg[z].imageOffset};
+            uint64_t a0 = perf_begin();
+            done = vk_astc_record(cb, sb, slice * (size_t)g->nz, ar, g->nz, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb,
+                                  e->pub.image, aspect, VK_NULL_HANDLE);
+            perf_end(PERF_ASTC, a0);
+            free(ar);
+        }
+        if (!agpu) vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
+        else if (!done) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
+                                    (unsigned long long)e->pub.addr);
         barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     } else {
         barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -1090,6 +1200,7 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
             log_limited(&n_bad, "WriteTexels: region outside level %u of texture %#llx", g.level, (unsigned long long)e->pub.addr);
         vk_guest_written((uintptr_t)t->mem, t->L.size);
         if (e->pub.gpu_owned) image_texels(e, &g, r, (uint8_t *)src, 1);
+        else if (e->uploaded) e->wt_n++;
     } else if (e) {
         image_texels(e, &g, r, (uint8_t *)src, 1);
     }
@@ -1133,12 +1244,49 @@ static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
     return n;
 }
 
+// A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
+// tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
+void vk_texture_storage_bound_locked(const VkTexImage *img) {
+    Tex *e = (Tex *)img;   // pub is the first member
+    uint64_t f = vk_exec_recording_fence();
+    if (f > e->wr_fence) e->wr_fence = f;
+}
+
+uint64_t vk_texture_last_write(const tex_t *t) {
+    lock();
+    Tex *e = entry_of(t);
+    uint64_t f = e ? e->wr_fence : 0;
+    unlock();
+    return f;
+}
+
+size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img) {
+    Region g;
+    if (!region_of(t, v, r, row, img, &g)) return 0;
+    return (size_t)(g.nz - 1) * g.img + (g.hb - 1) * g.row + g.wb;
+}
+
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size) {
     if (!size || !__atomic_load_n(&nowned, __ATOMIC_ACQUIRE)) return 0;
     AcquireSRWLockShared(&owned_lock);
     int dirty = owned_dirty(addr, size, NULL);
     ReleaseSRWLockShared(&owned_lock);
     return dirty;
+}
+
+// The newest submission recorded to write a GPU-written mirrored texture overlapping [addr, addr+size); 0: none.
+uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size) {
+    if (!size || !__atomic_load_n(&nowned, __ATOMIC_ACQUIRE)) return 0;
+    lock();
+    uint64_t f = 0;
+    for (int i = owned_lower(addr > max_owned ? addr - max_owned : 0); i < nowned && owned[i]->pub.addr < addr + size; i++) {
+        const Tex *e = owned[i];
+        if (!e->gpu_dirty || e->pub.addr + e->t.L.size <= addr) continue;
+        if (e->gpu_fence > f) f = e->gpu_fence;
+        if (e->wr_fence > f) f = e->wr_fence;
+    }
+    unlock();
+    return f;
 }
 
 // The image is the newest content only while nothing wrote the storage since the GPU render: TotK finalizes grass maps,
@@ -1151,6 +1299,48 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
     Tex **hit = malloc(sizeof *hit * (size_t)(nowned + 1));
     if (!hit) rt_fatal("vk: out of memory for a texture write-back");
     int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
+    for (int i = 0; i < n; i++) {
+        uint32_t now;
+        if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
+        else hit[k++] = hit[i];
+    }
+    for (int i = 1; i < k; i++)
+        for (int j = i; j > 0 && hit[j - 1]->gpu_seq > hit[j]->gpu_seq; j--) {
+            Tex *x = hit[j];
+            hit[j] = hit[j - 1], hit[j - 1] = x;
+        }
+    for (int i = 0; i < k; i++) write_back(hit[i]);
+    for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
+    for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
+    free(hit);
+    unlock();
+}
+
+// TotK's grass system renders a 128x128 RGBA8 map of cut and trampled grass into a CPU-cached pool every frame and its
+// CPU code reads the pool bytes without nvnMemoryPoolInvalidateMappedRange (cut reactions: blades, insects, the cut
+// itself; build/v121-bloom NOTES.md). On the Switch the bytes are there once the frame's fence has passed. So when the
+// CPU waits for a fence, mirrored targets up to WB_SMALL bytes rendered by work up to that fence go back to their
+// storage, unless the CPU rewrote it since. Larger targets still go back on an invalidate, memcpy or ReadTexels.
+int vk_texture_small_dirty(void) { return __atomic_load_n(&small_pending, __ATOMIC_ACQUIRE); }
+
+void vk_texture_write_back_small(uint64_t fence) {
+    lock();
+    __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
+    AcquireSRWLockShared(&owned_lock);
+    int n = 0, later = 0;
+    for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && owned[i]->t.L.size <= WB_SMALL;
+    Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
+    if (n && !hit) rt_fatal("vk: out of memory for a texture write-back");
+    n = 0;
+    for (int i = 0; i < nowned; i++) {
+        Tex *e = owned[i];
+        if (!e->gpu_dirty || e->t.L.size > WB_SMALL) continue;
+        if (e->gpu_fence > fence) later = 1;
+        else hit[n++] = e;
+    }
+    ReleaseSRWLockShared(&owned_lock);
+    if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
+    int k = 0;
     for (int i = 0; i < n; i++) {
         uint32_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
@@ -1275,6 +1465,7 @@ void vk_sampler_register(int id, const samp_par *s) {
     sslots[id].p = *s;
     sslots[id].s = VK_NULL_HANDLE;
     sslots[id].used = 1;
+    samp_gen++;
     unlock();
 }
 

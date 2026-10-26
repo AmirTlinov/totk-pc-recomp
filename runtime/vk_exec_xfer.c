@@ -275,6 +275,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     VkMemSpan m;
     if (!vk_mem_resolve(p->addr, sizeof(NVNcounterData), &m))
         rt_fatal("vk: counter report at %#llx is in no memory pool", (unsigned long long)p->addr);
+    vk_mem_count(m.cls, VK_MUSE_GPU_WRITE, sizeof(NVNcounterData));
     if (samples) oq_report(ex, p->addr);
     else {
         uint64_t *a = malloc(sizeof *a);
@@ -297,6 +298,7 @@ static int counter_word(uint64_t addr, uint64_t *v) {
     VkMemSpan m;
     if (nvn_gpu_only(addr) || !vk_mem_resolve(addr, sizeof *v, &m)) return 0;
     memcpy(v, (const void *)(uintptr_t)addr, sizeof *v);
+    vk_mem_count(m.cls, VK_MUSE_CPU_READ, sizeof *v);
     return 1;
 }
 
@@ -377,9 +379,10 @@ static VkExtent3D sub_extent(const Sub *s) {
     return (VkExtent3D){s->w, s->h, s->img->type == VK_IMAGE_TYPE_3D ? s->nz : 1};
 }
 
-// Buffer side of a texture <-> buffer copy: bytes covered, pitches, Vulkan buffer span.
+// Buffer side of a texture <-> buffer copy: bytes covered, pitches, Vulkan buffer span (a VRAM mirror when the pool
+// has one).
 static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *size, VkBufferImageCopy *c,
-                       VkBuffer *buf) {
+                       VkMemSpan *span) {
     uint32_t wb = (s->w + (uint32_t)s->bw - 1) / (uint32_t)s->bw, hb = (s->h + (uint32_t)s->bh - 1) / (uint32_t)s->bh;
     uint64_t row = ex->copy_stride > 0 ? (uint64_t)ex->copy_stride : (uint64_t)wb * (uint64_t)s->bpb;
     if (row % (uint64_t)s->bpb || row < (uint64_t)wb * (uint64_t)s->bpb) {
@@ -395,7 +398,8 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
                   (unsigned long long)addr, (unsigned long long)*size);
         return 0;
     }
-    *buf = m.buffer;
+    VK_MEM_PICK(m);
+    *span = m;
     *c = (VkBufferImageCopy){.bufferOffset = m.offset, .bufferRowLength = (uint32_t)(row / (uint64_t)s->bpb) * (uint32_t)s->bw,
                              .bufferImageHeight = hb * (uint32_t)s->bh, .imageSubresource = sub_layers(s),
                              .imageOffset = sub_offset(s), .imageExtent = sub_extent(s)};
@@ -407,15 +411,16 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
     uint64_t size;
     VkBufferImageCopy c;
-    VkBuffer buf;
-    if (!buffer_side(ex, &s, p->src, &size, &c, &buf)) return;
+    VkMemSpan m;
+    if (!buffer_side(ex, &s, p->src, &size, &c, &m)) return;
+    vk_mem_count(m.cls, to_image ? VK_MUSE_COPY_SRC : VK_MUSE_GPU_WRITE, size);
     vk_exec_pass_end(ex);
     vk_exec_barrier(ex);
-    if (to_image) vkCmdCopyBufferToImage(ex->cb, buf, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-    else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
+    if (to_image) vkCmdCopyBufferToImage(ex->cb, m.buffer, s.img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    else vkCmdCopyImageToBuffer(ex->cb, s.img->image, VK_IMAGE_LAYOUT_GENERAL, m.buffer, 1, &c);
     ex->recorded++;
     if (to_image) vk_texture_gpu_written(p->tex);
-    else note_gpu_write(ex, p->src, size);
+    else vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
 }
 
 static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
@@ -471,6 +476,8 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
         }
         uint64_t n = left < s.avail ? left : s.avail;
         if (n > d.avail) n = d.avail;
+        VK_MEM_PICK(s);
+        VK_MEM_PICK(d);
         if (s.buffer == d.buffer && s.offset < d.offset + n && d.offset < s.offset + n) {
             warn_once(W_OVERLAP, "buffer copy %#llx -> %#llx overlaps within one buffer: skipped",
                       (unsigned long long)p->src, (unsigned long long)p->dst);
@@ -479,7 +486,10 @@ static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
         if (!started) vk_exec_pass_end(ex), vk_exec_barrier(ex), started = 1;
         VkBufferCopy bc = {s.offset, d.offset, n};
         vkCmdCopyBuffer(ex->cb, s.buffer, d.buffer, 1, &bc);
+        vk_mem_gpu_wrote(&d, n);
         ex->recorded++;
+        vk_mem_count(s.cls, VK_MUSE_COPY_SRC, n);
+        vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);
         src += n, dst += n, left -= n;
     }
     if (started) note_gpu_write(ex, p->dst, p->size - left);
@@ -507,8 +517,11 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         uint64_t n = left < d.avail ? left : d.avail & ~3ull;
         if (!n) break;
         if (!started) vk_exec_pass_end(ex), vk_exec_barrier(ex), started = 1;
+        VK_MEM_PICK(d);
         vkCmdFillBuffer(ex->cb, d.buffer, d.offset, n, p->value);
+        vk_mem_gpu_wrote(&d, n);
         ex->recorded++;
+        vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);
         dst += n, left -= n;
     }
     if (started) note_gpu_write(ex, p->addr, p->size - left);

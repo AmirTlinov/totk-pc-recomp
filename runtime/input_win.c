@@ -1,6 +1,6 @@
 // Host input for nn::hid (runtime/ov_input.c): an SDL3 gamepad (no SDL window, no SDL video), the keyboard and the mouse,
-// merged into Switch npad button bits and stick axes. Button order follows libnx HidNpadButton (ISC). The key bindings are
-// the table in input_map.c; this file translates Win32 virtual keys to its key ids, reads the mouse (raw input, WM_INPUT)
+// merged into Switch npad button bits and stick axes. Button order follows libnx HidNpadButton (ISC). The key and pad bindings
+// are the tables in input_map.c (totk.ini overrides them); this file translates Win32 virtual keys to its key ids, reads the mouse (raw input, WM_INPUT)
 // and owns the cursor capture. Keys and their map: docs/controls.md.
 // The gamepad also rumbles (input_rumble) and, when it has a gyro and an accelerometer, feeds the six-axis sensor from a
 // thread of its own (input_motion_start). Every SDL call on the gamepad is made under `lock`.
@@ -30,13 +30,14 @@ static SDL_JoystickID sensor_pad;    // the gamepad whose sensors the motion thr
 static int sensor_ok;                // ... and it has both sensors, enabled
 static int motion_thread;            // 0 not started, 1 running, -1 off (TOTK_MOTION=0, no SDL)
 
-// Gamepad buttons by position: south is Switch B, east A, west Y, north X (Nintendo layout).
-static const struct { SDL_GamepadButton sdl; int bit; } pad_buttons[] = {
-    {SDL_GAMEPAD_BUTTON_SOUTH, B_B}, {SDL_GAMEPAD_BUTTON_EAST, B_A}, {SDL_GAMEPAD_BUTTON_WEST, B_Y},
-    {SDL_GAMEPAD_BUTTON_NORTH, B_X}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, B_STICK_L}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, B_STICK_R},
-    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, B_L}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, B_R}, {SDL_GAMEPAD_BUTTON_START, B_PLUS},
-    {SDL_GAMEPAD_BUTTON_BACK, B_MINUS}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, B_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_UP, B_UP},
-    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, B_RIGHT}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, B_DOWN},
+// SDL buttons of the gamepad inputs (input_map.h PAD_*), by position; PAD_ZL and PAD_ZR are the triggers (axes).
+static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
+    [PAD_SOUTH] = SDL_GAMEPAD_BUTTON_SOUTH, [PAD_EAST] = SDL_GAMEPAD_BUTTON_EAST, [PAD_WEST] = SDL_GAMEPAD_BUTTON_WEST,
+    [PAD_NORTH] = SDL_GAMEPAD_BUTTON_NORTH, [PAD_LSTICK] = SDL_GAMEPAD_BUTTON_LEFT_STICK,
+    [PAD_RSTICK] = SDL_GAMEPAD_BUTTON_RIGHT_STICK, [PAD_L] = SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,
+    [PAD_R] = SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, [PAD_START] = SDL_GAMEPAD_BUTTON_START, [PAD_BACK] = SDL_GAMEPAD_BUTTON_BACK,
+    [PAD_DPAD_LEFT] = SDL_GAMEPAD_BUTTON_DPAD_LEFT, [PAD_DPAD_UP] = SDL_GAMEPAD_BUTTON_DPAD_UP,
+    [PAD_DPAD_RIGHT] = SDL_GAMEPAD_BUTTON_DPAD_RIGHT, [PAD_DPAD_DOWN] = SDL_GAMEPAD_BUTTON_DPAD_DOWN,
 };
 
 // TOTK_INPUT_SCRIPT=<file>: lines "<frame> <button> [hold]" or "<frame> LSTICK|RSTICK <x> <y> [hold]", ORed into the real input.
@@ -190,6 +191,7 @@ static int key_vk(int key) {
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
 static volatile LONG cur_captured;         // cursor hidden and confined to the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
+static volatile LONG cur_released;         // Esc, or activation by a click on the title bar or border: until a client click
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
@@ -214,7 +216,7 @@ static float mouse_sens_get(void) {
 static void cursor_update(HWND h) {
     const char *in = cfg_get("TOTK_INPUT");
     AcquireSRWLockExclusive(&cur_lock);
-    int want = h && cur_active && !cur_suspend && g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 &&
+    int want = h && cur_active && !cur_released && !cur_suspend && g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 &&
                !(in && !strcmp(in, "none")) && GetForegroundWindow() == h && !IsIconic(h);
     RECT r;
     POINT tl = {0, 0};
@@ -229,6 +231,8 @@ static void cursor_update(HWND h) {
     }
     ReleaseSRWLockExclusive(&cur_lock);
 }
+
+int input_cursor_released(void) { return cur_released != 0; }
 
 void input_cursor_suspend(int on) {
     InterlockedExchange(&cur_suspend, on != 0);
@@ -256,7 +260,17 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_SETCURSOR:
         if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
         break;
+    case WM_KEYDOWN:   // Esc is unbound in the game layout, so it only releases the cursor
+        if (w == VK_ESCAPE) { InterlockedExchange(&cur_released, 1); cursor_update(h); }
+        break;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
+        if (cur_released) { InterlockedExchange(&cur_released, 0); cursor_update(h); }
+        break;
+    case WM_MOUSEACTIVATE:   // sent before WM_ACTIVATEAPP: a title bar or border click must not capture
+        if (LOWORD(l) != HTCLIENT) InterlockedExchange(&cur_released, 1);
+        break;
     case WM_ACTIVATEAPP:
+        if (!w) InterlockedExchange(&cur_released, 0);   // Alt+Tab back in captures again
         InterlockedExchange(&cur_active, w != 0);
         cursor_update(h);
         break;
@@ -329,6 +343,7 @@ static void scan_pads(void) {
 }
 
 static void start(void) {
+    input_map_configure();
     const char *e = cfg_get("TOTK_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (TOTK_INPUT=none)"); return; }
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
@@ -352,15 +367,17 @@ static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     if (b > a) { *x = kx; *y = ky; }
 }
 
-// Under lock, state 1: the open gamepad's buttons (Switch bits) and sticks; 0 without a connected gamepad.
+// Under lock, state 1: the open gamepad's buttons (Switch bits after the TOTK_BIND_* layout) and sticks; 0 without a
+// connected gamepad.
 static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
     SDL_UpdateGamepads();
     if (!pad || !SDL_GamepadConnected(pad)) return 0;
-    for (size_t i = 0; i < sizeof pad_buttons / sizeof *pad_buttons; i++)
-        if (SDL_GetGamepadButton(pad, pad_buttons[i].sdl)) *b |= 1ull << pad_buttons[i].bit;
-    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) *b |= 1ull << B_ZL;
-    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) *b |= 1ull << B_ZR;
+    uint8_t pd[PAD_COUNT] = {0};
+    for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
+    pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
+    pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    *b |= input_map_pad_buttons(pd);
     sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
     sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
     sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));

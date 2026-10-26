@@ -217,6 +217,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // The process ends with the window, as in MNG. Save writes go straight to files (runtime/fs_host.c).
         rt_log("gfx: window closed; exiting");
         vk_pipeline_save();
+        prof_write();   // ExitProcess runs no atexit handlers
         ExitProcess(0);
     case WM_ERASEBKGND:
         return 1;

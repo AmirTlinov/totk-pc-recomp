@@ -28,6 +28,7 @@ void prof_write(void);                          // idempotent; boot.c calls it b
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
+void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
 // first texture uploads and re-uploads after CPU writes, draws skipped while a shader translates in the background,
 // draws that waited for their pending pipeline and got it, draws into a target the previous frame did not render that
@@ -41,6 +42,16 @@ enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_RE
 void perf_count(int kind);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
+void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
+void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
+// GPU side of the 60-frame perf line, filled by the graphics back end when it set perf_gpu_stats. gpu_ns: GPU busy time
+// since the previous call (timestamp queries, overlaps counted once), have_gpu 0 when the device has no timestamps.
+typedef struct {
+    int have_gpu, have_vram, vram_exact;
+    uint64_t gpu_ns, gpu_parts, gpu_missed;     // busy time, submission parts timed, parts left untimed
+    uint64_t vram_used, vram_budget;
+} PerfGpu;
+extern void (*perf_gpu_stats)(PerfGpu *out);
 #define RT_RESULT(module, desc) ((uint32_t)(module) | ((uint32_t)(desc) << 9))
 void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if the provider fails
 
@@ -119,6 +130,18 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
                                                            // past max stays reported next time). The range must lie
                                                            // inside the stack/heap block or the alias region
                                                            // (write watch); otherwise returns UINT64_MAX
+uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
+                                                           // the same without the reset: the bits stay for the next
+                                                           // mem_written_pages (verify checks only)
+int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
+                                                           // committed PAGE_READWRITE) read-only until a write or
+                                                           // mem_thaw thaws it; 1 frozen (or already), 0 refused
+int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
+                                                           // since its freeze
+void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
+                                                           // before a kernel write (file read) into guest memory
+void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
+                                                           // regions frozen now; freezes and thaws since the last call
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
 
 // ---- modules (loader.c, T1)
@@ -155,6 +178,14 @@ void kern_core_back(int *away);
 void kern_checkpoint(void);                                // preemption point, at every SVC and indirect call
 // A preempt request is pending for the thread (Cpu.thread): its RtThread starts with the flag (kernel.c).
 static inline int kern_preempt_pending(const void *thread) { return __atomic_load_n((const int *)thread, __ATOMIC_RELAXED); }
+// Set once before guest threads start (TOTK_CORE_DIAG, TOTK_ASYNC_PREEMPT): host calls (hostfn.c) and SVCs (svc.c) count their depth in
+// the thread's second int, so the kernel knows whether a core owner runs game code at the top level.
+extern int kern_host_track;
+static inline int *kern_host_depth(void *thread) { return (int *)thread + 1; }
+void kern_host_left(void *thread);                         // back at depth 0 with a preempt request pending
+int kern_core_diag_on(void);                               // TOTK_CORE_DIAG
+void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_present, every present (also logs the
+                                                           // asynchronous preemption counters)
 void kern_sched_report(uint64_t frame);                    // TOTK_TRACE=sched: per-thread time split, on present
 uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION or KERN_TMEM (ipc.c)
 void *kern_handle_get(uint32_t h, int kind);
@@ -218,7 +249,7 @@ int probe_vkdevice(void);                                 // M4 T2: vk_device.c
 int probe_nvn(void), probe_nvn_tex(void);                  // M4 T3: nvn_probe.c
 int probe_window(void);                                    // M4 T2
 int probe_shader(void);                                    // M4 T4
-int probe_vkmem(void), probe_vkexec(void);                 // M4 T5, T6
+int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // M4 T5, T6
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 // gfx_stubs.c defines each of these weakly: prints "probe-x: not built yet", returns 2.
