@@ -249,7 +249,7 @@ def diff_table(cand, base, cand_results, base_results):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('build', type=Path)
-    ap.add_argument('--base', type=Path, help='frozen build to compare with (build/v121-m4)')
+    ap.add_argument('--base', type=Path, help='frozen build to compare with (e.g. build/v121-base)')
     ap.add_argument('--routes', default='fight,rock,island,field')
     ap.add_argument('--repeat', type=int, default=1)
     ap.add_argument('--cold', action='store_true', help='empty pipeline cache and key file')

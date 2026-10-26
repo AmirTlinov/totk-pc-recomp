@@ -5,7 +5,7 @@
 // nn::swkbd::ShowKeyboard: text entry for the game. On the Switch the call starts the keyboard library applet, which
 // takes the screen until the player confirms or cancels. TotK calls it in one place, naming a horse at a stable
 // (main+0x1ecbf64 -> main+0x1b2b3a0: UserName preset, at most 9 characters, '@' '%' '\' disabled, UTF-16 out, no
-// header, guide or initial text; an empty answer counts as not named). See build/v121-swkbd/NOTES.md.
+// header, guide or initial text; an empty answer counts as not named).
 //
 // Front end: a modal Win32 window owned by the game window, run on the guest thread that called (the call blocks, as
 // on the Switch). The thread gives its virtual core up meanwhile, so the other guest threads keep running; it holds no
