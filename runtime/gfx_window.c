@@ -45,6 +45,7 @@ static volatile LONG g_focused = 1;
 static volatile LONG g_focus_msgs;
 static CRITICAL_SECTION g_start_lock;       // gfx_window_start / vsync start
 static int g_started, g_wnd_failed;
+static int g_background;                   // TOTK_BACKGROUND_WINDOW: the window stays behind the user's windows
 
 // ---- swapchain and present state (g_pl)
 static CRITICAL_SECTION g_pl;
@@ -199,7 +200,8 @@ static void cfg_window_size(int *w, int *h) {
 }
 
 // F11: borderless window over the whole monitor, and back to the saved window. The swapchain follows through WM_SIZE.
-// Not Alt+Enter: Enter is the Plus button (input_win.c).
+// Not Alt+Enter: Enter is the Plus button (input_win.c). A background window (test runs) keeps its place behind the
+// user's windows and takes no focus.
 static void toggle_fullscreen(HWND h) {
     LONG style = GetWindowLongW(h, GWL_STYLE);
     if (style & WS_OVERLAPPEDWINDOW) {
@@ -208,11 +210,15 @@ static void toggle_fullscreen(HWND h) {
             return;
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED | (g_background ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
     } else {
         SetWindowLongW(h, GWL_STYLE, (style & ~WS_POPUP) | WND_STYLE);
+        if (g_background) g_saved_place.showCmd = SW_SHOWNOACTIVATE;
         SetWindowPlacement(h, &g_saved_place);
-        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
+                         (g_background ? SWP_NOACTIVATE : 0));
     }
 }
 
@@ -282,6 +288,14 @@ void gfx_window_request_close(void) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
+int gfx_window_monitor_size(int *w, int *h) {
+    MONITORINFO mi = {sizeof mi};
+    if (!g_hwnd || !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return 0;
+    *w = mi.rcMonitor.right - mi.rcMonitor.left;
+    *h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    return 1;
+}
+
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     LRESULT input_res;
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
@@ -335,7 +349,7 @@ static DWORD WINAPI window_main(void *arg) {
     AdjustWindowRect(&r, WND_STYLE, FALSE);
     // TOTK_BACKGROUND_WINDOW=1 (test runs): the window opens behind the user's windows without taking focus; it keeps its
     // taskbar button and can be brought up by hand. It never goes fullscreen at start.
-    int background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
+    int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT,
                              r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!g_hwnd) {
@@ -369,8 +383,15 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd, g_surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
-    return VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR got = VK_PRESENT_MODE_FIFO_KHR;
+    for (uint32_t i = 0; i < n; i++) if (m[i] == want) got = want;
+    static int logged = -1;   // the mode last logged: a change from the menu shows in the log
+    if ((int)got != logged) {
+        logged = (int)got;
+        rt_log("gfx: present mode %s (TOTK_VK_PRESENT=%s)",
+               got == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : got == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo", e);
+    }
+    return got;
 }
 
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it

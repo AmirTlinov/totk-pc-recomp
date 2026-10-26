@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 #include "platform.h"
@@ -305,6 +306,28 @@ const char *plat_ui_language(void) {
         done = 1;
     }
     return tag;
+}
+
+int plat_font_path(const char *lang, char *out, size_t cap) {
+    static const struct { const char *lang; const wchar_t *files[3]; } fonts[] = {
+        {"ja", {L"YuGothM.ttc", L"meiryo.ttc", L"msgothic.ttc"}},
+        {"ko", {L"malgun.ttf", L"gulim.ttc", NULL}},
+        {"zh-Hans", {L"msyh.ttc", L"simsun.ttc", NULL}},
+        {"zh-Hant", {L"msjh.ttc", L"mingliu.ttc", NULL}},
+    };
+    wchar_t dir[MAX_PATH], w[WPATH];
+    UINT n = GetWindowsDirectoryW(dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return 0;
+    for (size_t i = 0; i < sizeof fonts / sizeof *fonts; i++) {
+        if (strcmp(fonts[i].lang, lang)) continue;
+        for (int k = 0; k < 3 && fonts[i].files[k]; k++) {
+            swprintf(w, WPATH, L"%ls\\Fonts\\%ls", dir, fonts[i].files[k]);
+            DWORD a = GetFileAttributesW(w);
+            if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY))
+                return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) != 0;
+        }
+    }
+    return 0;
 }
 
 // ---- child processes

@@ -32,8 +32,8 @@ static ImGuiKey key_of(WPARAM vk) {
     case VK_NEXT: return ImGuiKey_PageDown;
     case VK_SHIFT: return ImGuiKey_LeftShift;
     case VK_CONTROL: return ImGuiKey_LeftCtrl;
-    case 'Q': return ImGuiKey_Q;   // previous page (later)
-    case 'E': return ImGuiKey_E;   // next page (later)
+    case 'Q': return ImGuiKey_Q;   // previous tab
+    case 'E': return ImGuiKey_E;   // next tab
     default: return ImGuiKey_None;
     }
 }

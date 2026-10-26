@@ -69,6 +69,9 @@ size_t plat_getenv(const char *name, char *out, size_t cap);
 // The user's UI language as a BCP-47 tag ("ru-RU", "en-US"); "" when the system gives none. Valid for the process.
 const char *plat_ui_language(void);
 uint32_t plat_thread_id(void);                            // id of the calling thread, for unique file names
+// A system font file with the glyphs of a catalog language ("ja", "ko", "zh-Hans", "zh-Hant"): the menu shows each
+// language's name in its own script. Copies the UTF-8 path into out; 0 when the system has none.
+int plat_font_path(const char *lang, char *out, size_t cap);
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;
