@@ -16,6 +16,7 @@
 #include "input.h"
 #include "input_map.h"
 #include "nvn_api.h"
+#include "ui/menu.h"
 #include "vk.h"
 
 enum { STICK_MAX = 32767, STICK_DEAD = 2500, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
@@ -192,6 +193,7 @@ static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's appli
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
 static volatile LONG g_block;              // text entry state, see input_block
+static volatile LONG g_menu;               // in-game menu state, see input_menu
 static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off; live (cfg_version)
 static unsigned mouse_sens_seen;
 
@@ -208,12 +210,12 @@ static float mouse_sens_get(void) {
 }
 
 // Hide the cursor and confine it to the client area while the window is focused, not suspended, not behind a text entry
-// and the mouse camera is on; release it otherwise. Safe from any thread.
+// or the menu, and the mouse camera is on; release it otherwise. Safe from any thread.
 static void cursor_update(HWND h) {
     const char *in = cfg_get("TOTK_INPUT");
     AcquireSRWLockExclusive(&cur_lock);
-    int want = h && cur_active && !cur_suspend && g_block != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) &&
-               GetForegroundWindow() == h && !IsIconic(h);
+    int want = h && cur_active && !cur_suspend && g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 &&
+               !(in && !strcmp(in, "none")) && GetForegroundWindow() == h && !IsIconic(h);
     RECT r;
     POINT tl = {0, 0};
     if (want && GetClientRect(h, &r) && ClientToScreen(h, &tl)) {
@@ -350,26 +352,30 @@ static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     if (b > a) { *x = kx; *y = ky; }
 }
 
+// Under lock, state 1: the open gamepad's buttons (Switch bits) and sticks; 0 without a connected gamepad.
+static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+    if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
+    SDL_UpdateGamepads();
+    if (!pad || !SDL_GamepadConnected(pad)) return 0;
+    for (size_t i = 0; i < sizeof pad_buttons / sizeof *pad_buttons; i++)
+        if (SDL_GetGamepadButton(pad, pad_buttons[i].sdl)) *b |= 1ull << pad_buttons[i].bit;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) *b |= 1ull << B_ZL;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) *b |= 1ull << B_ZR;
+    sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
+    sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
+    sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
+    sr[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+    return 1;
+}
+
 static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (state > 0) {
-        if (state == 1) {
-            if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
-            SDL_UpdateGamepads();
-            if (pad && SDL_GamepadConnected(pad)) {
-                for (size_t i = 0; i < sizeof pad_buttons / sizeof *pad_buttons; i++)
-                    if (SDL_GetGamepadButton(pad, pad_buttons[i].sdl)) b |= 1ull << pad_buttons[i].bit;
-                if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON) b |= 1ull << B_ZL;
-                if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON) b |= 1ull << B_ZR;
-                sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
-                sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
-                sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
-                sr[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
-            }
-        }
+        if (state == 1 && pad_read(&b, sl, sr))   // Minus and Plus held together on the gamepad open or close the menu
+            menu_pad_combo((b >> B_MINUS & 1) && (b >> B_PLUS & 1));
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
             uint8_t down[KEY_COUNT] = {0};
@@ -413,15 +419,41 @@ void input_block(int on) {
     cursor_update(gfx_window_handle());
 }
 
+// The in-game menu (ui/menu.cpp) blocks the game's input the same way: g_menu 0 closed, 1 open, 2 closed, waiting for
+// the release. The cursor is released while it is open, for the menu's mouse.
+void input_menu(int open) {
+    InterlockedExchange(&g_menu, open ? 1 : 2);
+    cursor_update(gfx_window_handle());
+}
+
+// 1 while flag (g_block, g_menu) blocks the game's input; state 2 ends at the first poll with nothing held.
+static int blocked(volatile LONG *flag, uint64_t buttons) {
+    LONG k = *flag;
+    return k && !(k == 2 && !buttons && InterlockedCompareExchange(flag, 0, 2) == 2);
+}
+
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
-    LONG k = g_block;
-    if (!k || (k == 2 && !*buttons && InterlockedCompareExchange(&g_block, 0, 2) == 2)) return;
+    int text = blocked(&g_block, *buttons), menu = blocked(&g_menu, *buttons);
+    if (!text && !menu) return;
     *buttons = 0; *lx = *ly = *rx = *ry = 0;
 }
 
 void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
+}
+
+int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    uint64_t b = 0;
+    int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
+    AcquireSRWLockExclusive(&lock);
+    if (!state) start();
+    int ok = state == 1 && pad_read(&b, sl, sr);
+    ReleaseSRWLockExclusive(&lock);
+    *buttons = b;
+    *lx = sl[0];
+    *ly = sl[1];
+    return ok;
 }
 
 uint16_t rumble_motor(float a, float curve, float strength) {

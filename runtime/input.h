@@ -13,12 +13,20 @@ void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_
 // reports nothing; input_block(0) when it closes: nothing until all buttons and stick directions are released.
 void input_poll_ui(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
 void input_block(int on);
+// The in-game menu (ui/menu.h): input_menu(1) when it opens (input_poll reports nothing, the cursor is released), (0) when
+// it closes (nothing until every button and stick direction is released). Independent of input_block.
+void input_menu(int open);
+// The gamepad alone, for the menu: Switch button bits and the left stick (up +y). 0 without a connected gamepad.
+int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly);
 
 // Mouse camera and cursor (input_win.c, Win32 window thread). The window procedure calls input_window_msg first for raw
 // mouse input, cursor hiding and confinement; it returns 1 with *res set when the message is handled. input_cursor_suspend(1)
 // releases the cursor around an F11 window change, (0) captures it again once the client area has its new size.
 #ifdef _WIN32
 int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
+// The menu's Win32 adapter (ui/menu_win.cpp), called next: F1 / Esc open or close the menu; while it is open, keys,
+// mouse and focus go to it. Returns 1 with *res set when the message is fully handled.
+int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
 #endif
 void input_cursor_suspend(int on);
 

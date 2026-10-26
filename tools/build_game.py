@@ -139,9 +139,9 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 
 def runtime_sources(skip=()):
-    """Every runtime/*.c and runtime/platform/*.c except the names in skip, so a task adds a file without editing this
-    script."""
-    pats = ('*.c', '*.cpp', 'platform/*.c')
+    """Every runtime/*.c, *.cpp, platform/*.c, the in-game menu (ui/*.cpp) and Dear ImGui except the names in skip, so
+    a task adds a file without editing this script."""
+    pats = ('*.c', '*.cpp', 'platform/*.c', 'ui/*.cpp', 'third_party/imgui/*.cpp', 'third_party/imgui/backends/*.cpp')
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip)
 
 
@@ -186,7 +186,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False):
     """build.ninja text, and the object lists per module. With prebuilt the generated objects already exist in
     out/obj and are link inputs without a compile edge."""
     inc = f'-I {flag_path(RUNTIME)} -I {flag_path(gen)}'
-    rt_inc = f'{inc} -I {flag_path(out)} -I {flag_path(VMA_INCLUDE)}'   # romfs_config.h, vk_mem_alloc.h
+    # romfs_config.h, vk_mem_alloc.h, imgui.h
+    rt_inc = f'{inc} -I {flag_path(out)} -I {flag_path(VMA_INCLUDE)} -I {flag_path(RUNTIME / "third_party" / "imgui")}'
     lines = [
         '# Written by tools/build_game.py; do not edit.',
         'ninja_required_version = 1.10',
