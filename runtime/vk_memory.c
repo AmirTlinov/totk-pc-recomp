@@ -728,9 +728,15 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     }
     int untracked = 0, changed = 0;
     for (uint64_t r = r0; r <= r1; r++) untracked |= snap_untracked[r];
-    for (uint64_t a = lo; !untracked && a < hi && !changed; a += 1ull << GEN_PAGE_SHIFT) {
-        uint32_t *s = gen_slot(a, 0);
-        if (s && *s > since) changed = 1;
+    // Pages only in regions stamped after since (reg_max; REG_SHIFT is SNAP_SHIFT): an unchanged texture of 4 MiB was
+    // 1,024 page reads, at about 1,100 texture checks a frame.
+    for (uint64_t r = r0; !untracked && r <= r1 && !changed; r++) {
+        if (reg_max[r] <= since) continue;
+        uint64_t a = r << REG_SHIFT > lo ? r << REG_SHIFT : lo, b = (r + 1) << REG_SHIFT < hi ? (r + 1) << REG_SHIFT : hi;
+        for (; a < b && !changed; a += 1ull << GEN_PAGE_SHIFT) {
+            uint32_t *s = gen_slot(a, 0);
+            if (s && *s > since) changed = 1;
+        }
     }
     *now = gen_now;   // every observation so far is in the table
     __atomic_add_fetch(&n_snap_checks, 1, __ATOMIC_RELAXED);
