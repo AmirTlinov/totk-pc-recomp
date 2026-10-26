@@ -340,7 +340,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static DWORD WINAPI window_main(void *arg) {
     (void)arg;
     HINSTANCE inst = GetModuleHandleW(NULL);
+    // Icon resource 1 of totk.rc (runtime/totk.ico): the title bar, the taskbar button and Alt+Tab.
     WNDCLASSEXW wc = {.cbSize = sizeof wc, .lpfnWndProc = wnd_proc, .hInstance = inst,
+                      .hIcon = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                          GetSystemMetrics(SM_CYICON), LR_SHARED),
+                      .hIconSm = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                            GetSystemMetrics(SM_CYSMICON), LR_SHARED),
                       .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
     RegisterClassExW(&wc);
     int cw, ch;

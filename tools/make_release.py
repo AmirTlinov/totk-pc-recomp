@@ -97,7 +97,7 @@ LLVM_SKIP_SUFFIXES = {'.idl', '.tlb'}
 TOOLS_FILES = ['build_game.py', 'check_content.py', 'extract.py', 'make_romfs_patches.py', 'prepare_shaders.py',
                'romfs_index.py', 'shader_census.py']
 TOOLS_DIRS = ['vendor/macnativegames', 'data']   # data/: expected hashes
-RUNTIME_SUFFIXES = {'.h', '.inc'}
+RUNTIME_SUFFIXES = {'.h', '.inc', '.ico'}   # .ico: the installer window icon
 
 PROBES = ['--probe-kernel', '--probe-vkexec', '--probe-nvn-tex', '--probe-shader']
 
@@ -393,8 +393,12 @@ def launcher_header(path):
 def build_launcher(out, llvm):
     work = MAIN_ROOT / 'build' / 'release-check' / 'launcher'
     launcher_header(work / 'launcher_text.h')
+    env = clean_env(llvm / 'bin')
+    res = work / 'launcher_rc.o'
+    run([llvm / 'bin' / 'llvm-windres.exe', '-I', ROOT / 'runtime', '-O', 'coff',
+         ROOT / 'installer' / 'launcher' / 'launcher.rc', '-o', res], env=env)
     run([llvm / 'bin' / 'clang.exe', '-O2', '-mwindows', '-Wall', '-Wl,-s', '-I', work,
-         ROOT / 'installer' / 'launcher' / 'launcher.c', '-o', out / 'TotK-Setup.exe'], env=clean_env(llvm / 'bin'))
+         ROOT / 'installer' / 'launcher' / 'launcher.c', res, '-o', out / 'TotK-Setup.exe'], env=env)
 
 
 # ---- checks ----------------------------------------------------------------------------------------------------------

@@ -56,6 +56,9 @@ class App:
         self.screen = None
 
         root.title(self.cat('ui.title'))
+        icon = layout.runtime / 'totk.ico'
+        if os.name == 'nt' and icon.is_file():
+            root.iconbitmap(default=str(icon))
         root.minsize(680, 560)
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         style = ttk.Style(root)
