@@ -16,6 +16,13 @@
 // snapshots one GPU buffer range after every logged pass (buf_<pass>.bin and bufs.txt, see buf_snap).
 // PNGs are opaque (alpha dropped). Integer formats are scaled by the image maximum, depth by its min..max range, SNORM
 // as x/2+1/2, UNORM and sRGB bytes written as stored. Caps: MAX_PASSES passes copied, PNG_CAP bytes of PNGs.
+// TOTK_DUMP_TEX=<id>|<w>x<h>[,...]: those texture slots, or 2D textures of that size, are copied where first sampled,
+// whatever their format.
+// TOTK_DUMP_UBO=1: each listed pipeline also prints the first 16 vec4 of its user uniform blocks (c3 and up), read from
+// guest memory when the entry is listed. A block the submission rewrites with UpdateUniformBuffer shows its value from
+// before the submission (vk_exec_draw.c upd_note).
+// TOTK_DUMP_SKIP_RUNS=1: a render pass with the same targets as the render pass before it is logged but not copied
+// (the terrain decals draw one pass each into the G-buffer and would use up both caps).
 #include <windows.h>
 #include <math.h>
 #include <stdarg.h>
@@ -40,7 +47,12 @@ int vk_dump_armed;
 static uint64_t dump_frame, log_from;   // log_from: TOTK_DUMP_LOG, first frame logged to passes.txt without images
 static char dir[400];
 static FILE *passes_f, *images_f;
-static int seq, finished, dump_base;   // dump_base: first pass number of the dump frame
+static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
+static int skip_runs, dump_ubo;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
+static uint32_t want_tex[16][2];       // TOTK_DUMP_TEX: slot id and 0, or width and height
+static int nwant_tex;
+static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
+static const char *pass_skip;          // why the current pass copies nothing, or NULL
 static volatile LONG64 png_bytes, inflight;
 static SRWLOCK rec_lock = SRWLOCK_INIT, img_lock = SRWLOCK_INIT;
 
@@ -556,6 +568,23 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             sp(b, "\n");
             continue;
         }
+        if (r && bd->kind == GFX_RES_UBO && dump_ubo && r->slot >= 3 && r->slot - 3 < 18) {
+            int st = nvn_stage(bd->stage);
+            const p_bind_buf *u = &ex->ubo[st][r->slot - 3];
+            VkMemSpan ms;
+            sp(b, "    %s ubo c%d addr %#llx size %#llx", stn[st], r->slot, (unsigned long long)u->addr, (unsigned long long)u->size);
+            if (u->addr && vk_mem_resolve(u->addr, 1, &ms)) {
+                uint64_t n = u->size && u->size < ms.avail ? u->size : ms.avail;
+                const float *f = (const float *)(uintptr_t)u->addr;
+                for (uint64_t k = 0; k < 16 && (k + 1) * 16 <= n; k++)
+                    sp(b, "%s[%llu] %g %g %g %g", k % 4 ? " " : "\n      ", (unsigned long long)k, f[4 * k], f[4 * k + 1],
+                       f[4 * k + 2], f[4 * k + 3]);
+            } else {
+                sp(b, " (not mapped)");
+            }
+            sp(b, "\n");
+            continue;
+        }
         if (!r || (bd->kind != GFX_RES_TEX && bd->kind != GFX_RES_IMG)) continue;
         int st = nvn_stage(bd->stage), img = bd->kind == GFX_RES_IMG;
         char dt[24], fn[16];
@@ -607,7 +636,12 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                ssw[3]);
             if (hv && v.set_swizzle) sp(b, " view %u%u%u%u", v.swz[0], v.swz[1], v.swz[2], v.swz[3]);
             sp(b, "\n");
+            int wanted = 0;
+            for (int k = 0; k < nwant_tex; k++)
+                wanted |= want_tex[k][1] ? want_tex[k][0] == t->width && want_tex[k][1] == t->height
+                                         : want_tex[k][0] == (uint32_t)NVN_HANDLE_TEX(h);
             if (t->type == VK_IMAGE_TYPE_3D) queue_lut(t, NVN_HANDLE_TEX(h));
+            else if (wanted && t->type == VK_IMAGE_TYPE_2D && t->samples == 1) queue_lut(t, NVN_HANDLE_TEX(h));
             else if (!img && t->type == VK_IMAGE_TYPE_2D && t->samples == 1 && (uint64_t)t->width * t->height <= TEX2D_CAP &&
                      (t->format == VK_FORMAT_R8_UNORM || t->format == VK_FORMAT_R8G8_UNORM ||
                       t->format == VK_FORMAT_R8G8B8A8_UNORM || t->format == VK_FORMAT_R8G8B8A8_SRGB ||
@@ -668,7 +702,8 @@ static void target_line(VkExec *ex, const VkExecTarget *t, const char *tag, int 
     // a block view: the plane's blocks, read as the view format (one texel per block)
     uint32_t tw = t->tex->d.width >> t->level ? t->tex->d.width >> t->level : 1;
     uint32_t th = t->tex->d.height >> t->level ? t->tex->d.height >> t->level : 1;
-    const char *why = n - dump_base >= MAX_PASSES ? "pass cap" : t->samples > 1 ? "multisampled" :
+    (void)n;
+    const char *why = pass_skip ? pass_skip : t->samples > 1 ? "multisampled" :
                       t->blocks ? copy_region(ex, t->image, t->format, t->aspect, t->level, t->is3d ? 0 : t->base_layer,
                                               t->is3d ? t->base_layer : 0, (VkExtent3D){tw, th, 1}, t->width,
                                               t->height, 1, name) :
@@ -680,11 +715,30 @@ static void target_line(VkExec *ex, const VkExecTarget *t, const char *tag, int 
             why ? why : "");
 }
 
+static uint64_t targets_sig(const VkExec *ex) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 9; i++) {
+        const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
+        uint64_t v[3] = {(uint64_t)(uintptr_t)t->image, t->level, t->base_layer};
+        for (int k = 0; k < 3; k++) h = (h ^ v[k]) * 1099511628211ull;
+    }
+    return h;
+}
+
+// Sets pass_skip for the pass or dispatch being logged and counts it when it copies.
+static void pass_decide(int same_targets) {
+    if (frame_now() != dump_frame) copied = 0;
+    pass_skip = copied >= MAX_PASSES ? "pass cap" : same_targets ? "same targets as the previous pass" : NULL;
+    if (!pass_skip) copied++;
+}
+
 void vk_dump_pass_end(VkExec *ex) {
     AcquireSRWLockExclusive(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
-    if (frame_now() != dump_frame) dump_base = seq;
+    uint64_t sig = targets_sig(ex);
+    pass_decide(skip_runs && sig == last_targets);
+    last_targets = sig;
     fprintf(passes_f, "pass %04d: render pass, draws %d, area %ux%u layers %u, fence %llu, frame %llu\n", n, pass_draws,
             ex->pass_w, ex->pass_h, ex->pass_layers, (unsigned long long)ex->fence, (unsigned long long)frame_now());
     for (int i = 0; i < 8; i++) {
@@ -699,7 +753,7 @@ void vk_dump_pass_end(VkExec *ex) {
         free(ents[i].text);
     }
     if (ents_over) fprintf(passes_f, "  ... %d more draws with other pipeline/texture sets\n", ents_over);
-    if (n - dump_base < MAX_PASSES) flush_luts(ex, n);
+    if (!pass_skip) flush_luts(ex, n);
     else nluts = 0;
     buf_snap(ex, n);
     fflush(passes_f);
@@ -713,14 +767,15 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     AcquireSRWLockExclusive(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
-    if (frame_now() != dump_frame) dump_base = seq;
+    pass_decide(0);
+    last_targets = 0;
     Str b = {0};
     describe_bindings(&b, ex, info);
     fprintf(passes_f, "pass %04d: dispatch %dx%dx%d cs %016llx prog %llu caller %#llx, fence %llu\n%s", n, d->x, d->y,
             d->z, (unsigned long long)shader_hash(cs), (unsigned long long)(ex->prog ? ex->prog->serial : 0),
             (unsigned long long)d->caller, (unsigned long long)ex->fence, b.s ? b.s : "");
     free(b.s);
-    for (uint32_t i = 0; i < info->n_bindings && n - dump_base < MAX_PASSES; i++) {   // storage images the dispatch writes
+    for (uint32_t i = 0; i < info->n_bindings && !pass_skip; i++) {   // storage images the dispatch writes
         const VkPipeBinding *bd = &info->bindings[i];
         if (!bd->res || bd->kind != GFX_RES_IMG || !(bd->res->flags & 4) || bd->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
             continue;
@@ -745,7 +800,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
         fprintf(passes_f, "  writes img slot %d level %u layer %u depth %u -> %s.png%s%s\n", bd->res->slot, lv, layer,
                 dd, name, why ? " skipped: " : "", why ? why : "");
     }
-    if (n - dump_base < MAX_PASSES) flush_luts(ex, n);
+    if (!pass_skip) flush_luts(ex, n);
     else nluts = 0;
     buf_snap(ex, n);
     fflush(passes_f);
@@ -821,6 +876,16 @@ void vk_dump_init(void) {
     if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("TOTK_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
+    const char *sr = cfg_get("TOTK_DUMP_SKIP_RUNS");
+    skip_runs = sr && *sr && *sr != '0';
+    const char *du = cfg_get("TOTK_DUMP_UBO");
+    dump_ubo = du && *du && *du != '0';
+    const char *wt = cfg_get("TOTK_DUMP_TEX");
+    for (char *q = (char *)wt; q && *q && nwant_tex < 16; q += *q == ',') {
+        uint32_t *w = want_tex[nwant_tex++];
+        w[0] = (uint32_t)strtoul(q, &q, 10);
+        w[1] = *q == 'x' ? (uint32_t)strtoul(q + 1, &q, 10) : 0;
+    }
     const char *d = cfg_get("TOTK_DUMP_DIR");
     snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
     make_dirs(dir);
