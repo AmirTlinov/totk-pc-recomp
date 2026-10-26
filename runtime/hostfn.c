@@ -108,6 +108,18 @@ __attribute__((noinline, noreturn, cold)) static void bad_entry(Cpu *c) {
              ldr_describe(c->x[30], lr, sizeof lr));
 }
 
+// kern_host_track: the call counted in the thread's host depth. Not a tail call, so the host stack holds this frame
+// while fn runs; longjmp out of fn (ExitThread) leaves the depth raised on a thread that ends.
+__attribute__((noinline)) static void hostfn_tracked(Cpu *c, GuestFn fn) {
+    void *t = c->thread;
+    int *d = kern_host_depth(t);
+    __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
+    fn(c);
+    int n = *d - 1;
+    __atomic_store_n(d, n, __ATOMIC_RELAXED);
+    if (!n && kern_preempt_pending(t)) kern_host_left(t);
+}
+
 static void hostfn_entry(Cpu *c) {
     uint64_t i = (c->pc - RT_HOSTFN_BASE) >> 4;
     if (__builtin_expect((c->pc & 15) || i >= (uint64_t)nslots, 0)) bad_entry(c);
@@ -116,6 +128,10 @@ static void hostfn_entry(Cpu *c) {
     if (__builtin_expect(!n && (rt_trace & RT_TRACE_HOSTCALL), 0)) {
         char lr[96];
         rt_log("host call %s from %s", s->name, ldr_describe(c->x[30] - 4, lr, sizeof lr));
+    }
+    if (__builtin_expect(kern_host_track && c->thread, 0)) {
+        hostfn_tracked(c, s->fn);
+        return;
     }
     __attribute__((musttail)) return s->fn(c);
 }

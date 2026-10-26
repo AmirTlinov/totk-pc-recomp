@@ -55,6 +55,13 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 
 - Three virtual cores. A guest thread runs guest code only while it holds a core; the others wait in a priority-ordered list.
 - Preemption. When a waiting thread has a better priority than a holder on a core it may use, exactly one holder is flagged. The holder checks the flag at its next SVC and at every indirect call (`rt_dispatch`: two loads when nobody waits), checks again under the kernel lock that a better thread still waits, and only then hands its core over. The indirect-call check comes from SavageWindRecomp's BotW port; checking only at SVCs left a better thread waiting up to 26 ms.
+- Asynchronous preemption (from MacNativeGames 8bf0893, on unless `TOTK_ASYNC_PREEMPT=0`). Game code can run for
+  milliseconds with neither (`TOTK_CORE_DIAG=1` measures it): a waiter that has spun 250 us suspends the holder and,
+  if its host rip is in lifted code at host depth 0 (not inside a host call or SVC), moves it to `kern_ap_stub`, which
+  saves the volatile registers and gives the core up there. A holder of a guest mutex counts at the priority of its
+  best waiter, and one inside an SDK spin lock (TLR+0x100 `disable_count`) is not preempted: its interrupt flag is set
+  and the switch happens at SVC 0x36. `TOTK_ASYNC_PREEMPT=2` keeps those two without interrupting. The interruption is
+  Win32 (SuspendThread, SetThreadContext); another host needs a signal handler there, as MacNativeGames has.
 - Host work gives the core back. Queue submits, presents, GPU waits and shader translation run without a core (`NVN_BLOCKING`, `kern_core_away`), so a thread blocked in the driver does not hold up guest threads.
 - `TOTK_FREE_CORES=1` turns the gate off, for experiments.
 

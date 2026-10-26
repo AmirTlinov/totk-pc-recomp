@@ -138,8 +138,24 @@ static void get_info(Cpu *c, uint64_t pc) {
     c->x[1] = v;
 }
 
+static void svc_body(Cpu *c, uint32_t imm, uint64_t pc);
+
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     kern_checkpoint();
+    if (__builtin_expect(!kern_host_track || !c->thread, 1)) {
+        svc_body(c, imm, pc);
+        return;
+    }
+    void *t = c->thread;   // kern_host_track: the SVC counted in the thread's host depth (hostfn.c hostfn_tracked)
+    int *d = kern_host_depth(t);
+    __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
+    svc_body(c, imm, pc);
+    int n = *d - 1;
+    __atomic_store_n(d, n, __ATOMIC_RELAXED);
+    if (!n && kern_preempt_pending(t)) kern_host_left(t);
+}
+
+static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
     __atomic_fetch_add(&g_svcs, 1, __ATOMIC_RELAXED);
     if (rt_trace & RT_TRACE_SVC) {
         char at[160];
