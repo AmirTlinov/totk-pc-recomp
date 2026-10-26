@@ -23,7 +23,7 @@ To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md)
 ## Features
 
 - Native code, not emulation: the 1.2.1 `main`, `sdk` and `subsdk0` modules are compiled into `totk.exe`.
-- 60 fps with the game running at real-time speed, using MacNativeGames' frame-rate patches (`TOTK_FPS60=0` and `TOTK_REALTIME=0` switch them off).
+- 60 fps with the game running at real-time speed, using MacNativeGames' frame-rate patches; `TOTK_FPS_LIMIT` sets the limit (30, 60, 120, 144 or `display`; above 60 is experimental) and `TOTK_REALTIME=0` switches the real-time step off.
 - Keyboard, mouse and the first gamepad, merged into one controller, with the mouse on the camera and every button remappable: [docs/controls.md](docs/controls.md).
 - Rumble with adjustable strength, and motion controls on gamepads that have a gyro.
 - Sound through the game's own audio renderer, including voice.
@@ -113,7 +113,7 @@ From the repository root, in PowerShell:
 
 `build\v121\totk.exe --selftest` checks the build without game files.
 
-Settings live in `totk.ini` next to `totk.exe`; copy [totk.ini.example](totk.ini.example), which lists them, and edit it. A `TOTK_*` environment variable of the same name overrides the file (`TOTK_FPS60=0` beats `fps60 = 1`). Saves go to `build\profile`, created on first use. Everything the build writes stays under `build\` and `generated\`, which git ignores.
+Settings live in `totk.ini` next to `totk.exe`; copy [totk.ini.example](totk.ini.example), which lists them, and edit it. A `TOTK_*` environment variable of the same name overrides the file (`TOTK_FPS_LIMIT=30` beats `fps_limit = 60`). Saves go to `build\profile`, created on first use. Everything the build writes stays under `build\` and `generated\`, which git ignores.
 
 ## Contributing
 

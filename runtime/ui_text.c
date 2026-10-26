@@ -48,8 +48,12 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     // printf formats of the overlay line: frame rate; frame rate, mean and longest frame time in ms
     [UI_PERF_LINE_FPS] = "%.0f fps", [UI_PERF_LINE_FULL] = "%.0f fps   %.1f ms   max %.1f ms",
 
-    [UI_MENU_FPS60] = "Frame rate", [UI_MENU_FPS60_DESC] = "Runs the game at 60 frames per second instead of 30.",
-    [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_30] = "30 FPS",
+    [UI_MENU_FPS_LIMIT] = "Frame rate limit",
+    [UI_MENU_FPS_LIMIT_DESC] = "The most frames per second the game draws. Above 60 is experimental and needs Game speed "
+                               "follows the clock.",
+    [UI_MENU_FPS_30] = "30 FPS", [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
+    // the monitor's refresh rate; printf format with the rate in Hz when it is known
+    [UI_MENU_FPS_DISPLAY] = "Monitor rate", [UI_MENU_FPS_DISPLAY_HZ] = "Monitor rate (%.0f Hz)",
     [UI_MENU_REALTIME] = "Game speed follows the clock",
     [UI_MENU_REALTIME_DESC] = "Steps the game by real time, so a slow frame does not slow the game down.",
     [UI_MENU_CLOTH_REALTIME] = "Cloth on the clock",
@@ -184,8 +188,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_PERF_OFF] = "Выкл.", [UI_MENU_PERF_FPS] = "FPS", [UI_MENU_PERF_FULL] = "Полный",
     [UI_PERF_LINE_FPS] = "%.0f к/с", [UI_PERF_LINE_FULL] = "%.0f к/с   %.1f мс   макс. %.1f мс",
 
-    [UI_MENU_FPS60] = "Частота кадров", [UI_MENU_FPS60_DESC] = "Игра идёт в 60 кадров в секунду вместо 30.",
-    [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_30] = "30 FPS",
+    [UI_MENU_FPS_LIMIT] = "Ограничение частоты кадров",
+    [UI_MENU_FPS_LIMIT_DESC] = "Наибольшее число кадров в секунду. Выше 60 — экспериментальный режим, нужна «Скорость "
+                               "игры по часам».",
+    [UI_MENU_FPS_30] = "30 FPS", [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
+    [UI_MENU_FPS_DISPLAY] = "Как у монитора", [UI_MENU_FPS_DISPLAY_HZ] = "Как у монитора (%.0f Гц)",
     [UI_MENU_REALTIME] = "Скорость игры по часам",
     [UI_MENU_REALTIME_DESC] = "Игра идёт по реальному времени, медленный кадр её не замедляет.",
     [UI_MENU_CLOTH_REALTIME] = "Ткань по часам",

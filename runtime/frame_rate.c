@@ -1,7 +1,7 @@
 // Adapted from MacNativeGames games/totk/runtime/game_patches.c @ ebe621d (MIT, Copyright (c) 2026 MacNativeGames
 // contributors): runtime_frame_step_update (2338bb0: no 1/120 s floor) and the speed survey's player chain
 // (world_survey.c player_actor).
-// Frame rate: 60 fps and the real-time frame step, the host half of the patch sets fps60, realtime and cloth
+// Frame rate: the frame limit and the real-time frame step, the host half of the patch sets fps60, realtime and cloth
 // (build tables patches-v121.txt, patches-v143.txt; docs/research/macnativegames.md section 6.2).
 //
 // TotK's adaptive present-interval controller (main+0x8f26c8) turns the main thread's measured work into a number of
@@ -12,11 +12,13 @@
 // instead: +0 ratio = seconds * 30, +4 seconds (1.4.3: +8 interval = seconds * 60, the producer's nominal interval
 // before its half-step coefficient), the moving average of the last 5 display intervals, at most 1/15 s
 // (slower frames slow the game down, as on the console), no lower bound, so a higher frame-rate cap only changes the
-// pacer (nvn_api_obj.c VSYNC_HZ). The set cloth gives hair and cloth the same clock and needs realtime.
+// pacer (frame_step_cap_ns, TOTK_FPS_LIMIT). The set cloth gives hair and cloth the same clock and needs realtime.
 //
 // The sample is the display time the pacer gives each present (nvnQueuePresentTexture), so the step follows the
 // frames as shown, pacing waits included. With the step on, the pacer ignores the game's interval and holds a frame
-// only to the frame-rate cap (nvn_api_obj.c present_period): the controller's 2 or 3 vsyncs would only add latency.
+// only to the frame limit (nvn_api_obj.c present_period): the controller's 2 or 3 vsyncs would only add latency. The
+// vsync event stays at 60 Hz whatever the limit: the game does not wait for it each frame (1.4.3 shows its title at 144
+// fps with the event at 60 Hz).
 // One 64-bit and one 32-bit store per present; the guest reads the floats on its own threads, and each stays finite
 // and in range whichever store it sees.
 //
@@ -31,6 +33,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "gfx.h"
 #include "host.h"
 #include "layout.h"
 #include "platform/platform.h"
@@ -56,6 +59,8 @@ static void step_store(float seconds) {
     atomic_store_explicit(step_interval, iv, memory_order_release);
 }
 
+static void frame_limit_live(void);
+
 void frame_step_init(void) {
     int fps60 = rt_patch_set("fps60"), realtime = rt_patch_set("realtime"), cloth = rt_patch_set("cloth");
     if (realtime < 0) {
@@ -71,32 +76,60 @@ void frame_step_init(void) {
         step_interval = (_Atomic uint32_t *)((uint8_t *)rt_patch_page() + 8);
         step_store((float)STEP_FIRST_S);
     }
-    rt_log("frame rate: present interval %s, %s", rt_patch_enabled(fps60) ? "1..3 (60 fps)" : "2..3 (shipping 30 fps)",
+    frame_limit_live();   // TOTK_FPS_LIMIT decides the set fps60 from the start
+    rt_log("frame rate: present interval %s, %s", rt_patch_enabled(fps60) ? "1..3 (above 30 fps)" : "2..3 (shipping 30 fps)",
            step_word ? "real-time step (5-frame average of display intervals, at most 1/15 s)" : "whole-vsync steps");
 }
 
 int frame_step_realtime(void) { return step_word != NULL; }
 
-// The frame limit (menu: 30 or 60): TOTK_FPS60 switches the set fps60 while the game runs; the controller reads its
-// minimum interval from the patched sites each frame. With the real-time step the pacer holds frames to the cap.
+// The frame limit (menu, TOTK_FPS_LIMIT, live): 30, 60, 120, 144, any whole rate from 30 to 360, or display (the
+// refresh rate of the window's monitor). Unset, the older TOTK_FPS60=0 still means 30. A limit of 30 switches the set
+// fps60 off (the shipping minimum interval 2), every other limit switches it on; the controller reads its minimum
+// interval from the patched sites each frame. With the real-time step the pacer holds frames to the limit; above 60
+// only the pacer changes, as the step has no lower bound. Without it the game steps whole 60 Hz vsyncs and the pacer
+// follows the game's interval, so the limit stops at 60.
+#define LIMIT_MIN_HZ 30
+#define LIMIT_MAX_HZ 360
 static int fps60_set = -2;
-static unsigned fps60_seen;
+static unsigned limit_seen;
+static int limit_read;
+static int limit_hz = -1;   // 0: display; -1 before the first read
+
+static int limit_parse(void) {
+    const char *e = cfg_get("TOTK_FPS_LIMIT"), *old = cfg_get("TOTK_FPS60");
+    if (!e || !*e) return old && !strcmp(old, "0") ? 30 : 60;
+    if (!strcmp(e, "display")) return 0;
+    char *end;
+    long n = strtol(e, &end, 10);
+    if (!*end && n >= LIMIT_MIN_HZ && n <= LIMIT_MAX_HZ) return (int)n;
+    rt_log("frame rate: TOTK_FPS_LIMIT=%s is not 30..360 or display; 60", e);
+    return 60;
+}
 
 static void frame_limit_live(void) {
     unsigned v = cfg_version();
-    if (v == fps60_seen) return;
-    fps60_seen = v;
+    if (limit_read && v == limit_seen) return;
+    limit_read = 1;
+    limit_seen = v;
+    int hz = limit_parse();
+    if (hz == limit_hz) return;
+    limit_hz = hz;
     if (fps60_set == -2) fps60_set = rt_patch_set("fps60");
-    if (fps60_set < 0) return;
-    int on = cfg_bool("TOTK_FPS60");
-    if (on == rt_patch_enabled(fps60_set)) return;
-    rt_patch_switch(fps60_set, on);
-    rt_log("frame rate: limit %d fps (TOTK_FPS60=%d)", on ? 60 : 30, on);
+    if (fps60_set >= 0) rt_patch_switch(fps60_set, hz != 30);
+    if ((hz > 60 || hz == 0) && !step_word)
+        rt_log("frame rate: limits above 60 need the real-time step (TOTK_REALTIME=1); 60 fps");
+    else if (hz) rt_log("frame rate: limit %d fps", hz);
+    else if (gfx_window_refresh_hz() > 0) rt_log("frame rate: limit at the monitor's refresh rate (%.3f Hz now)", gfx_window_refresh_hz());
+    else rt_log("frame rate: limit at the monitor's refresh rate (60 until the window measures it)");
 }
 
-int frame_step_cap_ticks(void) {
-    if (fps60_set == -2) fps60_set = rt_patch_set("fps60");
-    return fps60_set < 0 || rt_patch_enabled(fps60_set) ? 1 : 2;
+uint64_t frame_step_cap_ns(void) {
+    frame_limit_live();
+    double hz = limit_hz ? limit_hz : gfx_window_refresh_hz();
+    if (hz < LIMIT_MIN_HZ) hz = 60;   // display rate unknown (no window yet)
+    if (hz > LIMIT_MAX_HZ) hz = LIMIT_MAX_HZ;
+    return (uint64_t)(1e9 / hz + 0.5);
 }
 
 // ---- TOTK_TRACE=perf speed lines

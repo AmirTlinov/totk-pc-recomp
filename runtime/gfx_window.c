@@ -288,6 +288,52 @@ void gfx_window_request_close(void) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
 }
 
+// ---- refresh rate of the window's monitor (TOTK_FPS_LIMIT=display). The window thread measures it when the window
+// opens, lands on another monitor or the display mode changes; readers take the stored value. QueryDisplayConfig gives
+// the exact rational rate (59.94, 143.998); EnumDisplaySettings' whole hertz is the fallback.
+static HMONITOR g_rate_mon;
+static volatile LONG g_rate_mhz;   // millihertz, 0 unknown
+
+static double monitor_rate_hz(HMONITOR mon) {
+    MONITORINFOEXW mi = {.cbSize = sizeof mi};
+    if (!GetMonitorInfoW(mon, (MONITORINFO *)&mi)) return 0;
+    double hz = 0;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) == ERROR_SUCCESS && np && nm) {
+        DISPLAYCONFIG_PATH_INFO *paths = calloc(np, sizeof *paths);
+        DISPLAYCONFIG_MODE_INFO *modes = calloc(nm, sizeof *modes);
+        if (paths && modes && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS)
+            for (UINT32 i = 0; i < np && !hz; i++) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {.header = {.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                                                                   .size = sizeof src,
+                                                                   .adapterId = paths[i].sourceInfo.adapterId,
+                                                                   .id = paths[i].sourceInfo.id}};
+                DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+                if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS && !wcscmp(src.viewGdiDeviceName, mi.szDevice) &&
+                    r.Denominator)
+                    hz = (double)r.Numerator / r.Denominator;
+            }
+        free(paths);
+        free(modes);
+    }
+    DEVMODEW dm = {.dmSize = sizeof dm};
+    if (!hz && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+        hz = dm.dmDisplayFrequency;   // 0 and 1 mean the hardware default
+    return hz;
+}
+
+// Window thread. force: the display mode changed, measure even on the same monitor.
+static void refresh_rate_update(HWND h, int force) {
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY);
+    if (!force && mon == g_rate_mon) return;
+    g_rate_mon = mon;
+    double hz = monitor_rate_hz(mon);
+    LONG mhz = (LONG)(hz * 1000 + 0.5);
+    if (InterlockedExchange(&g_rate_mhz, mhz) != mhz) rt_log("gfx: monitor refresh rate %.3f Hz", hz);
+}
+
+double gfx_window_refresh_hz(void) { return InterlockedCompareExchange(&g_rate_mhz, 0, 0) / 1000.0; }
+
 int gfx_window_monitor_size(int *w, int *h) {
     MONITORINFO mi = {sizeof mi};
     if (!g_hwnd || !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return 0;
@@ -316,7 +362,14 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_SIZE:
         if (w != SIZE_MINIMIZED) InterlockedExchange(&g_dirty, 1);
+        refresh_rate_update(h, 0);
         return 0;
+    case WM_EXITSIZEMOVE:   // dragged onto another monitor
+        refresh_rate_update(h, 0);
+        break;
+    case WM_DISPLAYCHANGE:
+        refresh_rate_update(h, 1);
+        break;
     case WM_ACTIVATEAPP: {
         int in = w != 0;
         InterlockedExchange(&g_focused, in);
@@ -367,6 +420,7 @@ static DWORD WINAPI window_main(void *arg) {
             ShowWindow(g_hwnd, cfg_get("TOTK_ASSUME_FOCUS") ? SW_SHOWNOACTIVATE : SW_SHOW);   // scripted runs leave focus alone
         if (!background && cfg_fullscreen()) toggle_fullscreen(g_hwnd);
         note_applied();
+        refresh_rate_update(g_hwnd, 1);
     }
     SetEvent(g_wnd_ready);
     if (g_wnd_failed) return 1;
