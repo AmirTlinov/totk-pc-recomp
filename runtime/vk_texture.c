@@ -1253,6 +1253,21 @@ int vk_texture_cpu_stale(uint64_t addr, uint64_t size) {
     return dirty;
 }
 
+// The newest submission recorded to write a GPU-written mirrored texture overlapping [addr, addr+size); 0: none.
+uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size) {
+    if (!size || !__atomic_load_n(&nowned, __ATOMIC_ACQUIRE)) return 0;
+    lock();
+    uint64_t f = 0;
+    for (int i = owned_lower(addr > max_owned ? addr - max_owned : 0); i < nowned && owned[i]->pub.addr < addr + size; i++) {
+        const Tex *e = owned[i];
+        if (!e->gpu_dirty || e->pub.addr + e->t.L.size <= addr) continue;
+        if (e->gpu_fence > f) f = e->gpu_fence;
+        if (e->wr_fence > f) f = e->wr_fence;
+    }
+    unlock();
+    return f;
+}
+
 // The image is the newest content only while nothing wrote the storage since the GPU render: TotK finalizes grass maps,
 // reuses their storage for new data and memcpys that data on, and writing the old image back first handed the copy
 // a stale map or stale resource bytes (wrong textures in the distance). Every hit is checked before any is written

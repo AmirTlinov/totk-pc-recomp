@@ -153,7 +153,7 @@ enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH,
        DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
 static const char *const dr_name[DR_N] = {
     "pool_fini", "map_virtual", "texture_release (queued)", "program_release", "finish", "read_texels (writer fence)",
-    "write_texels", "guest_read", "frame bound", "queue full", "check drain"};
+    "write_texels", "guest_read (writer fence)", "frame bound", "queue full", "check drain"};
 
 static SRWLOCK rl = SRWLOCK_INIT;
 static CONDITION_VARIABLE rcv = CONDITION_VARIABLE_INIT;   // item queued, item taken, item done
@@ -475,10 +475,29 @@ static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyReg
     vk_write_texels(t, v, r, src, row, img);
 }
 static void vk_be_guest_written(uint64_t addr, uint64_t size) { vk_sync_start(); vk_guest_written(addr, size); }
+// A CPU read of GPU-written mirrored storage (memcpy, pool invalidate). With the replay queued it waits for the newest
+// submission recorded to write the textures there, not for the whole queue: the write-back copy then runs after their
+// renders, and clears gpu_dirty only for content that is on the queue. Submissions not replayed yet render after the
+// copy, as on hardware when the GPU has not reached them; they mark the texture dirty again for a later read.
 static void vk_be_guest_read(uint64_t addr, uint64_t size) {
     if (!vk_texture_cpu_stale(addr, size)) return;
     vk_sync_start();
-    replay_drain(DR_GUEST_READ);
+    if (gfx_replay_async()) {
+        uint64_t f = vk_texture_dirty_fence(addr, size);
+        AcquireSRWLockExclusive(&rl);
+        dr_calls[DR_GUEST_READ]++, dr_tcalls[DR_GUEST_READ]++;
+        ReleaseSRWLockExclusive(&rl);
+        if (f && vk_sync_fence_done() < f) {
+            uint64_t t0 = kern_now_ns();
+            NVN_BLOCKING();
+            vk_sync_fence_wait(f, UINT64_MAX);
+            uint64_t d = kern_now_ns() - t0;
+            AcquireSRWLockExclusive(&rl);
+            dr_waits[DR_GUEST_READ]++, dr_twaits[DR_GUEST_READ]++;
+            dr_ns[DR_GUEST_READ] += d, dr_tns[DR_GUEST_READ] += d;
+            ReleaseSRWLockExclusive(&rl);
+        }
+    }
     vk_present_drain();
     vk_texture_write_back(addr, size);
 }

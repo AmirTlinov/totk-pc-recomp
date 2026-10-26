@@ -271,6 +271,7 @@ int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the d
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                           uint64_t img);            // always from the image (GPU copy, waited for); 0 on failure
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
+uint64_t vk_texture_dirty_fence(uint64_t addr, uint64_t size);   // newest recorded writer of such a texture; 0: none
 void vk_texture_write_back(uint64_t addr, uint64_t size);   // writes those images back into their storage (waits)
 void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   // vk_pool_fini: drop the images there
 void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
