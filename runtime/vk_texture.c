@@ -311,8 +311,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (block_views_ok(&bc)) ci = bc, usage = bc.usage, flags = bc.flags, block_views = 1;
     }
     // Feedback loops (vk.h VkCtx.feedback): every attachable image may be sampled by a draw of a pass that renders it,
-    // so it gets the usage now; adding it when a loop shows up would mean recreating the image (build/v121-fb lost the
-    // grass tile maps that way).
+    // so it gets the usage now; adding it when a loop shows up would mean recreating the image (that lost the
+    // grass tile maps once).
     int fb_usage = c->feedback == VK_FEEDBACK_LAYOUT && !block_views &&
                    (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     if (fb_usage) ci.usage = usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
@@ -1317,7 +1317,7 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
 
 // TotK's grass system renders a 128x128 RGBA8 map of cut and trampled grass into a CPU-cached pool every frame and its
 // CPU code reads the pool bytes without nvnMemoryPoolInvalidateMappedRange (cut reactions: blades, insects, the cut
-// itself; build/v121-bloom NOTES.md). On the Switch the bytes are there once the frame's fence has passed. So when the
+// itself). On the Switch the bytes are there once the frame's fence has passed. So when the
 // CPU waits for a fence, mirrored targets up to WB_SMALL bytes rendered by work up to that fence go back to their
 // storage, unless the CPU rewrote it since. Larger targets still go back on an invalidate, memcpy or ReadTexels.
 int vk_texture_small_dirty(void) { return __atomic_load_n(&small_pending, __ATOMIC_ACQUIRE); }

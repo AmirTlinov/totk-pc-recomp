@@ -280,7 +280,7 @@ static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) 
 // MacNativeGames contributors): Horizon gives a core to a strictly better thread the moment that thread is ready.
 // Here a better waiter only marks the owner, which gives the core up at its next SVC or indirect call; an owner in a
 // stretch of game code with neither keeps it (TOTK_CORE_DIAG: 0.5-1.1 ms of thread-time per frame, waits to 16 ms and
-// more, build/v121-preempt/NOTES.md). With it on, three parts, all of which MacNativeGames found necessary:
+// more). With it on, three parts, all of which MacNativeGames found necessary:
 // - The waiter interrupts the owner (SuspendThread, GetThreadContext) when it has waited AP_FIRST_NS, then every
 //   millisecond: if the owner's host rip is in the lifted modules' code (g_gen_lo..g_gen_hi) and its host depth is 0
 //   (not in a host call or SVC, nor in game code a host call made), it holds no host lock, so its rip is moved to
@@ -777,7 +777,7 @@ static int core_better_waiter(const RtThread *t, int c) {
 // Asks holders to give their cores up, one holder per waiter: waiters best first, each claims the worst holder worse
 // than itself on a core it may run on that no better waiter claimed (a request already pending is reused). Asking
 // every worse holder made several drop their cores for one waiter; the spare cores went to worse waiters, which asked
-// again (build/v121-dpre/NOTES.md).
+// again.
 static void core_kick(void) {
     RtThread *w[64];
     int wp[64], op[NCORE], n = 0, claimed = 0;

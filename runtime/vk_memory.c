@@ -741,7 +741,7 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked) {
 }
 
 // ---------------------------------------------------------------- dirty census (TOTK_TRACE=perf)
-// What a device-local mirror of the buffer-bound pools would upload (build/mem-plan.md step 2). The replay notes every
+// What a device-local mirror of the buffer-bound pools would upload. The replay notes every
 // imported pool it binds as a vertex, index, uniform, storage or indirect buffer (vk_mem_bound_note). At the start of
 // each submit one write-watch query per run of such pools stamps the pages written since with a new generation, in the
 // shared generation table (no second consumer of the OS bits: texture checks see the stamps), and the pages of those
@@ -918,7 +918,7 @@ static void dirty_frame(uint64_t frame) {
 }
 
 // ---------------------------------------------------------------- VRAM mirror of buffer-bound pools
-// build/mem-plan.md, "Design: VRAM mirror of buffer-bound pools". An imported pool keeps vertices, indices, constants
+// An imported pool keeps vertices, indices, constants
 // and storage buffers in system memory, so a discrete GPU reads them over PCIe on every draw (GTX 1050 Ti and RTX
 // 3090 Ti: about 110 ms of GPU time per frame in the field). In mirror mode (device class discrete, TOTK_MEMORY) an
 // imported pool gets a device-local buffer over its imported range the first time the replay uses it as a vertex,
@@ -1475,7 +1475,7 @@ static void mirror_log(uint64_t frame) {
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
 }
 
-// Device class (build/mem-plan.md): INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
+// Device class: INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
 // heap that is not device-local (host memory) -> discrete; otherwise uma (import everywhere). Sets the mirror mode.
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m) {
     int big_local = -1, host_heap = -1;

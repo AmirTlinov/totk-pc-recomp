@@ -139,7 +139,7 @@ void vk_mem_count(int cls, int use, uint64_t bytes);
 void vk_mem_bound_note(void *pool);
 #define VK_MEM_BOUND(sp) do { if ((rt_trace & RT_TRACE_PERF) && (sp).pool) vk_mem_bound_note((sp).pool); } while (0)
 void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its lock, before the replay
-// VRAM mirror of buffer-bound pools (vk_memory.c, build/mem-plan.md). vk_mirror_on: TOTK_MEMORY=mirror|verify, or the
+// VRAM mirror of buffer-bound pools (vk_memory.c). vk_mirror_on: TOTK_MEMORY=mirror|verify, or the
 // device class is discrete and TOTK_MEMORY is unset or auto; set at device selection. The replay (submitting thread
 // under vk_sync_submit's lock) calls:
 // - VK_MEM_USE at a vertex, index, uniform, storage or indirect binding of a span vk_mem_resolve returned: the pool's

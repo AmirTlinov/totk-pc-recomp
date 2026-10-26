@@ -2548,7 +2548,7 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 //   (shader-prepared.bin) the pre-rasterization library of a vertex shader, the fragment-shader library of a fragment
 //   shader and the pipeline of a compute shader, each built from a private shader copy and destroyed at once. What
 //   stays is the driver's own disk cache: on AMD a library built again in a later process takes 0.1 ms instead of
-//   55 ms (vertex) / 28 ms (fragment) (build/v121-sl NOTES, lib bench). Our pipeline-cache.bin is not written there:
+//   55 ms (vertex) / 28 ms (fragment). Our pipeline-cache.bin is not written there:
 //   it would grow by about 10 KB per library (~240 MB) and be read into memory at every boot.
 // - boot (lb_worker), after the pipeline-key prewarm, on cpus/4 threads at THREAD_PRIORITY_IDLE (the short P.lock
 //   sections and shader loads at normal priority, so a preempted thread never holds the lock the replay needs):
@@ -2791,7 +2791,7 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     uint32_t best = 0, bf = 0;
     for (uint32_t i = 1; i < 16; i++) best = pr_hist[i] > pr_hist[best] ? i : best;
     for (uint32_t i = 1; i < 4; i++) bf = fs_hist[i] > fs_hist[bf] ? i : bf;
-    if (!pr_hist[best]) best = 8;   // no key file: TotK clips -w..w (all 2706 records of build/v121's key file)
+    if (!pr_hist[best]) best = 8;   // no key file: TotK clips -w..w (all 2706 records of a recorded key file)
     LB.clamp = (uint8_t)(best & 1), LB.poly = (uint8_t)(best >> 1 & 3), LB.minus_w = (uint8_t)(best >> 3 & 1);
     LB.samples = (uint8_t)(1u << bf);
 }

@@ -688,7 +688,7 @@ static void ov_user_difference(Cpu *c) {
 }
 
 // ==== nn::pl shared fonts (shared_font.c). TotK asks for them only from its font loader, only with Simplified Chinese,
-// Korean or Traditional Chinese text, and only for type 0 (build/v121-swkbd/NOTES.md); tools/extract_fonts.py writes
+// Korean or Traditional Chinese text, and only for type 0; tools/extract_fonts.py writes
 // them from the user's firmware. Each type is read on first use into guest-visible memory as the BFTTF file the pl
 // shared memory holds; Address is 8 bytes past the file start (after the BFTTF header) and Size the decoded font size,
 // as in MNG. The load state is always Loaded: the game spins until it is, so missing files stop with a named fatal at

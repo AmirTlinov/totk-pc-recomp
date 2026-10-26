@@ -11,12 +11,12 @@
 // the frame's display time from the pacer (nvn_api_obj.c), so present-to-present intervals stay even whatever the
 // replay took. The blit is already on the queue, so the wait blocks no submission.
 //
-// Asynchronous replay (TOTK_REPLAY_ASYNC, default 1; 0 keeps the synchronous path unchanged): nvnQueueSubmitCommands
+// Asynchronous replay (TOTK_REPLAY_ASYNC, default 0; 1 turns it on): nvnQueueSubmitCommands
 // and nvnQueuePresentTexture only queue. Each item gets its timeline value at enqueue (vk_sync_reserve), in queue
 // order; the replay thread runs the synchronous submit and present bodies in that order, so every value is signalled
 // by the submission it was handed out for. The game runs at most one frame ahead: queueing present N waits until the
 // replay thread handled present N-1. Calls that read or free GPU state that queued work may use drain the queue first
-// (replay_drain), each cause counted. Design and the orderings it keeps: build/v121-replayq/NOTES.md.
+// (replay_drain), each cause counted.
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>

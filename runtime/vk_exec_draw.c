@@ -705,7 +705,7 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // candidate base from here and compares the global pointer against it. Compute: dispatch size at 0x200, the uniform
 // buffer table at 0x210 + 16 r. Graphics: the largest point size (Maxwell's limit, GLSLC clamps gl_PointSize to it) at
 // 0x610, the base instance at 0x644. Other stages: zeros. Unbound slots read zero, since the replay keeps them zero.
-// Layout: nxnative dm/gfx/nvn/nvn_mtl.m:4395-4420 (MIT); TotK readers in build/lessons/census.md G2.
+// Layout: nxnative dm/gfx/nvn/nvn_mtl.m:4395-4420 (MIT).
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     memset(bank, 0, VK_C0_BYTES);
@@ -815,7 +815,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
 // TotK's G-buffer and terrain shaders sample targets of the pass that renders them, at their own pixel, after earlier
 // draws of the pass wrote them (albedo, normals, R32F linear depth). Maxwell reads see those writes; in Vulkan the read
 // is undefined without a barrier, and on the RX 9070 it showed as dark screen-aligned blocks on the island ground
-// (build/v121-sq/SQUARES.md) and hid Tulin's sage spirit. Before a draw whose fragment shader samples an attachment of
+// and hid Tulin's sage spirit. Before a draw whose fragment shader samples an attachment of
 // the open pass that a draw or clear of the pass wrote since the pass began or the last barrier:
 // - VK_FEEDBACK_LAYOUT: the image is learned (VkTexImage.fb_learned; it has the feedback usage since its creation), the
 //   pass restarts once with it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT, and from then on its passes attach it in that

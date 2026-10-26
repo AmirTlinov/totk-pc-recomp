@@ -557,7 +557,7 @@ NVN_API(nvnQueueFinish) {
 // first, and the GPU reads uniform memory only after it. The game's producer f_70008c6460 (thread 0x103e, p56)
 // rewrites the half of its per-object uniform blocks that was front until the last flip, 14-23 ms after the submit
 // that still reads it, with no fence: on hardware the GPU has read that half by then. Here the rewrite lands inside
-// the replay, and that frame draws other objects' matrices (phantom rocks, flat far field; build/v121-lod NOTES.md).
+// the replay, and that frame draws other objects' matrices (phantom rocks, flat far field).
 // The guard makes the producer wait, at its commit point, until the newest submit has been replayed and completed.
 // lod_entered / lod_issued count submits that entered QueueSubmitCommands / reached the back end; lod_fence holds
 // the fence of the last LOD_RING. TOTK_LOD_GUARD=0 turns the wait off.
