@@ -9,6 +9,9 @@
 #include "input.h"
 #include "input_map.h"
 #include "platform/platform.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
@@ -127,6 +130,82 @@ int probe_cfg(void) {
     CHECK(cfg_save_to(path) == 1, "cfg_save_to creates a missing file");
     got = plat_file_read(path, &got_n);
     CHECK(got && !strcmp((const char *)got, "[audio]\nvolume = 90\n"), "new file: the section and the key");
+    free(got);
+
+    // Defaults table: the menu's "default" marks and Reset
+    const CfgMeta *m = cfg_meta("FPS60");
+    CHECK(m && EQ(m->def, "1") && m->live, "meta: fps60 defaults to 1 and is live");
+    m = cfg_meta("ASYNC_PREEMPT");
+    CHECK(m && EQ(m->values, "0|1|2") && !m->live, "meta: async_preempt takes 0|1|2 and needs a restart");
+    m = cfg_meta("totk_vk_present");
+    CHECK(m && EQ(m->key, "VK_PRESENT") && EQ(m->values, "mailbox|fifo|immediate") && m->live,
+          "meta: prefix and case are accepted");
+    m = cfg_meta("RUMBLE_STRENGTH");
+    CHECK(m && EQ(m->def, "130") && EQ(m->values, "0..300"), "meta: rumble strength 130 in 0..300");
+    m = cfg_meta("PERF_OVERLAY");
+    CHECK(m && EQ(m->def, "off") && EQ(m->values, "off|fps|full") && m->live, "meta: perf_overlay is live, off by default");
+    CHECK(cfg_meta("BIND_A") == NULL && cfg_meta("FPS_COUNTER") == NULL && cfg_meta("NO_SUCH") == NULL,
+          "meta: keys the menu does not show are NULL");
+
+    // cfg_reset: the key's active lines leave totk.ini, the commented example stays
+    static const char rbase[] = "[audio]\n# volume = 100\n[input]\nmotion = 0\n";
+    static const char *const vol[] = {"VOLUME"};
+    _putenv_s("TOTK_VOLUME", "");
+    CHECK(plat_file_write(path, rbase, sizeof rbase - 1), "write the reset ini");
+    CHECK(cfg_load(path) == 1, "load the reset ini");
+    cfg_set("TOTK_VOLUME", "40");
+    CHECK(cfg_save_to(path) == 1 && cfg_last_save_ok(), "reset: volume saved");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && strstr((const char *)got, "\nvolume = 40\n"), "reset: the active line is in the file");
+    free(got);
+    unsigned v1 = cfg_version();
+    CHECK(cfg_reset(vol, 1) == 1, "reset: one key reset");
+    CHECK(cfg_version() > v1 && cfg_get("TOTK_VOLUME") == NULL, "reset: the value is gone in memory, the version moved");
+    CHECK(cfg_reset(vol, 1) == 0, "reset: a key already reset counts 0");
+    CHECK(cfg_save_to(path) == 1, "reset: save");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && got_n == sizeof rbase - 1 && !memcmp(got, rbase, got_n) && strstr((const char *)got, "# volume = 100"),
+          "reset: no active volume line, the commented example and the other keys stay");
+    if (got && (got_n != sizeof rbase - 1 || memcmp(got, rbase, got_n))) fprintf(stderr, "---- saved:\n%s\n----\n", got);
+    free(got);
+    cfg_set("TOTK_VOLUME", "55");
+    CHECK(cfg_reset(vol, 1) == 1 && cfg_get("TOTK_VOLUME") == NULL, "reset: a value set after a save resets too");
+    cfg_set("TOTK_VOLUME", "60");
+    CHECK(cfg_save_to(path) == 1 && EQ(cfg_get("TOTK_VOLUME"), "60"), "reset then set before the save: the set wins");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && strstr((const char *)got, "\nvolume = 60\n"), "reset then set: the new line is written");
+    free(got);
+
+    // a key the environment sets is skipped and keeps its file line
+    CHECK(cfg_load(path) == 1 && EQ(cfg_get("TOTK_VOLUME"), "60"), "reset: reload");
+    _putenv_s("TOTK_VOLUME", "70");
+    CHECK(cfg_reset(vol, 1) == 0, "reset: an environment-set key is skipped");
+    _putenv_s("TOTK_VOLUME", "");
+    CHECK(EQ(cfg_get("TOTK_VOLUME"), "60"), "reset: the skipped key keeps its value");
+    CHECK(cfg_save_to(path) == 1, "reset: save after a skip");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && strstr((const char *)got, "\nvolume = 60\n"), "reset: the skipped key keeps its file line");
+    free(got);
+
+    // a failed save: the call fails, cfg_last_save_ok says so, the value stays set and a later save works
+    CHECK(cfg_last_save_ok() == 1, "save status: ok after a good save");
+    cfg_set("TOTK_VOLUME", "20");
+    char bad[1100];
+    snprintf(bad, sizeof bad, "%s", path);
+    strcpy(strrchr(bad, '\\') + 1, "no-such-dir\\cfg-probe.ini");
+    CHECK(cfg_save_to(bad) == 0 && cfg_last_save_ok() == 0 && EQ(cfg_get("TOTK_VOLUME"), "20"),
+          "save status: an unwritable path fails, the value stays");
+    cfg_set("TOTK_VOLUME", "21");
+#ifdef _WIN32
+    CHECK(plat_file_write(path, rbase, sizeof rbase - 1), "write the read-only ini");
+    SetFileAttributesA(path, FILE_ATTRIBUTE_READONLY);
+    CHECK(cfg_save_to(path) == 0 && cfg_last_save_ok() == 0 && EQ(cfg_get("TOTK_VOLUME"), "21"),
+          "save status: a read-only file fails, cfg_get returns the new value");
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+#endif
+    CHECK(cfg_save_to(path) == 1 && cfg_last_save_ok() == 1, "save status: the retry after the failure works");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && strstr((const char *)got, "\nvolume = 21\n"), "save status: the retried save wrote the value");
     free(got);
     plat_file_delete(path);
     cfg_load(path);

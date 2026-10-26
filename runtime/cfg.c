@@ -19,12 +19,13 @@
 #define PREFIX_LEN 5
 #define CFG_MAX_KEYS 512
 
-typedef struct { char *key, *value; int dirty; } CfgEntry;   // key upper-case, without the prefix
+typedef struct { char *key, *value; int dirty, removed; } CfgEntry;   // key upper-case, without the prefix; value NULL after cfg_reset
 
 static CfgEntry entries[CFG_MAX_KEYS];
 static int n_entries;
 static unsigned version;
-static PlatMutex set_lock = PLAT_MUTEX_INIT;   // cfg_set, cfg_save
+static PlatMutex set_lock = PLAT_MUTEX_INIT;   // cfg_set, cfg_reset, cfg_save
+static int save_ok = 1;                         // the last cfg_save_to wrote (or had nothing to write)
 
 // Every name the runtime reads (and the patch sets in generated/), without the prefix. A file key outside this list is
 // logged as unknown. A new variable goes here too, or its ini key logs a harmless "unknown key" line.
@@ -34,11 +35,11 @@ static const char *const known[] = {
     "BIND_PLUS", "BIND_R", "BIND_RCLICK", "BIND_RIGHT", "BIND_SKIP", "BIND_STATS", "BIND_UP", "BIND_X", "BIND_Y",
     "BIND_ZL", "BIND_ZR", "CLOTH_REALTIME", "CORE_DIAG", "DESC_TEMPLATE", "DUMP", "DUMP_BUF", "DUMP_DIR", "DUMP_LOG",
     "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES", "FLIGHT_SPIKE_MS",
-    "FLIGHT_THUMBS", "FPS60", "FPS_COUNTER", "FREEZE_IDLE", "FREE_CORES", "FULLSCREEN", "GPL", "GPL_DRAW_BUILD", "GPU",
+    "FLIGHT_THUMBS", "FPS60", "FREEZE_IDLE", "FREE_CORES", "FULLSCREEN", "GPL", "GPL_DRAW_BUILD", "GPU",
     "GPU_INDEX", "GPU_NAME", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
     "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LOCALE", "LOD_GUARD", "MEMORY", "MENU_LANG", "MENU_TEST",
     "MENU_TEST_DIR", "MINIMAL_LAYOUT", "MIRROR_GAP", "MOTION", "MOUSE_SENS", "MOVIE_HOST", "MOVIE_PACE",
-    "OPERATION_MODE", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT",
+    "OPERATION_MODE", "PERF_OVERLAY", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT",
     "PREWARM_XLATE", "PROBE_MOVIE", "PROBE_MOVIE_SHOT", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES",
     "PROFILE_RENDER", "PUSH_SKIP", "PUSH_STAGE", "RDOC", "RDOC_DIR", "RDOC_DLL", "REALTIME", "REEXEC", "REPLAY_ASYNC",
     "REPLAY_CHECK", "RESOLVE_CHECK", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
@@ -52,11 +53,63 @@ static const char *const known[] = {
 // The totk.ini section a key cfg_set may write goes to when the file lacks it (totk.ini.example's sections).
 static const struct { const char *key, *section; } sections[] = {
     {"FPS60", "frame rate"},
-    {"FULLSCREEN", "display"}, {"WINDOW_SIZE", "display"}, {"FPS_COUNTER", "display"}, {"VK_PRESENT", "display"},
-    {"MENU_LANG", "language"},
+    {"REALTIME", "frame rate"}, {"CLOTH_REALTIME", "frame rate"}, {"HIGHFPS_FIX", "frame rate"},
+    {"FULLSCREEN", "display"}, {"WINDOW_SIZE", "display"}, {"PERF_OVERLAY", "display"}, {"VK_PRESENT", "display"},
+    {"GPU_INDEX", "display"},
+    {"MENU_LANG", "language"}, {"LANG", "language"}, {"OPERATION_MODE", "language"},
     {"VOLUME", "audio"},
     {"MOTION", "input"}, {"RUMBLE_STRENGTH", "input"}, {"RUMBLE_CURVE", "input"}, {"RUMBLE_TRIGGERS", "input"},
-    {"MOUSE_SENS", "input"},
+    {"MOUSE_SENS", "input"}, {"INPUT_RECORD", "input"},
+    {"ASYNC_PREEMPT", "performance"}, {"REPLAY_ASYNC", "performance"}, {"FREE_CORES", "performance"},
+    {"TIMER_1MS", "performance"}, {"PIPE_WAIT", "performance"}, {"PIPE_SKIP", "performance"},
+    {"LIB_PREBUILD", "performance"}, {"LIB_PREBUILD_THREADS", "performance"}, {"PIPE_PREBUILD", "performance"},
+    {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"},
+    {"TEX_ALIAS", "performance"}, {"LOD_GUARD", "performance"}, {"FIX_C0", "performance"}, {"FIX_ZERO", "performance"},
+    {"BIND_SKIP", "performance"}, {"SHADER_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
+    {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"VK_VALIDATION", "performance"},
+    {"VK_DYN_VERTEX", "performance"}, {"VK_SUBGROUP_PIN", "performance"},
+    {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
+};
+
+// The settings the menu shows: the value each consumer uses when the key is unset, and what the key accepts. Defaults
+// are copied from the consumers (grep cfg_get("TOTK_<KEY>")); the consumers keep parsing as they do.
+#define LIVE 1
+#define RESTART 0
+static const CfgMeta metas[] = {
+    // Screen
+    {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
+    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
+    {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
+    // Game
+    {"FPS60", "1", "0|1", LIVE}, {"REALTIME", "1", "0|1", RESTART}, {"CLOTH_REALTIME", "1", "0|1", RESTART},
+    {"HIGHFPS_FIX", "1", "0|1", RESTART},
+    {"LANG", "", "ja|en-US|fr|de|it|es|zh-CN|ko|nl|pt|ru|zh-TW|en-GB|fr-CA|es-419|zh-Hans|zh-Hant|pt-BR", RESTART},
+    {"OPERATION_MODE", "docked", "docked|handheld", RESTART},
+    // Sound, Controls, Menu
+    {"VOLUME", "100", "0..100", LIVE},
+    {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "130", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
+    {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"MOUSE_SENS", "1", "0..10", LIVE},
+    {"MENU_LANG", "", "en|ru", LIVE},
+    // Advanced: scheduling
+    {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
+    {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
+    // shaders and pipelines
+    {"PIPE_WAIT", "default", "default|draw", RESTART}, {"PIPE_SKIP", "any", "strict|any|fullscreen", RESTART},
+    {"LIB_PREBUILD", "1", "0|1", RESTART}, {"LIB_PREBUILD_THREADS", "", "1..64", RESTART},
+    {"PIPE_PREBUILD", "1", "0|1", RESTART}, {"PREWARM_XLATE", "", "1..64", RESTART}, {"GPL", "1", "0|1", RESTART},
+    // textures and memory
+    {"ASTC", "auto", "auto|gpu|native|cpu", RESTART}, {"MEMORY", "auto", "auto|import|mirror|verify", RESTART},
+    {"TEX_ALIAS", "1", "0|1", RESTART},
+    // render fixes
+    {"LOD_GUARD", "1", "0|1", RESTART}, {"FIX_C0", "1", "0|1", RESTART}, {"FIX_ZERO", "1", "0|1", RESTART},
+    {"BIND_SKIP", "1", "0|1", RESTART}, {"SHADER_MEMO", "1", "0|1", RESTART}, {"DESC_TEMPLATE", "1", "0|1", RESTART},
+    {"PUSH_SKIP", "1", "0|1", RESTART}, {"SPLIT_DRAWS", "64", "0..1000", RESTART},
+    // Vulkan
+    {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART},
+    {"VK_SUBGROUP_PIN", "1", "0|1", RESTART},
+    // diagnostics
+    {"TRACE", "", NULL, RESTART}, {"FLIGHT", "0", "0|1", RESTART}, {"FLIGHT_SPIKE_MS", "100", "0..60000", RESTART},
+    {"INPUT_RECORD", "", NULL, RESTART},
 };
 
 static int is_known(const char *key) {
@@ -97,7 +150,7 @@ static void add(char *key, char *value, int line) {
             return;
         }
     if (n_entries == CFG_MAX_KEYS) return;
-    entries[n_entries++] = (CfgEntry){_strdup(key), _strdup(value), 0};
+    entries[n_entries++] = (CfgEntry){_strdup(key), _strdup(value), 0, 0};
 }
 
 int cfg_load(const char *path) {
@@ -148,16 +201,52 @@ void cfg_set(const char *name, const char *value) {
     int i = 0, n = n_entries;
     while (i < n && strcmp(entries[i].key, key)) i++;
     if (i < n) {
-        if (strcmp(entries[i].value, value)) {
+        if (!entries[i].value || strcmp(entries[i].value, value)) {
             __atomic_store_n(&entries[i].value, _strdup(value), __ATOMIC_RELEASE);   // the old string stays for readers
             entries[i].dirty = 1;
         }
+        entries[i].removed = 0;   // a value set after cfg_reset replaces the line instead of deleting it
     } else if (n < CFG_MAX_KEYS) {
-        entries[n] = (CfgEntry){_strdup(key), _strdup(value), 1};
+        entries[n] = (CfgEntry){_strdup(key), _strdup(value), 1, 0};
         __atomic_store_n(&n_entries, n + 1, __ATOMIC_RELEASE);
     }
     __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&set_lock);
+}
+
+int cfg_reset(const char *const *keys, int n) {
+    int done = 0;
+    plat_mutex_lock(&set_lock);
+    for (int k = 0; k < n; k++) {
+        char key[64], var[80];
+        snprintf(key, sizeof key, "%s", keys[k]);
+        const char *name = norm_key(key);
+        snprintf(var, sizeof var, PREFIX "%s", name);
+        if (getenv(var)) continue;   // the environment wins; the file line stays
+        for (int i = 0; i < n_entries; i++)
+            if (!strcmp(entries[i].key, name)) {
+                if (!entries[i].value) break;
+                __atomic_store_n(&entries[i].value, NULL, __ATOMIC_RELEASE);   // the old string stays for readers
+                entries[i].dirty = 0;
+                entries[i].removed = 1;   // cfg_save_to deletes the key's lines
+                done++;
+                break;
+            }
+    }
+    if (done) __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&set_lock);
+    return done;
+}
+
+int cfg_last_save_ok(void) { return __atomic_load_n(&save_ok, __ATOMIC_ACQUIRE); }
+
+const CfgMeta *cfg_meta(const char *key) {
+    char k[64];
+    snprintf(k, sizeof k, "%s", key);
+    const char *name = norm_key(k);
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++)
+        if (!strcmp(metas[i].key, name)) return &metas[i];
+    return NULL;
 }
 
 // ---- cfg_save: the file as lines, each with its line ending
@@ -252,8 +341,9 @@ static void put_entry(Out *o, const CfgEntry *e, const char *eol) {
 int cfg_save_to(const char *path) {
     plat_mutex_lock(&set_lock);
     int n = n_entries, any = 0;
-    for (int i = 0; i < n; i++) any |= entries[i].dirty;
+    for (int i = 0; i < n; i++) any |= entries[i].dirty | entries[i].removed;
     if (!any) {
+        __atomic_store_n(&save_ok, 1, __ATOMIC_RELEASE);
         plat_mutex_unlock(&set_lock);
         return 1;
     }
@@ -264,7 +354,8 @@ int cfg_save_to(const char *path) {
     Line *lines = calloc((size_t)nl + 1, sizeof *lines);
     // after[i]: entries to write after line i (-1 = none); replace[i]: the entry whose value line i now carries
     int *replace = malloc(sizeof(int) * ((size_t)nl + 1)), *after_key = malloc(sizeof(int) * (size_t)(n + 1));
-    if (!lines || !replace || !after_key) rt_fatal("cfg: out of memory writing totk.ini");
+    char *drop = calloc((size_t)nl + 1, 1);   // lines of a reset key
+    if (!lines || !replace || !after_key || !drop) rt_fatal("cfg: out of memory writing totk.ini");
     for (int i = 0, at = 0; i < nl; i++) {
         size_t start = (size_t)at;
         while ((uint64_t)at < size && text[at] != '\n') at++;
@@ -277,6 +368,11 @@ int cfg_save_to(const char *path) {
     char t[1024], k[128], sec[128];
     for (int e = 0; e < n; e++) {
         after_key[e] = -2;   // -2 clean, -1 append in a new section at the end, >= 0 insert after that line
+        if (entries[e].removed)
+            for (int i = 0; i < nl; i++) {
+                line_text(&lines[i], i == 0, t, sizeof t);
+                if (line_key(t, 0, k, sizeof k) && !strcmp(k, entries[e].key)) drop[i] = 1;
+            }
         if (!entries[e].dirty) continue;
         int last = -1;
         for (int i = 0; i < nl; i++) {
@@ -304,7 +400,9 @@ int cfg_save_to(const char *path) {
     }
     Out o = {0};
     for (int i = 0; i < nl; i++) {
-        if (replace[i] >= 0) {
+        if (drop[i]) {
+            // the line leaves the file; keys inserted after it still need a line ending before them
+        } else if (replace[i] >= 0) {
             // keep the line's indentation and key spelling, put the new value after " = "
             const char *s = lines[i].s;
             size_t len = lines[i].n;
@@ -322,7 +420,7 @@ int cfg_save_to(const char *path) {
         }
         for (int e = 0; e < n; e++)
             if (after_key[e] == i) {
-                if (!lines[i].n || lines[i].s[lines[i].n - 1] != '\n') puts_(&o, eol);
+                if (o.n && o.buf[o.n - 1] != '\n') puts_(&o, eol);
                 put_entry(&o, &entries[e], eol);
             }
     }
@@ -348,10 +446,12 @@ int cfg_save_to(const char *path) {
     }
     int ok = plat_file_write_atomic(path, o.buf ? o.buf : "", o.n);
     if (ok)
-        for (int e = 0; e < n; e++) entries[e].dirty = 0;
+        for (int e = 0; e < n; e++) entries[e].dirty = entries[e].removed = 0;
     else
         rt_log("cfg: cannot write %s", path);
+    __atomic_store_n(&save_ok, ok ? 1 : 0, __ATOMIC_RELEASE);
     free(o.buf);
+    free(drop);
     free(after_key);
     free(replace);
     free(lines);
@@ -374,7 +474,11 @@ static int find_ini(void) {
     return 1;
 }
 
-int cfg_save(void) { return find_ini() && cfg_save_to(ini_path); }
+int cfg_save(void) {
+    if (find_ini()) return cfg_save_to(ini_path);
+    __atomic_store_n(&save_ok, 0, __ATOMIC_RELEASE);
+    return 0;
+}
 
 void cfg_init(void) {
     if (!find_ini()) return;

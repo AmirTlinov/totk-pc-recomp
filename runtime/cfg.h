@@ -27,3 +27,17 @@ int cfg_from_env(const char *name);
 // when missing), comments and every other line stay byte for byte. 1 on success or with nothing to write.
 int cfg_save(void);
 int cfg_save_to(const char *path);
+
+// Reset (the menu's "Reset all settings to defaults"). Removes the active line of each key (names without TOTK_, any
+// case) from totk.ini at the next cfg_save and its value from memory, so the consumer's own default applies again; the
+// commented example lines stay. Keys the environment sets are skipped. Bumps cfg_version. Returns how many it reset.
+int cfg_reset(const char *const *keys, int n);
+// 0 when the last cfg_save / cfg_save_to failed to write (the values stay set in memory, the next save tries again).
+int cfg_last_save_ok(void);
+
+// What the menu knows about a setting. key: without TOTK_, upper case. def: what the consumer uses when the key is
+// unset ("" = no fixed default, the consumer picks per machine). values: "0|1", "mailbox|fifo|immediate", a range
+// "0..300", or NULL for free text. live: applies at once; the others are read at start.
+typedef struct { const char *key, *def, *values; int live; } CfgMeta;
+// The row of key (prefix and case ignored); NULL for a key the menu does not show.
+const CfgMeta *cfg_meta(const char *key);
