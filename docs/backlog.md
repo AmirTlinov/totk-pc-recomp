@@ -150,24 +150,23 @@ Each platform item gets a written design first, agreed with the maintainer.
 
 ## Later
 
-38. **In-game menu**: the first stage is in. F1, Esc or Minus+Plus opens it; the game gets no input while it is open.
-    Tabs Screen, Game, Sound, Controls and Menu show option rows over the `cfg` table (`runtime/cfg.c`), with the
-    description of the selected row beside them, English and Russian text from `runtime/ui_text.c`. Every change goes
-    to `totk.ini`, keeping the user's comments; a key set in the environment shows greyed out, a key read only at start
-    says "after restart". Dear ImGui is drawn after the blit into the swapchain image (`runtime/ui/menu.cpp`).
+38. **In-game menu**. F1, Esc or Minus+Plus opens it; the game gets no input while it is open. Tabs Screen, Game,
+    Sound, Controls, Menu and Advanced show option rows over the `cfg` table (`runtime/cfg.c`), with the description of
+    the selected row beside them, English and Russian text from `runtime/ui_text.c`. Every change goes to `totk.ini`,
+    keeping the user's comments; a key set in the environment shows greyed out, a key read only at start says "after
+    restart". Advanced holds every remaining key by group, open the log folder, copy system information
+    (`runtime/sysinfo.c`) and reset of all settings behind a confirmation. `TOTK_PERF_OVERLAY` (F10 cycles): `fps` one
+    line, `full` a panel of fixed width from `runtime/perfmon.c` (CPU, GPU and memory load through PDH, temperature,
+    power and clock through NVML on NVIDIA only, frame times with a graph, replay, GPU time and the render thread's
+    waits). Dear ImGui is drawn after the blit into the swapchain image (`runtime/ui/menu.cpp`). On machine A the
+    swapchain gets fifo for the default mailbox in 30 of 31 logs; the Presentation row says so.
 
-    Left to do, in this order (unfinished work on branch `task/menu-advanced`):
-    1. Performance overlay: `TOTK_PERF_OVERLAY` (F10 cycles) shows the frame rate, and in `full` the mean and longest
-       frame time. Left: CPU and GPU load through PDH and NVML (SavageWindRecomp `runtime/perfmon.c`).
-    2. Advanced tab: the remaining `cfg` keys (scheduling, replay thread, pipeline and shader switches), reset of all
-       settings, and a system information block (`sysinfo.c`) with copy to clipboard and open the log folder.
-    3. Game language list without Portuguese (TotK ships ja, en, fr, de, it, es, nl, ru, zh-CN, zh-TW, ko).
-    4. The Presentation row notes the mode the swapchain got when it differs from the setting (mailbox falls back to
-       fifo).
-    5. Not yet checked by hand: keyboard and gamepad navigation, Quit, input right after closing, `totk.ini` locked by
-       another program.
-    6. Later pages: button remapping (LAS Recomp `runtime/ui/controls_ui.mm`), AMD FSR 1 or bilinear scaling of the
-       900p image, a frame-time graph with the wait breakdown of `TOTK_TRACE=perf`, gyro sensitivity.
+    Left to do:
+    1. Not yet checked by hand: keyboard and gamepad navigation (the long Advanced page, the reset confirmation), Copy
+       system info and Open log folder, Quit, input right after closing, `totk.ini` locked by another program.
+    2. AMD GPU temperature, power and clock (ADLX); the overlay shows "-" for them on machine A.
+    3. Later pages: button remapping (LAS Recomp `runtime/ui/controls_ui.mm`), AMD FSR 1 or bilinear scaling of the
+       900p image, gyro sensitivity.
 
     Rendering above the game's 900p is a separate study (a game-side resolution patch, as Switch mods do, or scaling
     every render target ourselves); MacNativeGames has neither. The software keyboard could move onto
