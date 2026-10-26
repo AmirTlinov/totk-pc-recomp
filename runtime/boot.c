@@ -14,6 +14,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "nvn_api.h"
 #include "vk.h"
 
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
@@ -200,7 +201,7 @@ static void save_shot(const tex_t *t, const char *path) {
     view_t view;
     memset(&view, 0, sizeof view);
     NVNcopyRegion r = {.width = (int)w, .height = (int)h, .depth = 1};
-    gfx_backend()->finish();   // the presented frame's submissions may still be queued for the replay (vk_backend.c)
+    if (gfx_replay_async()) gfx_backend()->finish();   // the presented frame may still be queued for the replay
     gfx_backend()->read_texels(t, &view, &r, px, 4ull * w, 4ull * w * h);
     if (bgra)
         for (uint64_t i = 0; i < 4ull * w * h; i += 4) {
@@ -239,7 +240,7 @@ static void series_shot(const tex_t *t, uint64_t n) {
     view_t view;
     memset(&view, 0, sizeof view);
     NVNcopyRegion r = {.width = (int)w, .height = (int)h, .depth = 1};
-    gfx_backend()->finish();   // the presented frame's submissions may still be queued for the replay (vk_backend.c)
+    if (gfx_replay_async()) gfx_backend()->finish();   // the presented frame may still be queued for the replay
     gfx_backend()->read_texels(t, &view, &r, px, 4ull * w, 4ull * w * h);
     for (uint32_t y = 0; y < oh; y++)
         for (uint32_t x = 0; x < ow; x++) {
