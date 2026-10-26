@@ -34,7 +34,8 @@ other `totk.exe` or `ninja.exe` runs. The log's first and last lines record the 
   frame 600. `mem: class` (once at start) says whether the GPU counts as uma or discrete and lists its heaps and types.
 - With `perf`, `mem: dirty` every 60 frames: what a VRAM mirror of the buffer-bound pools would upload (pages the CPU
   wrote per frame and per submit, eager and lazy, by pool class), FlushMappedRange calls and bytes, and the mirror
-  size. The census costs about 1.1 ms of CPU per frame on the submitting thread; `perf_summary.py` summarises it.
+  size. The dirty count costs about 1.1 ms of CPU per frame on the submitting thread here (3 ms on an 8th-gen i7);
+  `perf_summary.py` summarises it.
 - `TOTK_PROFILE=<path> TOTK_PROFILE_FRAMES=lo-hi`: sampling profiler (`runtime/prof_win.c`), read with
   `tools/prof_report.py <profile> <totk.map>`. With `TOTK_PROFILE_RENDER=1` it samples the render thread only and keeps
   call chains: the report adds inclusive time per function and the exe callers of the driver and system DLLs.
@@ -66,10 +67,25 @@ RenderDoc cannot capture: the driver hides `VK_EXT_external_memory_host`.
 
 ## Other GPUs
 
-The RX 9070 is the only GPU here; the build also has to run on NVIDIA and older AMD (Vega, wave64 only). New Vulkan code
-queries the feature, extension, format or limit it uses and keeps a working path or a logged fallback when it is
-missing (`vk_pipeline.c` provoking vertex and subgroup size pinning are examples). Never hard-code what this GPU
+The RX 9070 is the only GPU agents can run; the build also has to run on NVIDIA and older AMD (Vega, wave64 only). New
+Vulkan code queries the feature, extension, format or limit it uses and keeps a working path or a logged fallback when
+it is missing (`vk_pipeline.c` provoking vertex and subgroup size pinning are examples). Never hard-code what this GPU
 reports: alignments, subgroup size, depth formats, `maxPushDescriptors`.
+
+Numbers from this machine do not carry over. Measured on the user's other machines (2026-10-24/25, logs and analysis
+in `build/mem-plan.md`):
+
+- GTX 1050 Ti (4 GiB, 214 MiB BAR, no ReBAR; i7 8th-10th gen) and RTX 3090 Ti: GPU time 110-120 ms per frame in the
+  world against 4.3 ms here, because the GPU reads imported host pools over PCIe. The VRAM mirror (cd6f490) brings
+  the 1050 Ti to 10-11 ms; that machine is now CPU-bound at 25-45 fps (replay 25-30 ms per frame, backlog 0b).
+- The same write-watch scan costs about 3x the CPU time it costs here.
+- NVIDIA has no ASTC: first texture uploads decode on the CPU, 0.4-0.7 s load frames (backlog 5a.2).
+- `cannot alias its pool memory` fills its 16-line log limit on NVIDIA and on the RX 9070 alike (1920x1080, 1600x900,
+  800x450 render targets); a suspect for the black patches of backlog 0a (`build/alias-plan.md`).
+
+A run on another machine goes through the user: copy `build/release/TotK-perf-log.vbs` next to the `totk.exe` you
+hand over. It starts the game with `TOTK_TRACE=perf` and writes `logs\perf-<date>-<time>.log`. Ask for the log; the
+user cannot run scripted input there.
 
 ## Checks before handing back
 

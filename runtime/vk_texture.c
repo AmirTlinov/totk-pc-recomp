@@ -55,6 +55,7 @@ typedef struct Tex {
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
     uint8_t listed;               // in owned[]
+    uint32_t wt_n;                // WriteTexels into the storage since the last upload
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -82,6 +83,8 @@ static int nsslots;
 static nvn_hmap samplers = {.klen = sizeof(samp_par)};
 static int nreleased;
 static uint64_t n_uploads, n_reuploads;
+// Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
+static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
 // TOTK_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
 static int tex_alias = -1;
@@ -516,7 +519,7 @@ static void upload(Tex *e) {
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
     if (!bpb || !t->mem) return;
-    uint64_t p0 = perf_begin();
+    uint64_t p0 = perf_begin(), u0 = kern_now_ns();
     int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
     uint32_t levels = linear ? 1 : e->pub.levels, layers = linear ? 1 : e->pub.layers;
     int astc = e->f.astc_bw != 0, rgb = e->f.expand_rgb;
@@ -596,8 +599,21 @@ static void upload(Tex *e) {
     free(raw_copy);
     free(ar);
     free(rg);
-    if (e->uploaded) n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
-    else n_uploads++, perf_count(PERF_CNT_TEX_UP);
+    uint64_t dt = kern_now_ns() - u0;
+    if (e->uploaded) {
+        n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
+        ru_n++, ru_bytes += t->L.size, ru_ns += dt;
+        if (e->wt_n) {
+            ru_wt_n++, ru_wt_bytes += t->L.size, ru_wt_ns += dt;
+            if (rt_trace & RT_TRACE_PERF)
+                rt_log("perf: frame %llu: re-upload after %u WriteTexels: texture %#llx fmt %#x %ux%u, %.1f KiB, %.3f ms",
+                       (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), e->wt_n,
+                       (unsigned long long)e->pub.addr, d->format, d->width, d->height, t->L.size / 1024.0, dt / 1e6);
+        }
+    } else {
+        n_uploads++, perf_count(PERF_CNT_TEX_UP);
+    }
+    e->wt_n = 0;
     e->uploaded = 1;
     e->n_up++;
     perf_end(PERF_TEX, p0);
@@ -976,6 +992,10 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)n_alias_copied, (unsigned long long)n_alias_upload,
                (unsigned long long)n_alias_uninit);
         n_alias_copied = n_alias_upload = n_alias_uninit = 0;
+        rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms)",
+               (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
+               (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6);
+        ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = 0;
         uint64_t ck, calls, untr;
         vk_mem_snap_stats(&ck, &calls, &untr);
         rt_log("perf: frame %llu: binding storage checks %llu (texture %llu), write-watch snapshot queries %llu, untracked %llu",
@@ -1180,6 +1200,7 @@ void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, co
             log_limited(&n_bad, "WriteTexels: region outside level %u of texture %#llx", g.level, (unsigned long long)e->pub.addr);
         vk_guest_written((uintptr_t)t->mem, t->L.size);
         if (e->pub.gpu_owned) image_texels(e, &g, r, (uint8_t *)src, 1);
+        else if (e->uploaded) e->wt_n++;
     } else if (e) {
         image_texels(e, &g, r, (uint8_t *)src, 1);
     }
