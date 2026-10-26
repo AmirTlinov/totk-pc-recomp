@@ -17,6 +17,7 @@
 # async_preempt = 1
 # Replay NVN submissions on their own thread, at most one frame behind the game (1 = on).
 # replay_async = 0
+
 [display]
 # Presentation mode: mailbox (default when the driver offers it, vsync otherwise), fifo (vsync) or immediate.
 # vk_present = mailbox

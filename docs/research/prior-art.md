@@ -137,7 +137,7 @@ and deterministic state-hash mode.
 
 ## D. Performance techniques in other Switch recomps (2026-10-21)
 
-Clones read at `build/research/` (ignored): HWDER (https://github.com/sonsegajp/HWDER, MIT), B2recomp
+Clones read locally (not in `refs/`): HWDER (https://github.com/sonsegajp/HWDER, MIT), B2recomp
 (https://github.com/K0NL/B2recomp, GPL-3.0; its runtime is a copy of ssbu-recomp), SuperMarioWonderRecomp
 (https://github.com/BelmanteGu/SuperMarioWonderRecomp, MIT), ssbu-recomp (GPL-3.0). GPL code: read only.
 
@@ -173,17 +173,18 @@ Clones read at `build/research/` (ignored): HWDER (https://github.com/sonsegajp/
 
 MIT (`LICENSE:1-4`), pinned in `tools/fetch_refs.sh`. 430 files, 8 commits, one week old. Its notes (`docs/SAVAGE-WIND.md`, Spanish, 904 lines, cited
 as `SW.md:line` = first line of the entry) are a dated log of BOTW 1.8.2 bring-up fixes. Most are bugs TotK 1.2.1 hits too. Paths are relative to
-`refs/SavageWindRecomp/`. BOTW addresses do not carry over to TotK; the mechanisms do.
+`refs/SavageWindRecomp/`; our code is cited by file and function, and the Ours column was updated 2026-10-26. BOTW
+addresses do not carry over to TotK; the mechanisms do.
 
 | Area | Theirs | Ours | Differs |
 |---|---|---|---|
-| Cores | 4 tokens, ticket queue per core (`runtime/kernel.c:96-235`); mask used only if single-bit (`kernel.c:867-880`) | 3 cores, mask-aware grant, preempt flag (`runtime/kernel.c:230-360`) | Yes |
-| Preemption points | SVCs plus every indirect call (`runtime/dispatch.c:167`) | SVCs only (`runtime/svc.c:140`) | Yes |
-| Exclusive monitor | Value CAS (`runtime/cpu.h:73-97`); pairs unsupported (`tools/lifter.py:391-392`) | Same macro plus 128-bit pair (`runtime/cpu.h:73-118`) | No (ours is a superset) |
-| Call/CopyCommands | Record `CMD_CALL`, executed recursively at submit (`runtime/nvn/cmdbuf.c:687-688`, `runtime/nvn/vulkan/exec.c:4689-4695`) | Inlined at record time (`runtime/nvn_api_cmd.c:395-410`) | Yes |
-| UpdateUniformBuffer | Applied at execution into guest memory, skipped if bytes equal (`exec.c:4863-4871`) | Recorded, written at replay (`nvn_api_cmd.c:430-441`) | Partly |
-| Submit | Host queue thread, part-wise GPU submit (`runtime/nvn/objects.c:157-170`, `exec.c:1015-1017`) | Replay on the submitting thread (`runtime/nvn_api_core.c:520-530`) | Yes |
-| Frame pacing | Patches VFR and the vsync wait (`tools/patches.py:186-223`) | none yet | Yes |
+| Cores | 4 tokens, ticket queue per core (`runtime/kernel.c:96-235`); mask used only if single-bit (`kernel.c:867-880`) | 3 cores, mask-aware grant, preempt flag, asynchronous preemption of a holder in game code (ours: `kernel.c` `core_take`, `kern_ap_stub`) | Yes |
+| Preemption points | SVCs plus every indirect call (`runtime/dispatch.c:167`) | SVCs and every indirect call (ours: `svc.c`, `dispatch.c` `dispatch_preempt`), plus the waiter's interrupt | No |
+| Exclusive monitor | Value CAS (`runtime/cpu.h:73-97`); pairs unsupported (`tools/lifter.py:391-392`) | Same macro plus 128-bit pair (ours: `cpu.h` `EXCL`) | No (ours is a superset) |
+| Call/CopyCommands | Record `CMD_CALL`, executed recursively at submit (`runtime/nvn/cmdbuf.c:687-688`, `runtime/nvn/vulkan/exec.c:4689-4695`) | Inlined at record time (ours: `nvn_api_cmd.c` `inline_recording`) | Yes |
+| UpdateUniformBuffer | Applied at execution into guest memory, skipped if bytes equal (`exec.c:4863-4871`) | Recorded, written at replay (ours: `nvn_api_cmd.c` `nvnCommandBufferUpdateUniformBuffer`) | Partly |
+| Submit | Host queue thread, part-wise GPU submit (`runtime/nvn/objects.c:157-170`, `exec.c:1015-1017`) | Replay on the submitting thread, submitted in parts every 64 draws; a queued replay thread behind `TOTK_REPLAY_ASYNC=1` (ours: `nvn_api_core.c` `nvnQueueSubmitCommands`, `vk_backend.c`) | Partly |
+| Frame pacing | Patches VFR and the vsync wait (`tools/patches.py:186-223`) | MacNativeGames' present-interval and real-time frame-step patches, back-edge present pacing (ours: `frame_rate.c`, `vk_backend.c`) | Yes |
 
 ### a. Threads
 - Core gate like ours: a token per core, best priority then ticket order (`kernel.c:96-165`). Reason given: BOTW shares a sead heap without a lock between threads pinned to one core (`kernel.c:97-103`).
@@ -191,7 +192,7 @@ as `SW.md:line` = first line of the entry) are a dated log of BOTW 1.8.2 bring-u
   Ours takes any free allowed core and keeps the ideal core for -2/-3, closer to Horizon.
 - Preemption at indirect calls: `rt_dispatch` compares `g_core_best_wait[core]` with the running priority and yields (`dispatch.c:167`, `kernel.c:120-130, 220-229`).
   Reason: a prio-48 job thread ran about 5 ms of guest code without a syscall once a second while a prio-44 worker on the same core, which the main thread waited for, sat waiting (a frame 10 ms longer each second) (`SW.md:540`).
-  Measured p99 frame time 23.6-24.8 ms without, 17.4-20.6 ms with (`SW.md:553`). Ours preempts only at SVCs (`runtime/kernel.c:354-362`, `runtime/svc.c:140`).
+  Measured p99 frame time 23.6-24.8 ms without, 17.4-20.6 ms with (`SW.md:553`). Ours has the same indirect-call check (`dispatch.c` `dispatch_preempt`).
 - Host work releases the core: the submit and present path calls `kernel_host_work_begin/end` (`kernel.c:196-205`, `runtime/nvn/objects.c:132, 245-249, 292-294`). Reason: the translation took about 10 ms a frame on the core token (`SW.md:295`).
 - Yield and `SleepThread(0)`: release then reacquire, so same-priority waiters go first (`kernel.c:231-236, 838`). `SignalProcessWideKey` and `ArbitrateUnlock` yield after unlocking, not before (`kernel.c:735-741`, `SW.md:256`).
 - `svcWaitProcessWideKeyAtomic`: releasing the mutex before marking the condvar hung half the runs (`SW.md:224`); a timed-out wait returns without the mutex, and a timeout racing a wake does not count as expired (`SW.md:253`). Same family as port-lessons S6.
@@ -217,11 +218,11 @@ as `SW.md:line` = first line of the entry) are a dated log of BOTW 1.8.2 bring-u
   Havok, stamina, time of day and animation all read the ratio; a ratio that alternated made Link's camera judder.
 - Dynamic resolution: BOTW picks 1600x900 or 1280x720 from GPU time in `ReportCounter`; their translation time dropped the open world to 720p. Fix: every counter in a frame gets the same timestamp (`exec.c:4890-4902`, `SW.md:414`).
 - Render-thread layout: the main thread records about 30 of 62 lists per frame, two workers the rest; the sead render thread (`0x7000d81100`) submits one list a frame and presents (`SW.md:503`).
-- FPCR.FZ is set at thread start (`0x7000b4de30`, `0x70000c4e3c`). Software flushing cost about 40 % of main-thread time; they mirror FZ into MXCSR (`runtime/simd.h:53-58, 239`; `SW.md:516`). Ours already mirrors it (`runtime/cpu.h:21`).
-- Depth clamp: BOTW enables it for the three sun-shadow cascades and the sun query. Ignored, geometry nearer than a cascade's near plane was clipped; tree shadows appeared, were cut and moved with the camera (`SW.md:593`). Ours records and applies it (`runtime/nvn_api_cmd.c:528`, `runtime/vk_pipeline.c:242`).
+- FPCR.FZ is set at thread start (`0x7000b4de30`, `0x70000c4e3c`). Software flushing cost about 40 % of main-thread time; they mirror FZ into MXCSR (`runtime/simd.h:53-58, 239`; `SW.md:516`). Ours already mirrors it (ours: `cpu.h` `fpcr_host`).
+- Depth clamp: BOTW enables it for the three sun-shadow cascades and the sun query. Ignored, geometry nearer than a cascade's near plane was clipped; tree shadows appeared, were cut and moved with the camera (`SW.md:593`). Ours records and applies it (ours: `nvn_api_cmd.c` `nvnCommandBufferSetDepthClamp`, `vk_pipeline.c` `depthClampEnable`).
   `SAMPLES_PASSED` returns 0 and `SetRenderEnableConditional`/`SetRasterizerDiscard` are no-ops (`SW.md:593`).
 - Same-pass feedback: the terrain fragment shader ORs bits into the G-buffer's own pixel, about 240 draws a frame. Copying the 1600x900 target before each draw cost 8.5 of 16 ms GPU. They use `VK_EXT_attachment_feedback_loop_layout` plus `VK_KHR_dynamic_rendering_local_read` with an in-pass barrier: copies 8.5 to 0.4 ms (`SW.md:325`).
-  Ours parks this (`docs/backlog.md:51-54`); TotK has 425-667 such draws.
+  Ours does the same since 2026-10-23 (`TOTK_FEEDBACK`, [maxwell.md](maxwell.md) check 10); TotK has 425-667 such draws.
 - Submit in parts: a pass boundary about every 300 draws (`exec.c:1015-1017`, `SW.md:302`), except after a shader storing to guest memory (about 10 dispatches a frame). Ranges those storage buffers can write are tracked; a UBO inside them is read in place from the imported heap, and any other CPU copy of that memory waits for the GPU (`SW.md:524`). Holding the rest of the list caused device-lost in 1 of 7 loads when copying half-written data.
 - Present on its own thread with a second queue; NVIDIA `vkQueuePresentKHR` blocked on the GPU for 13-18 ms in one frame of five (`runtime/nvn/vulkan/device.c:563-593`, `SW.md:306`).
 - Shaders and pipelines: translation cached in memory and on disk (`cache/xlate/`, `SW.md:309`); `vk_pipelines.bin` with a GPU/driver/translator header plus `vk_pipelines.list`, replayed by worker threads at start-up, first world frame waits for it (`SW.md:337`, `device.c:310-384`).
@@ -248,6 +249,10 @@ Nothing in the issues or the log describes objects teleporting for a frame, or a
 - Linux needs a 4 KB or 16 KB page kernel (`docs/linux.md`).
 
 ### What to adopt, ranked by expected effect on glitches and stutter
+
+Status 2026-10-26: 1 and 2 are in, 3 is in part (part-wise submit; the queue is off by default), the feedback-loop
+layout is in.
+
 1. Preemption at indirect calls in `rt_dispatch`, plus the host-work core release. Small change, removes a periodic 5-10 ms frame spike they measured (p99 23.6-24.8 to 17.4-20.6 ms). Needs TotK confirmation with our sched trace.
 2. Persistent pipeline list pre-warmed at start-up, with a key that holds only the used targets. Removes the 40-100 ms first-use hitches that read as stutter (frames over 40 ms 56 to 5 on their walk).
 3. Host submission queue with part-wise GPU submit (about 300 draws) and the guest-memory-write tracking for storing shaders. Their p99 went 38-43 ms to 29-34 ms with queue, MXCSR FZ and range tracking together (`SW.md:550-552`).

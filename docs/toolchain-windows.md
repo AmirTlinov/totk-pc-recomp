@@ -18,7 +18,7 @@ Versions are the ones verified on 2026-10-20. Newer patch releases are fine unle
 | Ghidra | 12.1.2 (pinned: SwitchLoader targets it; REA accepts 12.1.x) | Release zip from github.com/NationalSecurityAgency/ghidra into `toolchain/ghidra/` | `toolchain\ghidra\ghidra_12.1.2_PUBLIC\support\analyzeHeadless.bat` |
 | Ghidra SwitchLoader | 1.6.1-c600d05 for Ghidra 12.1.2 | Release zip from github.com/Adubbz/Ghidra-Switch-Loader, extracted into `<ghidra>\Ghidra\Extensions\SwitchLoader` | Ghidra lists "Nintendo Switch Binary" as a loader |
 | RenderDoc | 1.46 (`e4bd23b`) | Signed MSI from renderdoc.org, unpacked without installing: `msiexec /a <msi> /qn TARGETDIR=<tmp>`, then move `<tmp>\PFiles\RenderDoc\*` to `toolchain/renderdoc/` (drop `System`/`System64`, the VC++ runtime Windows already has). For Vulkan captures, once, as administrator: `renderdoccmd vulkanlayer --register --system` | `renderdoccmd version`; `renderdoccmd vulkanlayer --explain` reports the layer registered |
-| REA | rea-agents 6.7.0 | Skill in the repo (`skills-lock.json`); MCP server registered per clone, see [AGENTS.md](../AGENTS.md) | `claude mcp get rea`; `npx -y rea-agents@6.7.0 doctor --json` shows the Ghidra provider available |
+| REA | rea-agents 6.7.0 | Skill pinned in `.claude/skills/skills-lock.json`; MCP server registered per clone, see [AGENTS.md](../AGENTS.md) | `claude mcp get rea`; `npx -y rea-agents@6.7.0 doctor --json` shows the Ghidra provider available |
 
 ## PATH
 

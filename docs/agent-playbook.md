@@ -8,8 +8,7 @@ Read this before you run the game, take a frame dump or measure performance. Thi
 Start, build, hand back and clean up a task with the `private-build` skill (`.claude/skills/private-build/SKILL.md`): a git worktree on `task/<tag>` and a build dir `build/v121-<tag>`.
 The pipeline cache, `pipeline-keys.bin`, `shader-cache`, `shader-programs.bin` and `shader-answers.bin` live next to
 each `totk.exe`, so a task build starts cold: seed it by copying `build/v121`'s five before timing anything. A build seeded
-from an older one stalls on pipeline and shader builds, and its slow frames say nothing about the change. (Until 2026-10-22 every task build wrote into
-`build/v121`'s caches, and task builds broke each other's runs.)
+from an older one stalls on pipeline and shader builds, and its slow frames say nothing about the change.
 
 ## Running
 
@@ -39,7 +38,7 @@ other `totk.exe` or `ninja.exe` runs. The log's first and last lines record the 
 - `TOTK_PROFILE=<path> TOTK_PROFILE_FRAMES=lo-hi`: sampling profiler (`runtime/prof_win.c`), read with
   `tools/prof_report.py <profile> <totk.map>`. With `TOTK_PROFILE_RENDER=1` it samples the render thread only and keeps
   call chains: the report adds inclusive time per function and the exe callers of the driver and system DLLs.
-- `tools/regress.py <build> --base build/v121-m4 [--routes fight,rock,island,field] [--repeat 3] [--cold] [--validation]
+- `tools/regress.py <build> [--base <build>] [--routes fight,rock,island,field] [--repeat 3] [--cold] [--validation]
   [--out dir]`: runs the routes through `run_game.py --quiet`, scores logs and `TOTK_SHOTS` frames
   (`tools/regress_score.py`, tested by `tests/regress_score_test.py`) and prints median and worst per metric. Run the candidate alone and judge it against
   the targets: max fps, no slow frames (`perf: slow frame`), no black or flat frames, no new validation errors.
@@ -52,7 +51,7 @@ other `totk.exe` or `ninja.exe` runs. The log's first and last lines record the 
   - `fight.txt`: 59.1 fps mean, 60 median, replay 13.6 ms, 0 CPU-side slow frames; the slow frames left are
     pipeline and shader-translation waits.
 - `--validation` runs work in the world (1800 frames checked). The layer prints each message kind 10 times, so it
-  gives no totals; the known messages left are in the backlog correctness queue, item 8.
+  gives no totals; the known messages left are in the backlog, item 6.
 
 ## Frame dumps
 
@@ -63,7 +62,7 @@ copies and clears. `TOTK_DUMP_BUF=addr:size[:off:stride:w:h]` dumps a guest buff
 - A draw's argument lines come before its pass header.
 - Pass numbers shift between runs. Find a pass by its draw count instead: the g-buffer pass has about 1990 draws.
 
-RenderDoc cannot capture: the driver hides `VK_EXT_external_memory_host`.
+RenderDoc cannot capture: it hides `VK_EXT_external_memory_host` ([controls.md](controls.md), "RenderDoc capture").
 
 ## Other GPUs
 
@@ -72,27 +71,29 @@ Vulkan code queries the feature, extension, format or limit it uses and keeps a 
 it is missing (`vk_pipeline.c` provoking vertex and subgroup size pinning are examples). Never hard-code what this GPU
 reports: alignments, subgroup size, depth formats, `maxPushDescriptors`.
 
-Numbers from this machine do not carry over. Measured on the user's other machines (2026-10-24/25, logs and analysis
-in `build/mem-plan.md`):
+Numbers from this machine do not carry over. The user's other machines (the test machines of
+[backlog.md](backlog.md)) measured:
 
 - GTX 1050 Ti (4 GiB, 214 MiB BAR, no ReBAR; i7 8th-10th gen) and RTX 3090 Ti: GPU time 110-120 ms per frame in the
   world against 4.3 ms here, because the GPU reads imported host pools over PCIe. The VRAM mirror (cd6f490) brings
-  the 1050 Ti to 10-11 ms; that machine is now CPU-bound at 25-45 fps (replay 25-30 ms per frame, backlog 0b).
+  the 1050 Ti to 10-11 ms; that machine is now CPU-bound at 25-45 fps (replay 25-30 ms per frame, backlog item 8).
 - The same write-watch scan costs about 3x the CPU time it costs here.
-- NVIDIA has no ASTC: first texture uploads decode on the CPU, 0.4-0.7 s load frames (backlog 5a.2).
+- NVIDIA and AMD desktop GPUs have no ASTC: textures decode in a compute shader (`TOTK_ASTC`). Before that, CPU
+  decodes made 0.4-0.7 s load frames on the 1050 Ti. The UHD 630 reports ASTC, so it takes the native upload path
+  (not yet confirmed in a run).
 - `cannot alias its pool memory` fills its 16-line log limit on NVIDIA and on the RX 9070 alike (1920x1080, 1600x900,
-  800x450 render targets); a suspect for the black patches of backlog 0a (`build/alias-plan.md`).
+  800x450 render targets); a suspect for the black patches of backlog item 2.
 
-A run on another machine goes through the user: copy `build/release/TotK-perf-log.vbs` next to the `totk.exe` you
-hand over. It starts the game with `TOTK_TRACE=perf` and writes `logs\perf-<date>-<time>.log`. Ask for the log; the
-user cannot run scripted input there.
+A run on another machine goes through the user: hand over a build that starts with `TOTK_TRACE=perf` (the
+environment, or `trace = perf` in its `totk.ini`) and writes stderr to a log file, and ask for the log. The user
+cannot run scripted input there.
 
 ## Checks before handing back
 
 `totk.exe --probe-kernel`, `--probe-vkexec`, `--probe-nvn-tex` and `--probe-shader` run from the build directory and
 must pass. CPU-header changes also need `tests\diff\simd.py`, `lift.py` and `func.py` (AGENTS.md).
 `tools\build_game.py` hashes every object against `obj/objects.sha256` before it links and recompiles a mismatch (the
-faulty RAM flipped bits in stored objects once, `build/BOOTCRASH.md`). The line `objects verified: N, recompiled after
+faulty RAM flipped bits in stored objects once). The line `objects verified: N, recompiled after
 a hash mismatch: M` should show M of 0; a nonzero M means rerun the probes. A task build checks the shared objects against
 the main build's manifest, so build `build/v121` first.
 

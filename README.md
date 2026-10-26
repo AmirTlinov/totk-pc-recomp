@@ -16,15 +16,19 @@ The Switch code is lifted from ARM64 to C ahead of time, compiled with Clang, an
 
 ## Status
 
-This is an early build. Version 1.2.1 starts, shows the title screen, loads saves and runs in the world at 60 fps, with keyboard or gamepad input and with sound. Graphics, stability and speed are still being worked on: visual bugs and crashes are expected. You build it from source; nothing is packaged for download.
+This is an early build. Version 1.2.1 starts, shows the title screen, loads saves and runs in the world at 60 fps, with keyboard, mouse or gamepad input and with sound. Graphics, stability and speed are still being worked on: visual bugs and crashes are expected. No release has been published yet. You build the game from source, or assemble the installer described in [docs/installer.md](docs/installer.md), which builds it on the player's machine from the player's own files.
 
-It is developed and measured on one machine (Ryzen 9 7900X, Radeon RX 9070). NVIDIA and older AMD GPUs are expected to work but are barely tested; [docs/tester-guide.md](docs/tester-guide.md) says what to send back.
+It is developed on a Ryzen 9 7900X with a Radeon RX 9070 and tested on two more machines: a laptop with a GeForce GTX 1050 Ti and an 8th- to 10th-generation Core i7, and a Core i7 of the same generations with Intel UHD Graphics 630. An RTX 3090 Ti has also been measured. On the GTX 1050 Ti laptop the game is limited by the CPU and runs at 25 to 45 fps. Other GPUs are expected to work but are barely tested; [docs/tester-guide.md](docs/tester-guide.md) says what to send back.
 
 To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md). Include the GPU and driver, the log, and the steps that get there. Screenshots are fine.
 
 ### Known problems
 
-- For one frame, a rock or pillar can appear in the wrong place, or nearby objects vanish, most often while running or falling from a sky island. The leading suspect is thread ordering the game expects from the Switch scheduler; see [docs/backlog.md](docs/backlog.md).
+The full list, with the evidence for each item, is in [docs/backlog.md](docs/backlog.md).
+
+- For one frame, a rock or pillar can appear in the wrong place, or nearby objects vanish, most often while running or falling from a sky island.
+- Yunobo fades out and disappears when his ability is used.
+- On the GTX 1050 Ti, black patches appear for a moment, for example when the Purah Pad opens.
 - Without `tools\prepare_shaders.py` (build step 6) the first launch compiles shaders and pipelines and stutters until the caches fill. With it, a fight on a cleared driver cache had 1 slow frame instead of 37.
 - Newly streamed areas still have single slow frames while their textures upload.
 - Far terrain can turn flat gray or brown for a few frames after Link is knocked down.
@@ -32,9 +36,9 @@ To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md)
 ### Not in yet
 
 - macOS and Linux
-- Running 1.0.0, 1.1.2 or 1.4.3 (the extractor recognises those updates; the host is built for 1.2.1)
-- Button remapping
-- A package that builds the game code on a player's machine. Today you compile it yourself
+- Running 1.0.0, 1.1.2 or 1.4.3. The extractor recognises those updates, but the host is built for 1.2.1. Work on 1.4.3 has started.
+- An in-game settings menu. Settings are edited in `totk.ini`.
+- A published installer release
 
 ## Features
 
@@ -43,7 +47,8 @@ To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md)
 - Title screen, save loading and play, including the overworld, combat and the map.
 - 60 fps with the game running at real-time speed: MacNativeGames' 60 fps and frame-step patches are built in and can be switched off (`TOTK_FPS60=0`, `TOTK_REALTIME=0`).
 - F11 switches between the window and borderless fullscreen.
-- Keyboard and the first SDL3 gamepad, merged into one controller. Buttons are taken by position, so the south face button is B. The key map is in [docs/controls.md](docs/controls.md). Keys count only while the game window is in front.
+- Keyboard, mouse and the first SDL3 gamepad, merged into one controller. Buttons are taken by position, so the south face button is B. The mouse turns the camera (`mouse_sens` sets the speed) and Esc releases the cursor. Every button can be rebound in `totk.ini` (`bind_*` lines). The key map and the remapping syntax are in [docs/controls.md](docs/controls.md). Keys count only while the game window is in front.
+- Rumble with adjustable strength and response curve, and motion controls on gamepads that have a gyro.
 - Sound through the game's own audio renderer, played with SDL3, including Opus voice.
 - Language from the Windows locale, or from `TOTK_LOCALE`. A locale the game does not ship becomes `en-US`. `TOTK_LANG` sets a Switch code directly (`en-US`, `ja`, `zh-Hant`, …).
 - Docked mode by default, which reports the boost performance configuration. `TOTK_OPERATION_MODE=handheld` reports the normal one.
@@ -58,8 +63,8 @@ The design and the research it rests on are in [docs/architecture.md](docs/archi
 
 1. **Input.** Your base game and the 1.2.1 update are decrypted and unpacked locally with your own `prod.keys`. File hashes are checked against known retail dumps.
 2. **CPU.** `main`, `sdk` and `subsdk0` are lifted to C, one function per guest function. NEON and floating point are lowered to C that follows ARM rounding. Guest addresses are host addresses. Jump tables are resolved by a symbolic pass in the generator.
-3. **Host.** Threads, memory, the RomFS, saves, time, account, language and the audio renderer are implemented on Windows. Every guest thread is a host thread, but only three run game code at once: the host models the Switch's three application cores and its priority preemption, because the game keeps per-core data without locks and orders some work by thread priority alone. Input and audio output go through SDL3.
-4. **Graphics.** The NVN front end records what the game submits. A Vulkan 1.3 back end replays it, uploading the memory the CPU wrote and writing GPU results back when the CPU reads them. The Ryujinx Maxwell translator, built as `totk_xlate.exe`, turns shaders into SPIR-V. Pipelines are linked from precompiled stages on first use (`VK_EXT_graphics_pipeline_library`) and optimised in the background.
+3. **Host.** Threads, memory, the RomFS, saves, time, account, language and the audio renderer are implemented on Windows. Every guest thread is a host thread, but only three run game code at once: the host models the Switch's three application cores and its priority preemption, because the game keeps per-core data without locks and orders some work by thread priority alone. A thread that waits for a core interrupts a lower-priority holder that is running game code, as MacNativeGames does. Input and audio output go through SDL3.
+4. **Graphics.** The NVN front end records what the game submits. A Vulkan 1.3 back end replays it, uploading the memory the CPU wrote and writing GPU results back when the CPU reads them. On a discrete GPU, memory the game binds as buffers is mirrored in video memory. The Ryujinx Maxwell translator, built as `totk_xlate.exe`, turns shaders into SPIR-V. Pipelines are linked from precompiled stages on first use (`VK_EXT_graphics_pipeline_library`) and optimised in the background. ASTC textures are decoded by a compute shader, or uploaded as they are where the GPU samples ASTC.
 
 ## How this project is made
 
@@ -70,7 +75,7 @@ Most of the code and documentation here is written by AI coding agents (Claude C
 - Players and testers: [controls](docs/controls.md), [tester guide](docs/tester-guide.md).
 - How it works: [architecture](docs/architecture.md), with research notes on the upstream projects, Maxwell GPU behaviour and what other ports learned in [docs/research/](docs/research/).
 - What is being worked on: [backlog](docs/backlog.md).
-- Building: [toolchain-windows.md](docs/toolchain-windows.md), [toolchain-msys2-python.md](docs/toolchain-msys2-python.md).
+- Building: [toolchain-windows.md](docs/toolchain-windows.md), [toolchain-msys2-python.md](docs/toolchain-msys2-python.md), and the [installer](docs/installer.md) that builds the game on a player's machine.
 - Coding agents: [AGENTS.md](AGENTS.md) and [docs/agent-playbook.md](docs/agent-playbook.md).
 
 ## Building from source
@@ -171,6 +176,7 @@ This project stands on two MIT codebases and the projects they came from. Code t
 - **[hactool](https://github.com/SciresM/hactool)** by SciresM (ISC) extracts NCA and update containers.
 - **[SDL 3](https://libsdl.org)** (zlib) is the gamepad and the audio output.
 - **[libopus](https://opus-codec.org)** (BSD) decodes voice.
+- **[libvpx](https://chromium.googlesource.com/webm/libvpx)** (BSD) decodes the cutscene movies.
 - **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** (MIT) allocates GPU memory.
 - **[deko3d](https://github.com/devkitPro/deko3d)** (zlib) is the source of the block-linear image layout, via MacNativeGames, and a reference for Maxwell command semantics.
 - **[SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp)** (MIT), a static recompilation of *Breath of the Wild*, is the model for preemption at indirect calls and a reference for frame pacing and the platform split.
@@ -195,6 +201,7 @@ Third-party code keeps its own license. The full list, with the commit each copy
 | SDL 3 | 3.4.18 | zlib | `SDL3.dll` next to `totk.exe` (gamepad, audio) |
 | libiconv | 1.19 | LGPL 2.1+ | `libiconv-2.dll`, unmodified, a dependency of SDL 3 |
 | libopus | 1.6.1 | BSD 3-clause | `libopus-0.dll` next to `totk.exe` (voice) |
+| libvpx | 1.17.0 | BSD 3-clause, with the WebM patent grant | linked statically into `totk.exe` (movies) |
 | Vulkan Memory Allocator | 3.4.0 | MIT | compiled into `totk.exe` |
 | Ryujinx shader translator | 1.3.2 | MIT | `build\xlate\totk_xlate.exe`, a separate process |
 | GCC runtime (`libstdc++`) | 16.2.0 | GPL 3.0 with the GCC Runtime Library Exception | linked into `totk.exe` |
