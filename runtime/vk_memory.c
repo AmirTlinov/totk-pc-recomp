@@ -467,8 +467,12 @@ int vk_mem_class_of(uint64_t addr) {
 // ---------------------------------------------------------------- census
 static volatile LONG64 traffic[VK_MCLS_N][VK_MUSE_N];
 
+// Every caller is the replay (vk_exec*, under vk_sync_submit's lock), about ten adds per draw: one writer at a time, so
+// a plain add, not a locked one. An add racing the census's reset may be lost.
 void vk_mem_count(int cls, int use, uint64_t bytes) {
-    if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N) InterlockedAdd64(&traffic[cls][use], (LONG64)bytes);
+    if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N)
+        __atomic_store_n(&traffic[cls][use], __atomic_load_n(&traffic[cls][use], __ATOMIC_RELAXED) + (LONG64)bytes,
+                         __ATOMIC_RELAXED);
 }
 
 static void flag_names(uint32_t f, char *buf, size_t n) {
