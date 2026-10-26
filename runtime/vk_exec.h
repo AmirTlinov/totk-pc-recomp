@@ -51,6 +51,7 @@ typedef struct VkExec {
     int rt_resolved;                   // color[] and depth hold this command buffer's images for rt
     VkExecTarget color[8], depth;        // resolved targets
     uint32_t pass_w, pass_h, pass_layers;            // render area and layer count of the open (or next) pass
+    int pass_noatt;                                   // the pass has no attachment: its size follows the draws (vk_exec_noatt_dims)
     VkFormat pass_color[8], pass_depth, pass_stencil; // attachment formats of the pass (VkPipelineRenderingCreateInfo);
                                                       // VK_FORMAT_UNDEFINED: none
     uint32_t pass_ncolor, pass_samples;               // colorAttachmentCount and rasterization samples of the pass
@@ -123,6 +124,7 @@ void vk_exec_draw_new_cb(void);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
+void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set
 // 1: every target of the current pass (any 1: at least one) was rendered in the previous presented frame (per-frame
 // targets); 0 otherwise, or when the pass has none.
 int vk_exec_targets_recent(VkExec *ex, int any);
