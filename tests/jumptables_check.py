@@ -57,6 +57,7 @@ class Oracle:
         self.set_at = self.regs = None
         self.start = self.cmp = None   # the first instruction of the bounds-check block, the bounds cmp
         self.guard = None              # _taken: the b.ls/b.lo into the dispatch block (set_at)
+        self.count = None              # indices the bounds check lets through
         self.exclude = frozenset()     # indices the emulation skips (oracle_wrong: excluded on every way in)
         self.watch = self.seen = None  # (address, register): record the register when the emulation reaches address
 
@@ -68,7 +69,7 @@ class Oracle:
 
     def jump_table(self, br_pc, entry, end):
         """Targets, or None. Leaves the index set point and the registers set there in self.set_at, self.regs."""
-        self.set_at = self.regs = self.start = self.cmp = self.guard = None
+        self.set_at = self.regs = self.start = self.cmp = self.guard = self.count = None
         r = self._fallthrough(br_pc, entry, end)
         if r is None:
             r = self._taken(br_pc, entry, end)
@@ -164,7 +165,7 @@ class Oracle:
             count = limit + 1 if bits(w, 0, 4) == 9 else limit
             if count <= 0 or count > 4096:
                 continue
-            self.set_at, self.regs, self.guard, self.cmp = s, [bits(cw, 5, 5)], g, g - 4
+            self.set_at, self.regs, self.guard, self.cmp, self.count = s, [bits(cw, 5, 5)], g, g - 4, count
             b = g - 4
             while b - 4 >= entry and g - 4 - (b - 4) <= 4 * 12 and self.kind(b - 4) in ('op', 'asm'):
                 b -= 4
@@ -206,7 +207,7 @@ class Oracle:
         while start - 4 >= entry and cmp - (start - 4) <= 4 * 12 and self.kind(start - 4) in ('op', 'asm'):
             start -= 4
         regs = self._index_regs(start, cmp, bits(w, 5, 5))
-        self.set_at, self.regs, self.start, self.cmp = cmp, regs, start, cmp
+        self.set_at, self.regs, self.start, self.cmp, self.count = cmp, regs, start, cmp, count
         rn = bits(self.word(br_pc), 5, 5)
         targets = []
         try:
@@ -435,38 +436,179 @@ def _ways_in(fc, lo, hi, tables):
     return out
 
 
-def excluded_indices(fc, br, oracle, tables):
-    """Indices that cannot reach the oracle's bounds check: the intersection over every way into its block
-    [oracle.start, oracle.cmp] of the index value that way rules out. Only `cmp wR, #k; b.ne <block start>` with R an
-    index register the block does not write rules out a value (k); any other way in rules out nothing. When the oracle
-    enters the dispatch block by the taken bounds branch (_taken), that branch must be the only way into the dispatch
-    block. Uses the module's words and capstone, plus the resolver's other tables as possible ways in."""
-    mod, lo, hi = fc.mod, oracle.start, oracle.cmp
+# Instructions an index slice may hold: integer arithmetic that reads only general registers and writes the flags at
+# most (the flags-reading forms adc/sbc/csel/ccmp/... stay out).
+_FLAG_SETTERS = {'cmp', 'cmn', 'tst', 'ands', 'bics', 'adds', 'subs', 'negs'}
+_PURE_ALU = {'mov', 'movz', 'movn', 'movk', 'add', 'sub', 'and', 'orr', 'eor', 'bic', 'orn', 'eon', 'lsl', 'lsr',
+             'asr', 'ror', 'ubfx', 'sbfx', 'ubfiz', 'sbfiz', 'bfi', 'bfxil', 'uxtb', 'uxth', 'uxtw', 'sxtb', 'sxth',
+             'sxtw', 'neg', 'mvn', 'mul', 'madd', 'msub', 'udiv', 'sdiv', 'ubfm', 'sbfm', 'bfm'} | _FLAG_SETTERS
+_DEPTH = 4   # predecessor blocks above the dispatch region
+
+
+def _ends_block(ins):
+    return ins is None or _branch_target(ins) is not None or ins.mnemonic in ('br', 'ret', 'brk', 'udf')
+
+
+class _Ways:
+    """Direct branches and fall-throughs of one function, with the addresses control may enter from elsewhere."""
+
+    def __init__(self, fc, tables):
+        mod = self.mod = fc.mod
+        self.entry, self.into = fc.entry, {}
+        for a in range(fc.entry, fc.end, 4):
+            ins = _insn(mod, a)
+            t = _branch_target(ins)
+            if t is not None and fc.entry <= t < fc.end:
+                self.into.setdefault(t, []).append((a, ins))
+        self.roots = {fc.entry} | set(fc.cfg.unknown)
+        self.roots |= {t for ts in tables.values() if ts != 'all' for t in ts}
+        self.leaders = self.roots | set(self.into)
+
+    def block_start(self, a):
+        s = a
+        while s > self.entry and s not in self.leaders and not _ends_block(_insn(self.mod, s - 4)):
+            s -= 4
+        return s
+
+    def preds(self, s):
+        """(branch or last instruction, insn, taken) for every way into s."""
+        out = [(a, ins, True) for a, ins in self.into.get(s, ())]
+        if s > self.entry:
+            p = _insn(self.mod, s - 4)
+            if p is not None and p.mnemonic not in ('b', 'br', 'ret', 'brk', 'udf'):
+                out.append((s - 4, p, False))
+        return out
+
+
+def _edge_holds(oracle, ways, start, src, ins, taken, reg, k):
+    """Whether the way out of the block [start, src] over the branch at src can be taken with x<reg> = k at src:
+    False only when the branch condition is a function of x<reg> alone (its slice, back to the last write of x<reg>,
+    is plain arithmetic and flag setting on x<reg>), evaluated by Unicorn; True otherwise."""
+    if _branch_target(ins) is None or ins.mnemonic == 'b':
+        return True
+    mod = ways.mod
+
+    def gp_reads(i):   # general registers read, zr dropped; None when sp or a non-general register is read
+        try:
+            r, _ = i.regs_access()
+        except capstone.CsError:
+            return None
+        if i.mnemonic in ('cmp', 'cmn', 'tst'):   # capstone lists their first operand as written, not read
+            r = list(r) + [op.reg for op in i.operands if op.type == capstone.arm64.ARM64_OP_REG]
+        out = set()
+        for x in r:
+            name = i.reg_name(x)
+            if name in ('xzr', 'wzr', 'nzcv'):
+                continue
+            n = _regno(name)
+            if n is None or n == 31:
+                return None
+            out.add(n)
+        return out
+
+    def sets_flags(i):
+        try:
+            return i.mnemonic in _FLAG_SETTERS or 'nzcv' in (i.reg_name(r) for r in i.regs_access()[1])
+        except capstone.CsError:
+            return True
+
+    if ins.mnemonic.startswith('b.'):
+        setter = next((x for x in range(src - 4, start - 4, -4) if sets_flags(_insn(mod, x))), None)
+        if setter is None or _insn(mod, setter).mnemonic not in _FLAG_SETTERS                 or any(reg in _writes(_insn(mod, x)) for x in range(setter, src, 4)):
+            return True
+        need, top, sl = gp_reads(_insn(mod, setter)), setter, [setter]
+    else:
+        need, top, sl = gp_reads(ins), src, []
+    if need is None:
+        return True
+    for x in range(top - 4, start - 4, -4):
+        i = _insn(mod, x)
+        w = _writes(i)
+        if reg in w:
+            break   # x<reg> is k from here on
+        if not w & need:
+            continue
+        r = gp_reads(i)
+        if i.mnemonic not in _PURE_ALU or r is None:
+            return True
+        sl.append(x)
+        need = (need - w) | r
+    if need - {reg}:
+        return True
+    mu = oracle.mu
+    try:
+        for r in range(29):
+            mu.reg_write(A.UC_ARM64_REG_X0 + r, SCRATCH_MEM + 0x80000)
+        mu.reg_write(A.UC_ARM64_REG_X0 + reg if reg < 29 else A.UC_ARM64_REG_X29, k)
+        for x in reversed(sl):
+            mu.emu_start(x, 0, count=1)
+        mu.emu_start(src, 0, count=1)
+        went = mu.reg_read(A.UC_ARM64_REG_PC) != src + 4
+    except uc.UcError:
+        return True
+    return went == taken
+
+
+def _way_live(oracle, ways, src, ins, taken, reg, k, depth, seen):
+    """Whether the way over src can carry x<reg> = k: its edge holds (_edge_holds) and its block either writes x<reg>
+    or is entered with k (_reaches)."""
+    start = ways.block_start(src)
+    if not _edge_holds(oracle, ways, start, src, ins, taken, reg, k):
+        return False
+    if any(reg in _writes(_insn(ways.mod, x)) for x in range(start, src + 4, 4)):
+        return True
+    return _reaches(oracle, ways, start, reg, k, depth, seen)
+
+
+def _reaches(oracle, ways, s, reg, k, depth, seen):
+    """Whether control can enter s with x<reg> = k, over at most `depth` predecessor blocks."""
+    if s in ways.roots or depth == 0 or s in seen:
+        return True
+    seen = seen | {s}
+    return any(_way_live(oracle, ways, src, ins, taken, reg, k, depth - 1, seen)
+               for src, ins, taken in ways.preds(s))
+
+
+def excluded_indices(fc, br, oracle, tables, count):
+    """Indices < count that cannot reach br: no way into the dispatch region [oracle.start, br] (its first instruction
+    and every branch target inside it) can carry them. The index is the register of the oracle's bounds cmp, which no
+    instruction from such an entry to br may write. Ways in are the module's direct branches and fall-throughs by
+    capstone; the function entry, exception landing pads and every resolver table target count as entries from
+    anywhere. Branch conditions are evaluated only where they depend on the index alone (_edge_holds). When the
+    oracle enters the dispatch block by the taken bounds branch (_taken), that branch must be its only way in."""
+    mod, lo = fc.mod, oracle.start
     if lo is None:
         return frozenset()
     if oracle.guard is not None:
         ways = _ways_in(fc, oracle.set_at, br, tables)
         if ways is None or [a for a, _, _ in ways] != [oracle.guard]:
             return frozenset()
-    written = set()
-    for a in range(lo, hi, 4):
-        written |= _writes(_insn(mod, a))
-    regs = set(oracle.regs) - written
-    ways = _ways_in(fc, lo, hi, tables)
-    if not ways:
+    reg = bits(oracle.word(oracle.cmp), 5, 5)
+    ways = _Ways(fc, tables)
+    # The region falls through from lo to br (_fallthrough), or is the bounds-check block whose b.ls/b.lo is the only
+    # way into the dispatch block (_taken).
+    hi = br if oracle.guard is None else oracle.cmp
+    if oracle.guard is not None and any(reg in _writes(_insn(mod, x)) for x in range(oracle.set_at, br, 4)):
         return frozenset()
-    out = None
-    for a, ins, t in ways:
-        k = None
-        if ins.mnemonic == 'b.ne' and t == lo and a - 4 >= fc.entry:
-            c = _insn(mod, a - 4)
-            if c is not None and c.mnemonic == 'cmp' and len(c.operands) == 2                     and c.operands[1].type == capstone.arm64.ARM64_OP_IMM                     and _regno(c.reg_name(c.operands[0].reg)) in regs:
-                k = c.operands[1].imm
-        here = frozenset() if k is None else frozenset([k])
-        out = here if out is None else out & here
-        if not out:
+    entries = [lo] + [t for t in range(lo + 4, hi + 4, 4) if t in ways.leaders]
+    for e in entries:
+        if e in ways.roots or any(reg in _writes(_insn(mod, x)) for x in range(e, hi, 4)):
             return frozenset()
-    return out
+    out = set()
+    for k in range(count):
+        live = False
+        for e in entries:
+            for src, ins, taken in ways.preds(e):
+                if lo <= src < hi:
+                    continue   # inside the region: its own conditions are ignored
+                if _way_live(oracle, ways, src, ins, taken, reg, k, _DEPTH, frozenset()):
+                    live = True
+                    break
+            if live:
+                break
+        if not live:
+            out.add(k)
+    return frozenset(out)
 
 
 def oracle_wrong(fc, br, oracle, ours=None):
@@ -476,8 +618,9 @@ def oracle_wrong(fc, br, oracle, ours=None):
       register or is reloaded from memory, which the oracle leaves at its scratch value);
     - the table base the oracle uses (its replay of ADRP/ADR/ADD-imm from the entry) is not the one constant that
       every reaching definition gives;
-    - the oracle enumerates an index that no way into the bounds check lets through (excluded_indices: a case k
-      peeled off by `cmp wI, #k; b.ne` before the table), and without it the oracle gives the resolver's targets.
+    - the oracle enumerates an index that no way into the dispatch region lets through (excluded_indices: a case
+      peeled off before the table by `cmp wI, #k; b.ne`, `cbnz wI` or a range check on wI, possibly some blocks up),
+      and without it the oracle gives the resolver's targets.
     """
     mod = fc.mod
     s = fc.cfg.block(br)
@@ -503,7 +646,7 @@ def oracle_wrong(fc, br, oracle, ours=None):
             return f'oracle base x{reg} = {seen:#x}, every reaching definition gives {value:#x}'
     if ours is not None:
         oracle.jump_table(br, fc.entry, fc.end)
-        ex = excluded_indices(fc, br, oracle, {a: t for a, t in fc.tables.items() if a != br})
+        ex = excluded_indices(fc, br, oracle, fc.tables, oracle.count) if oracle.count else frozenset()
         if ex:
             oracle.exclude = ex
             try:
@@ -511,7 +654,7 @@ def oracle_wrong(fc, br, oracle, ours=None):
             finally:
                 oracle.exclude = frozenset()
             if again == ours:
-                return 'index ' + ', '.join(str(k) for k in sorted(ex)) + ' excluded by `cmp #k; b.ne` on every way in'
+                return 'index ' + ', '.join(str(k) for k in sorted(ex)) + ' unreachable on every way in'
     return None
 
 
