@@ -98,6 +98,10 @@ static struct {
     int st_valid;
     VkBuffer vb[17];                     // vertex buffers last bound
     VkDeviceSize vo[17], vsz[17], vstr[17];
+    int vcls[17];                        // their pool class and pool record, for the census
+    void *vpool[17];
+    NVNbufferRange vin[16];              // the ranges they were resolved from, under vk_mem_gen vgen
+    uint64_t vgen;
     int vb_valid;
     uint8_t support[SUPPORT_BYTES];      // last support buffer and where it lives
     float sup_in[3];                     // the support_fill arguments it was filled from
@@ -560,9 +564,24 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
     return 0;
 }
 
-// Texture and image types of a stage's first 32 slots, each kept with the handle and the resolution generation
-// (vk_texture_slots_gen) it was looked up under: a slot is looked up again, a hash probe, only when either changed.
-static struct { uint64_t tex[32], img[32]; uint32_t tgen[32], igen[32]; uint8_t tv[32], iv[32], tt[32], it[32]; } AC[6];
+// Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
+// was looked up under: a slot is looked up again, a hash probe, only when the handle changed or its slot may resolve
+// otherwise (slot_still).
+static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; } AC[6];
+
+// vk_texture_slot_token of the slot a texture or image handle names; an empty handle always resolves to nothing.
+static uint64_t token_of(uint64_t h) { return h ? vk_texture_slot_token((int)(h & 0xfffff)) : 1; }
+
+// Whether what handle h resolved to under the global generation *egen and its slot token etok (both read before that
+// lookup) still holds at global generation gen: nothing at all changed since, or not its slot (the token, read only when
+// the global generation moved, about every 16 draws). A token hit moves *egen to gen.
+static int slot_still(uint32_t *egen, uint64_t etok, uint64_t h, uint32_t gen) {
+    if (*egen == gen) return 1;
+    uint64_t t = token_of(h);
+    if (!t || t != etok) return 0;
+    *egen = gen;
+    return 1;
+}
 static int shader_memo_on(void);
 
 // The slots of (program, stage) whose types its translation reads (gfx_shader_slot_mask), learned from its first
@@ -602,18 +621,20 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
             a->local[k] = (uint16_t)(l ? l : 1);
         }
     typeof(AC[0]) *c = &AC[st];
-    // Read before the lookups (one that creates an entry bumps it) and unlocked: a registration racing with it is
-    // ordered after this draw, and a slot stored under an older generation is only looked up again.
+    // The generation and tokens are read before the lookups (one that creates an entry changes them) and unlocked: a
+    // registration racing with them is ordered after this draw, and a slot stored under older ones is only looked up
+    // again.
     uint32_t gen = vk_texture_slots_gen();
     int locked = 0, check = shader_memo_on() == 2;
     for (uint32_t m = mask; m; m &= m - 1) {
         int slot = __builtin_ctz(m);
         uint64_t h = ex->tex[st][slot], hi = ex->img[st][slot];
-        int tmiss = !c->tv[slot] || c->tgen[slot] != gen || c->tex[slot] != h;
-        int imiss = !c->iv[slot] || c->igen[slot] != gen || c->img[slot] != hi;
+        int tmiss = c->tex[slot] != h || !c->ttok[slot] || !slot_still(&c->tgen[slot], c->ttok[slot], h, gen);
+        int imiss = c->img[slot] != hi || !c->itok[slot] || !slot_still(&c->igen[slot], c->itok[slot], hi, gen);
+        uint64_t tt = tmiss ? token_of(h) : 0, it = imiss ? token_of(hi) : 0;
         if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
-        if (tmiss) c->tt[slot] = type_of_handle(h), c->tex[slot] = h, c->tgen[slot] = gen, c->tv[slot] = 1;
-        if (imiss) c->it[slot] = type_of_handle(hi), c->img[slot] = hi, c->igen[slot] = gen, c->iv[slot] = 1;
+        if (tmiss) c->tt[slot] = type_of_handle(h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
+        if (imiss) c->it[slot] = type_of_handle(hi), c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
         if (check && (type_of_handle(h) != c->tt[slot] || type_of_handle(hi) != c->it[slot]))   // TOTK_SHADER_MEMO=check
             rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
         a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot];
@@ -916,19 +937,51 @@ static int in_fbl(const VkExec *ex, VkImage img) {
     return 0;
 }
 
-// Attachment slots of the open pass (bit 8 depth) whose subresource the view of img covers.
-static uint32_t attached_as(const VkExec *ex, const VkTexImage *img, const view_t *v, int hv) {
-    uint32_t l0 = 0, l1 = img->levels, a0 = 0, a1 = img->layers, m = 0;
-    if (hv && v->set_levels) l0 = v->base_level, l1 = v->base_level + (v->nlevels ? v->nlevels : img->levels);
-    if (hv && v->set_layers) a0 = v->min_layer, a1 = v->min_layer + (v->nlayers ? v->nlayers : img->layers);
+// The image and the levels [l0, l1) and layers [a0, a1) a texture's view covers.
+typedef struct { VkImage image; uint32_t l0, l1, a0, a1; } SubRange;
+
+static SubRange sub_of(const VkTexImage *img, const view_t *v, int hv) {
+    SubRange r = {img->image, 0, img->levels, 0, img->layers};
+    if (hv && v->set_levels) r.l0 = v->base_level, r.l1 = v->base_level + (v->nlevels ? v->nlevels : img->levels);
+    if (hv && v->set_layers) r.a0 = v->min_layer, r.a1 = v->min_layer + (v->nlayers ? v->nlayers : img->layers);
+    return r;
+}
+
+// Attachment slots of the open pass (bit 8 depth) whose subresource r covers.
+static uint32_t attached_as(const VkExec *ex, const SubRange *r) {
+    uint32_t m = 0;
+    if (!r->image) return 0;
     for (uint32_t i = 0; i < 9; i++) {
         const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
-        if ((i < 8 && i >= ex->pass_ncolor) || t->image != img->image) continue;
-        if (t->level < l0 || t->level >= l1) continue;
-        if (!t->is3d && (t->base_layer + t->layers <= a0 || t->base_layer >= a1)) continue;
+        if ((i < 8 && i >= ex->pass_ncolor) || t->image != r->image) continue;
+        if (t->level < r->l0 || t->level >= r->l1) continue;
+        if (!t->is3d && (t->base_layer + t->layers <= r->a0 || t->base_layer >= r->a1)) continue;
         m |= 1u << i;
     }
     return m;
+}
+
+// TOTK_TEX_MEMO (tex_info, feedback_scan): 0 off, 1 on, 2 (=check) computes every hit again and stops on a difference.
+static int td_mode(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_value("TOTK_TEX_MEMO");
+        on = !strcmp(e, "check") ? 2 : strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+// The subresource a texture handle samples, per handle, kept while its slot resolves the same (slot_still): a draw's
+// texture bindings change the whole-scan memo below, but the handles they bind were mostly looked up before, in this
+// pass or an earlier one. Direct-mapped.
+#define FM_N 8192
+static struct { uint64_t h, tok; uint32_t gen; SubRange r; } FM[FM_N];
+
+static SubRange sampled_sub(uint64_t h) {   // texture lock held
+    view_t v;
+    int hv;
+    const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
+    return img ? sub_of(img, &v, hv) : (SubRange){0};
 }
 
 // Attachments of the open pass the fragment shader fs samples; kept while the shader, the texture bindings and the
@@ -937,18 +990,32 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     if (ex->fb_fs == fs && ex->fb_serial == ex->tex_serial && ex->fb_pass == ex->pass_serial) return ex->fb_sampled;
     const GfxShaderRes *res;
     int n = gfx_shader_resources(fs, GFX_RES_TEX, &res);
-    uint32_t m = 0;
-    vk_texture_lock();
+    uint32_t m = 0, gen = vk_texture_slots_gen();   // before any lookup
+    int memo = td_mode(), locked = 0;
     for (int r = 0; r < n; r++)
         for (int k = 0; k < (res[r].count ? res[r].count : 1); k++) {
             int slot = res[r].slot + k;
             uint64_t h = slot >= 0 && slot < 128 ? ex->tex[NVN_STAGE_FS][slot] : 0;
-            view_t v;
-            int hv;
-            const VkTexImage *img = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
-            if (img) m |= attached_as(ex, img, &v, hv);
+            if (!h) continue;
+            typeof(FM[0]) *f = &FM[(h * 0x9E3779B97F4A7C15ull) >> 51];
+            if (memo && f->h == h && slot_still(&f->gen, f->tok, h, gen)) {
+                if (memo == 2) {
+                    if (!locked) vk_texture_lock(), locked = 1;
+                    SubRange c = sampled_sub(h);
+                    if (memcmp(&c, &f->r, sizeof c))
+                        rt_fatal("vk_exec: feedback memo of handle %#llx differs from a lookup", (unsigned long long)h);
+                }
+                m |= attached_as(ex, &f->r);
+                continue;
+            }
+            uint64_t tok = token_of(h);   // before the lookup
+            if (!locked) vk_texture_lock(), locked = 1;
+            SubRange sr = sampled_sub(h);
+            m |= attached_as(ex, &sr);
+            if (tok) *f = (typeof(*f)){.h = h, .tok = tok, .gen = gen, .r = sr};
+            else f->h = 0;
         }
-    vk_texture_unlock();
+    if (locked) vk_texture_unlock();
     ex->fb_fs = fs, ex->fb_serial = ex->tex_serial, ex->fb_pass = ex->pass_serial, ex->fb_sampled = m;
     return m;
 }
@@ -1000,48 +1067,60 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
 }
 
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                          VkDescriptorImageInfo *out);
+                          VkDescriptorImageInfo *out, VkImage *image);
 
-// Sampled-texture descriptors per (handle, resource type, separate), kept while nothing they derive from changed: every
-// slot's resolution and texture entry (vk_texture_slots_gen), the samplers (vk_sampler_gen), the submission
-// (vk_texture_epoch: the first binding of a slot in a submission checks its storage) and, in a pass with images in the
-// feedback layout, the pass. Draws bind the same textures thousands of times a frame; a hit skips the slot lookup, the
-// view key with its hash probe and the sampler lookup. Storage images, which note their binding per submission, are
+// Sampled-texture descriptors per (handle, resource type, separate), kept while nothing they derive from changed: the
+// slot's resolution and texture entry (slot_still) and the samplers (vk_sampler_gen); the layout is set again on every
+// hit from the images in the feedback layout (in_fbl of the image kept with it). The first binding of a slot in a submission (vk_texture_epoch) still makes the slot lookup
+// for its storage check; a re-upload writes the same image, so the descriptor stays. Draws bind the same textures
+// thousands of times a frame (15,000 lookups a frame in the monsters fight); a hit skips the slot lookup, the view key
+// with its hash probe and the sampler lookup. Storage images, which note their binding per submission, are
 // not kept. Direct-mapped; texture lock held. TOTK_TEX_MEMO=0 turns it off; =check computes every hit again and stops
 // on a difference.
-#define TD_N 4096
-static struct { uint64_t h; uint32_t gen, epoch, sgen, pass; uint16_t type; uint8_t separate, valid; VkDescriptorImageInfo out; } TD[TD_N];
-static int td_on = -1;
+#define TD_N 8192
+static struct {
+    uint64_t h, tok;
+    uint32_t gen, epoch, sgen;
+    uint16_t type;
+    uint8_t separate, valid;
+    VkImage image;
+    VkDescriptorImageInfo out;
+} TD[TD_N];
 
 static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out) {
-    if (td_on < 0) {
-        const char *e = cfg_value("TOTK_TEX_MEMO");
-        td_on = !strcmp(e, "check") ? 2 : strcmp(e, "0") != 0;
-    }
-    if (!h || storage || !td_on) return tex_info_full(ex, r, h, storage, separate, out);
+    int td_on = td_mode();
+    VkImage image;
+    if (!h || storage || !td_on) return tex_info_full(ex, r, h, storage, separate, out, &image);
     uint32_t gen = vk_texture_slots_gen(), ep = vk_texture_epoch(), sg = vk_sampler_gen();   // before any lookup
-    uint32_t pass = ex->nfbl ? ex->pass_serial | 0x80000000u : 0;
-    typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 52];
-    if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->gen == gen && m->epoch == ep &&
-        m->sgen == sg && m->pass == pass) {
+    typeof(TD[0]) *m = &TD[(h * 0x9E3779B97F4A7C15ull ^ (uint64_t)r->type << 7 ^ (uint64_t)separate) >> 51];
+    if (m->valid && m->h == h && m->type == r->type && m->separate == separate && m->sgen == sg &&
+        slot_still(&m->gen, m->tok, h, gen)) {
+        if (m->epoch != ep) {   // the slot's first binding in this submission: only its storage check is due
+            vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL);
+            m->epoch = ep;
+        }
         *out = m->out;
+        out->imageLayout = m->image && ex->nfbl && in_fbl(ex, m->image) ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                                                          : VK_IMAGE_LAYOUT_GENERAL;
         if (td_on == 2) {
             VkDescriptorImageInfo full;
-            tex_info_full(ex, r, h, storage, separate, &full);
+            tex_info_full(ex, r, h, storage, separate, &full, &image);
             if (full.sampler != out->sampler || full.imageView != out->imageView || full.imageLayout != out->imageLayout)
                 rt_fatal("vk_exec: texture descriptor memo of handle %#llx type %#x differs from a lookup",
                          (unsigned long long)h, r->type);
         }
         return;
     }
-    tex_info_full(ex, r, h, storage, separate, out);
-    *m = (typeof(*m)){.h = h, .gen = gen, .epoch = ep, .sgen = sg, .pass = pass, .type = r->type,
-                      .separate = (uint8_t)separate, .valid = 1, .out = *out};
+    uint64_t tok = token_of(h);   // before the lookup
+    tex_info_full(ex, r, h, storage, separate, out, &image);
+    *m = (typeof(*m)){.h = h, .tok = tok, .gen = gen, .epoch = ep, .sgen = sg, .type = r->type,
+                      .separate = (uint8_t)separate, .valid = 1, .image = image, .out = *out};
 }
 
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
-                          VkDescriptorImageInfo *out) {
+                          VkDescriptorImageInfo *out, VkImage *image) {
     int ms = (r->type & 0x200) != 0;
+    *image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler samp = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1049,7 +1128,7 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         view_t v;
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
-        if (img) view = get_view(ex, img, &v, hv, r->type, storage);
+        if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
@@ -1570,16 +1649,27 @@ static void bind_vertex_buffers(VkExec *ex) {
     int vcls[17] = {0};
     void *vpool[17] = {0};
     int dyn = vk_pipeline_vertex_input_dynamic();
+    // A stream whose range is the one its bound buffer was resolved from, with no pool or mirror change since
+    // (vk_mem_gen, read before any resolve), resolves to that buffer again: most draws change one stream or none.
+    uint64_t gen = vk_mem_gen();
+    int same_gen = B.vb_valid && B.vgen == gen;
     for (int b = 0; b < 17; b++) {
         vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0;
         if (b == VK_PIPE_ZERO_BINDING) continue;
         const NVNbufferRange *r = &ex->vbuf[b];
+        if (same_gen && B.vin[b].address == r->address && B.vin[b].size == r->size) {
+            vb[b] = B.vb[b], vo[b] = B.vo[b], vsz[b] = B.vsz[b], vcls[b] = B.vcls[b], vpool[b] = B.vpool[b];
+            continue;
+        }
         VkMemSpan sp;
         if (!r->address || !vk_mem_resolve(r->address, 1, &sp)) continue;
         VK_MEM_USE(sp);
         uint64_t n = r->size && r->size < sp.avail ? r->size : sp.avail;
         vb[b] = sp.buffer, vo[b] = sp.offset, vsz[b] = n, vcls[b] = sp.cls, vpool[b] = sp.pool;
     }
+    memcpy(B.vcls, vcls, sizeof vcls), memcpy(B.vpool, vpool, sizeof vpool);
+    memcpy(B.vin, ex->vbuf, sizeof B.vin);
+    B.vgen = gen;
     if (B.vb_valid && !memcmp(B.vb, vb, sizeof vb) && !memcmp(B.vo, vo, sizeof vo) && !memcmp(B.vsz, vsz, sizeof vsz) &&
         (dyn || !memcmp(B.vstr, vstr, sizeof vstr)))
         return;
