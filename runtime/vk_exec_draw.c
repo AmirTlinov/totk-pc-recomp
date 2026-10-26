@@ -550,7 +550,7 @@ void vk_exec_image_gone(VkImage image) {
 typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const GfxShader *s; } ShaderEnt;
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
-static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
+static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
         const uint8_t *c = p->sd[i].control;
         if (!c || !p->sd[i].data) continue;
@@ -562,6 +562,32 @@ static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const
         return 1;
     }
     return 0;
+}
+
+// Which shader of a program serves each NVN stage, and its code length, per program serial (new at every
+// nvnProgramSetShaders): the scan reads two words of every stage's control block, cold guest cache lines, and runs
+// several times a draw. Direct-mapped; a collision only scans again.
+#define STAGEM_N 512
+static struct { uint64_t serial; int8_t idx[6]; uint32_t len[6]; } stagem[STAGEM_N];
+
+static int find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
+    if (!p->serial || (unsigned)nvn_stage >= 6) return find_stage_scan(p, nvn_stage, ctl, code, len);
+    typeof(stagem[0]) *m = &stagem[p->serial * 0x9E3779B97F4A7C15ull >> 55];
+    if (m->serial != p->serial) {
+        m->serial = p->serial;
+        memset(m->idx, -1, sizeof m->idx);
+        for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
+            const uint8_t *c = p->sd[i].control;
+            if (!c || !p->sd[i].data) continue;
+            uint32_t st;
+            memcpy(&st, c + 0x714, 4);
+            if (st < 6 && m->idx[st] < 0) m->idx[st] = (int8_t)i, memcpy(&m->len[st], c + 0x704, 4);
+        }
+    }
+    int i = m->idx[nvn_stage];
+    if (i < 0) return 0;
+    *ctl = p->sd[i].control, *code = (const uint8_t *)(uintptr_t)p->sd[i].data, *len = m->len[nvn_stage];
+    return 1;
 }
 
 // Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
