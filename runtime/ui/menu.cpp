@@ -27,6 +27,7 @@ extern "C" {
 #include "input_map.h"
 #include "perfmon.h"
 #include "platform/platform.h"
+#include "sysinfo.h"
 #include "ui/menu.h"
 #include "ui_text.h"
 // host.h and vk.h pull in cpu.h, which is C only: the three functions the menu needs from them, as declared there.
@@ -291,7 +292,7 @@ extern "C" void menu_vk_release(void) {
 // TOTK_MENU_TEST_SET=<frame>:<key>=<value>[,<key>=<value>...][;<frame>:...]: cfg_set of each key (TOTK_ prefix
 // optional) at that presented frame; changes live settings with no input, menu open or not. totk.ini is written only by
 // the pseudo-key SAVE=1 (cfg_save, as a row change does; a failed write shows the menu's save note).
-enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MENU, TAB_COUNT };
+enum { TAB_SCREEN, TAB_GAME, TAB_SOUND, TAB_CONTROLS, TAB_MENU, TAB_ADVANCED, TAB_COUNT };
 enum { TEST_PAGE_FRAMES = 30, TEST_SETS = 16 };
 struct TestSet { uint64_t frame; char key[64], value[64]; };
 static struct {
@@ -502,8 +503,162 @@ static void tab_menu(float scale) {
     opt_end();
 }
 
+// ---- Advanced: the testing and troubleshooting keys, the bug report helpers and the reset of every setting
+static bool g_modal;   // the reset confirmation is open: B and Esc close it, not the menu; L / R stay on the page
+
+// A thread count with no fixed default: Automatic (unset), then the common counts.
+static void row_threads(const char *key, UiTextId label, UiTextId desc) {
+    static const char *const vals[] = {"", "1", "2", "4", "6", "8", "12", "16", "24", "32", "48", "64"};
+    enum { N = sizeof vals / sizeof *vals };
+    const char *names[N];
+    names[0] = menu_text(UI_MENU_AUTO);
+    for (int i = 1; i < N; i++) names[i] = vals[i];
+    opt_choice_list(key, label, vals, names, N, desc);
+}
+
+// A free-text key shown as Off (unset) / On (value set): On writes on_value, any set value reads as On.
+static void row_set_or_not(const char *key, UiTextId label, UiTextId desc, const char *on_value) {
+    const char *vals[] = {"", on_value}, *names[] = {menu_text(UI_MENU_OFF), menu_text(UI_MENU_ON)};
+    opt_choice_list(key, label, vals, names, 2, desc, *cfg_value(key) ? 1 : 0);
+}
+
+static bool validation_layer_present(void) {
+    static int have = -1;
+    if (have < 0) {
+        uint32_t n = 0;
+        vkEnumerateInstanceLayerProperties(&n, nullptr);
+        VkLayerProperties *l = (VkLayerProperties *)calloc(n ? n : 1, sizeof *l);
+        if (l && vkEnumerateInstanceLayerProperties(&n, l) >= 0)
+            for (uint32_t i = 0; i < n && have <= 0; i++) have = !strcmp(l[i].layerName, "VK_LAYER_KHRONOS_validation");
+        free(l);
+        if (have < 0) have = 0;
+    }
+    return have != 0;
+}
+
+// Every setting the menu shows back to its default (the environment's keys stay), written to totk.ini.
+static void reset_all(void) {
+    const char *keys[128];
+    int n = 0;
+    for (const CfgMeta *m; n < 128 && (m = cfg_meta_at(n)); n++) keys[n] = m->key;
+    int done = cfg_reset(keys, n);
+    opt_save_soon();
+    rt_log("menu: reset %d settings to their defaults", done);
+}
+
+// A button's result shown in its value for a few seconds: 1 done (done_text), -1 failed.
+struct ActionNote { uint64_t until; int result; };
+
+static const char *action_value(const ActionNote &a, UiTextId done_text) {
+    if (!a.result || plat_now_ns() > a.until) return "";
+    return menu_text(a.result > 0 ? done_text : UI_MENU_ACTION_FAILED);
+}
+
+static void action_done(ActionNote &a, bool ok) { a = {plat_now_ns() + 3000000000ull, ok ? 1 : -1}; }
+
+static void tab_advanced(float scale) {
+    static ActionNote copy_note, log_note;
+    opt_begin("##advanced", scale);
+    opt_text(UI_MENU_ADV_WARNING, true);
+
+    opt_group(UI_MENU_GROUP_SCHED);
+    static const UiTextId preempt[] = {UI_MENU_PREEMPT_OFF, UI_MENU_PREEMPT_ON, UI_MENU_PREEMPT_INHERIT};   // 0|1|2
+    opt_choice("TOTK_ASYNC_PREEMPT", UI_MENU_ASYNC_PREEMPT, preempt, 3, UI_MENU_ASYNC_PREEMPT_DESC);
+    opt_toggle("TOTK_REPLAY_ASYNC", UI_MENU_REPLAY_ASYNC, UI_MENU_REPLAY_ASYNC_DESC);
+    opt_toggle("TOTK_FREE_CORES", UI_MENU_FREE_CORES, UI_MENU_FREE_CORES_DESC);
+    opt_toggle("TOTK_TIMER_1MS", UI_MENU_TIMER_1MS, UI_MENU_TIMER_1MS_DESC);
+
+    opt_group(UI_MENU_GROUP_SHADERS);
+    static const UiTextId wait[] = {UI_MENU_PIPE_WAIT_DEFAULT, UI_MENU_PIPE_WAIT_DRAW};
+    opt_choice("TOTK_PIPE_WAIT", UI_MENU_PIPE_WAIT, wait, 2, UI_MENU_PIPE_WAIT_DESC);
+    static const UiTextId skip[] = {UI_MENU_PIPE_SKIP_STRICT, UI_MENU_PIPE_SKIP_ANY, UI_MENU_PIPE_SKIP_FULLSCREEN};
+    opt_choice("TOTK_PIPE_SKIP", UI_MENU_PIPE_SKIP, skip, 3, UI_MENU_PIPE_SKIP_DESC);
+    opt_toggle("TOTK_LIB_PREBUILD", UI_MENU_LIB_PREBUILD, UI_MENU_LIB_PREBUILD_DESC);
+    row_threads("TOTK_LIB_PREBUILD_THREADS", UI_MENU_LIB_PREBUILD_THREADS, UI_MENU_LIB_PREBUILD_THREADS_DESC);
+    opt_toggle("TOTK_PIPE_PREBUILD", UI_MENU_PIPE_PREBUILD, UI_MENU_PIPE_PREBUILD_DESC);
+    row_threads("TOTK_PREWARM_XLATE", UI_MENU_PREWARM_XLATE, UI_MENU_PREWARM_XLATE_DESC);
+    opt_toggle("TOTK_GPL", UI_MENU_GPL, UI_MENU_GPL_DESC);
+
+    opt_group(UI_MENU_GROUP_TEXMEM);
+    static const UiTextId astc[] = {UI_MENU_ASTC_AUTO, UI_MENU_ASTC_GPU, UI_MENU_ASTC_NATIVE, UI_MENU_ASTC_CPU};
+    opt_choice("TOTK_ASTC", UI_MENU_ASTC, astc, 4, UI_MENU_ASTC_DESC);
+    static const UiTextId mem[] = {UI_MENU_MEMORY_AUTO, UI_MENU_MEMORY_IMPORT, UI_MENU_MEMORY_MIRROR,
+                                   UI_MENU_MEMORY_VERIFY};
+    opt_choice("TOTK_MEMORY", UI_MENU_MEMORY, mem, 4, UI_MENU_MEMORY_DESC);
+    opt_toggle("TOTK_TEX_ALIAS", UI_MENU_TEX_ALIAS, UI_MENU_TEX_ALIAS_DESC);
+
+    opt_group(UI_MENU_GROUP_FIXES);
+    opt_toggle("TOTK_LOD_GUARD", UI_MENU_LOD_GUARD, UI_MENU_LOD_GUARD_DESC);
+    opt_toggle("TOTK_FIX_C0", UI_MENU_FIX_C0, UI_MENU_FIX_C0_DESC);
+    opt_toggle("TOTK_FIX_ZERO", UI_MENU_FIX_ZERO, UI_MENU_FIX_ZERO_DESC);
+    opt_toggle("TOTK_BIND_SKIP", UI_MENU_BIND_SKIP, UI_MENU_BIND_SKIP_DESC);
+    opt_toggle("TOTK_SHADER_MEMO", UI_MENU_SHADER_MEMO, UI_MENU_SHADER_MEMO_DESC);
+    opt_toggle("TOTK_DESC_TEMPLATE", UI_MENU_DESC_TEMPLATE, UI_MENU_DESC_TEMPLATE_DESC);
+    opt_toggle("TOTK_PUSH_SKIP", UI_MENU_PUSH_SKIP, UI_MENU_PUSH_SKIP_DESC);
+    opt_slider("TOTK_SPLIT_DRAWS", UI_MENU_SPLIT_DRAWS, 0, 1000, UI_MENU_SPLIT_DRAWS_DESC, 8, "%.0f");
+
+    opt_group(UI_MENU_GROUP_VULKAN);
+    if (!validation_layer_present() && !cfg_bool("TOTK_VK_VALIDATION")) opt_disable_next(UI_MENU_VK_VALIDATION_MISSING);
+    opt_toggle("TOTK_VK_VALIDATION", UI_MENU_VK_VALIDATION, UI_MENU_VK_VALIDATION_DESC);
+    static const UiTextId dyn[] = {UI_MENU_AUTO, UI_MENU_OFF, UI_MENU_ON};   // unset, 0, 1
+    opt_choice("TOTK_VK_DYN_VERTEX", UI_MENU_VK_DYN_VERTEX, dyn, 3, UI_MENU_VK_DYN_VERTEX_DESC);
+    opt_toggle("TOTK_VK_SUBGROUP_PIN", UI_MENU_VK_SUBGROUP_PIN, UI_MENU_VK_SUBGROUP_PIN_DESC);
+
+    opt_group(UI_MENU_GROUP_DIAG);
+    row_set_or_not("TOTK_TRACE", UI_MENU_TRACE, UI_MENU_TRACE_DESC, "perf");
+    opt_toggle("TOTK_FLIGHT", UI_MENU_FLIGHT, UI_MENU_FLIGHT_DESC);
+    opt_slider("TOTK_FLIGHT_SPIKE_MS", UI_MENU_FLIGHT_SPIKE_MS, 20, 1000, UI_MENU_FLIGHT_SPIKE_MS_DESC, 10, "%.0f");
+    static char rec_path[600];   // the recording goes beside the log
+    if (!rec_path[0]) {
+        char dir[512];
+        snprintf(rec_path, sizeof rec_path, "%s\\input-record.txt", sysinfo_log_folder(dir, sizeof dir) ? dir : ".");
+    }
+    row_set_or_not("TOTK_INPUT_RECORD", UI_MENU_INPUT_RECORD, UI_MENU_INPUT_RECORD_DESC, rec_path);
+    if (opt_button("##open_log", UI_MENU_OPEN_LOG, UI_MENU_OPEN_LOG_DESC, action_value(log_note, UI_MENU_OPEN_LOG))) {
+        char dir[512];
+        bool ok = sysinfo_log_folder(dir, sizeof dir) && plat_open_folder(dir);
+        if (!ok) action_done(log_note, false);   // success shows as the opened folder
+    }
+    if (opt_button("##copy_info", UI_MENU_COPY_INFO, UI_MENU_COPY_INFO_DESC,
+                   action_value(copy_note, UI_MENU_COPY_INFO_DONE))) {
+        static char text[16384];
+        action_done(copy_note, sysinfo_text(text, sizeof text) > 0 && plat_clipboard_set(text));
+    }
+    bool ask = opt_button("##reset", UI_MENU_RESET, UI_MENU_RESET_DESC);
+    opt_end();
+    if (ask) ImGui::OpenPopup("##reset_confirm");   // at the level BeginPopupModal looks it up
+
+    // the confirmation, over the menu; Cancel has the cursor first
+    g_modal = false;
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("##reset_confirm", nullptr,
+                               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize)) {
+        g_modal = true;
+        ImGui::TextUnformatted(menu_text(UI_MENU_RESET_CONFIRM));
+        ImGui::Spacing();
+        const char *yes = menu_text(UI_MENU_RESET_YES), *no = menu_text(UI_MENU_RESET_NO);
+        const ImGuiStyle &st = ImGui::GetStyle();
+        float bw = fmaxf(ImGui::CalcTextSize(yes).x, ImGui::CalcTextSize(no).x) + st.FramePadding.x * 4;
+        bool close = false;
+        if (ImGui::Button(no, ImVec2(bw, 0))) close = true;
+        if (ImGui::IsWindowAppearing()) ImGui::SetItemDefaultFocus();
+        ImGui::SameLine();
+        if (ImGui::Button(yes, ImVec2(bw, 0))) {
+            reset_all();
+            close = true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+            close = true;
+        if (close) {
+            ImGui::CloseCurrentPopup();
+            opt_focus_key("##reset");   // back on the row it came from
+        }
+        ImGui::EndPopup();
+    }
+}
+
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
-                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MENU};
+                                              UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MENU, UI_MENU_TAB_ADVANCED};
 static int g_tab;               // the tab shown
 static int g_tab_request = -1;  // select this tab at the next layout; -1 none
 static int g_focus_page = -1;   // this tab's first row takes the cursor once it is shown; -1 none
@@ -519,7 +674,8 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
                                         ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", menu_text(UI_MENU_TITLE));
 
-    int step = ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false)   ? 1
+    int step = g_modal                                                                                   ? 0
+             : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
                                                                                                          : 0;
     if (step) g_tab_request = (g_tab + step + TAB_COUNT) % TAB_COUNT;
@@ -545,6 +701,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_SOUND: tab_sound(scale); break;
             case TAB_CONTROLS: tab_controls(scale); break;
             case TAB_MENU: tab_menu(scale); break;
+            case TAB_ADVANCED: tab_advanced(scale); break;
             }
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -566,7 +723,10 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     if (ImGui::Button(cont, ImVec2(bw, 0))) set_open(0);
     ImGui::SameLine();
     if (ImGui::Button(quit, ImVec2(bw, 0))) gfx_window_request_close();
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) set_open(0);
+    bool was_modal = g_modal;
+    if (g_tab != TAB_ADVANCED) g_modal = false;
+    if (!was_modal && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
+        set_open(0);
     ImGui::End();
 }
 
@@ -806,6 +966,8 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         io.ClearInputMouse();
         g_last_ns = 0;
         g_focus_page = g_tab_request >= 0 ? g_tab_request : g_tab;   // opening: the first row has the cursor
+        if (GImGui->OpenPopupStack.Size) ImGui::ClosePopupToLevel(0, false);   // a confirmation left open on closing
+        g_modal = false;
     }
     io.DisplaySize = ImVec2((float)t->width, (float)t->height);
     double dt = g_last_ns ? (t0 - g_last_ns) / 1e9 : 1 / 60.0;

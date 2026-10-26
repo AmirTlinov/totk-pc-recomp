@@ -111,7 +111,9 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
     bool off = disabled || cfg_from_env(key) != 0;
     ImGui::PushID(key);
     ImVec2 p = ImGui::GetCursorScreenPos();
-    float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = fs * 2.2f;
+    // h whole pixels: ImGui truncates cursor positions, which rounds a fractional height the other way above the window's
+    // top (negative y), so the page grew a pixel per row scrolled out and a row scrolled to the bottom was cut off
+    float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = floorf(fs * 2.2f);
     ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));   // the row's own border shows the selection
     bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h), ImGuiButtonFlags_EnableNav);
     ImGui::PopStyleColor();
@@ -119,7 +121,8 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
     if (g_take_first || to_key) {
         ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
         ImGui::SetNavCursorVisible(true);
-        ImGui::SetScrollHereY(g_take_first ? 0.0f : 0.5f);
+        if (g_take_first) ImGui::SetScrollY(0);   // the page's top: text and a heading above the first row show
+        else ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);   // as a cursor move would (the last row whole)
         g_take_first = false;
         if (to_key) g_focus_key[0] = 0;
     }
