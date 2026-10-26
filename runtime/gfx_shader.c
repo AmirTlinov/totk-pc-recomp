@@ -439,7 +439,7 @@ static void key_hex(const uint8_t key[32], char out[65]) {
 }
 
 // A .res.json the translator wrote: one JSON object that names its stage, no NUL inside. A file an interrupted write
-// left zero-filled (3647 of build/v121-m4's 21924 were) fails this; reflect() would take it for a vertex shader with
+// left zero-filled (3647 of 21924 in one cache were) fails this; reflect() would take it for a vertex shader with
 // no resources, and its pipeline layout would lack the shader's buffers and textures.
 static int reflection_valid(const char *res, uint64_t size) {
     if (strlen(res) != size) return 0;
