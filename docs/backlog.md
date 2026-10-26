@@ -173,25 +173,24 @@ Each platform item gets a written design first, agreed with the maintainer.
     every render target ourselves); MacNativeGames has neither. The software keyboard could move onto
     SavageWindRecomp's `osk.mm`.
 
-39. **Game version 1.4.3** (branch `task/v143`). Builds, boots and plays: the field save (a 1.2.1 save, converted on
-    load) runs at 60 fps with game speed 1.000, REV15 audio without underruns, 0 unimplemented NVN calls, 0 validation
-    errors; every probe passes on 1.4.3 and on 1.2.1; the jump-table check reports 0 disagreements on both; the
-    installer takes either update. Open:
-    1. Shader preparation is done: `prepare_shaders.py` seeds every shader's default variant, as MacNativeGames'
-       seed does, and reads the list with the V rows its history dropped (`tools/shader_list.py`; the current list
-       alone has 134 rows of 1.4.3 shaders). 29,587 variants, and all 1,095 that the field and intro runs met in play
-       are among them. Not ported: MacNativeGames types vertex inputs and colour outputs by the bound format, so a
-       variant serves any format; ours still differ by those types.
-    2. Not played beyond the field save and the opening cutscene: combat, abilities, cutscenes, menus, saving. Saves
-       carry over both ways (the user's saves were written by 1.4.3 and load on 1.2.1).
-    3. The installer end-to-end test (`tests/installer_e2e.py`) runs only on 1.2.1.
-    4. MacNativeGames' 1.4.3 output, render and fixed resolution patches (`game_patches_v143.c`) are not ported; 1.2.1
+39. **Game version 1.4.3**. Builds, boots and plays: the user played it from their own saves on 2026-10-26 without
+    problems; the field save runs at 60 fps with game speed 1.000, REV15 audio without underruns, 0 unimplemented NVN
+    calls, 0 validation errors; every probe passes on 1.4.3 and on 1.2.1; the jump-table check reports 0 disagreements
+    on both; the installer takes either update. Saves carry over both ways. `prepare_shaders.py` seeds every shader's
+    default variant, as MacNativeGames' seed does, and reads the list with the V rows its history dropped
+    (`tools/shader_list.py`; the current list alone has 134 rows of 1.4.3 shaders): 29,587 variants, among them all
+    1,095 that the field and intro runs met in play. Open:
+    1. MacNativeGames types vertex inputs and colour outputs by the bound format, so one variant serves any format;
+       ours still differ by those types (347 of 19,468 variants met on 1.2.1). No frame-time gain, only fewer
+       translations on first sight.
+    2. The installer end-to-end test (`tests/installer_e2e.py`) runs only on 1.2.1.
+    3. MacNativeGames' 1.4.3 output, render and fixed resolution patches (`game_patches_v143.c`) are not ported; 1.2.1
        has none of them either.
-    5. The opening cutscene (Zelda under Hyrule Castle) shows hard light bands on 1.4.3 and on 1.2.1 alike; whether
+    4. The opening cutscene (Zelda under Hyrule Castle) shows hard light bands on 1.4.3 and on 1.2.1 alike; whether
        that is the game's look or ours is not checked.
-40. **Community ExeFS patches** (`.ips`, `.pchtxt` for 1.2.1): apply them through the generator's patch table
-    (`recomp/patches.py`). RomFS mods already load (`romfs.c`, `TOTK_ROMFS_MODS`). Code-module mods (exlaunch
-    `subsdk9`) need porting one by one.
+40. **Community ExeFS patches** (`.ips`, `.pchtxt`, each for one game version): apply them through the generator's
+    patch table (`recomp/patches.py`). RomFS mods already load (`romfs.c`, `TOTK_ROMFS_MODS`). Code-module mods
+    (exlaunch `subsdk9`) need porting one by one.
 41. **Frame rates above 60 and VRR.**
 42. **Map tour**: teleport Link across the map by writing position, time of day and weather in guest memory, to fill
     the caches on a first run and to serve as an automatic test (crashes, validation, fps per region).
