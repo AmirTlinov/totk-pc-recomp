@@ -383,7 +383,19 @@ class Lifter:
             return self.ldst_pair(w)
         if bits(w, 27, 3) == 0b111:
             return self.ldst_reg(w)
+        if (w & 0xFFE00000) == 0xD9200000 and bits(w, 10, 2):
+            return self.stg(w)
         raise Unsupported(f'ldst {w:08x}')
+
+    def stg(self, w):
+        """STG (post-index, signed offset, pre-index). Horizon runs without MTE, so storing an allocation tag
+        changes no memory; only the base writeback remains (1.4.3 sdk+0x640050)."""
+        mode, rn = bits(w, 10, 2), bits(w, 5, 5)
+        if mode == 2:
+            return Insn('op', '/* stg */')
+        off = sext(bits(w, 12, 9), 9) << 4
+        dst = 'c->sp' if rn == 31 else f'c->x[{rn}]'
+        return Insn('op', f'{dst} = {XS(rn)} + {hx(off & 0xFFFFFFFFFFFFFFFF)}; /* stg */')
 
     def ldst_excl(self, w, pc):
         size, o2, L, o1, rs, o0, rn, rt = (bits(w, 30, 2), bits(w, 23, 1), bits(w, 22, 1), bits(w, 21, 1),

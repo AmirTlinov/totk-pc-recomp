@@ -1,16 +1,16 @@
-"""Package a built totk.exe into a folder that runs from anywhere: build/v121-portable by default.
+"""Package a built totk.exe into a folder that runs from anywhere: build/<version>-portable by default.
 
 The folder holds the exe, its DLLs, the shader translator (NativeAOT: no .NET), the RomFS index and patches, the
 extracted ExeFS (the game code the exe loads), the shared fonts, the prepared shader and pipeline files. There is
 no config file: totk.exe finds the exefs, romfs, profile and shared-fonts folders next to itself. Without --with-romfs
-the 16 GB RomFS image stays out; copy build/extracted/v121/romfs/romfs.bin to <folder>/romfs/ or set TOTK_ROMFS
+the 16 GB RomFS image stays out; copy build/extracted/<version>/romfs/romfs.bin to <folder>/romfs/ or set TOTK_ROMFS
 (a path, relative ones to the exe's folder).
 
 The folder contains game code and data derived from the game: for your own machines only, never publish or share it.
 Saves go to <folder>/profile.
 
-    .venv/Scripts/python tools/package_build.py [--build build/v121] [--exe PATH/totk.exe] [--out build/v121-portable]
-                                                [--with-romfs] [--no-shader-cache]
+    .venv/Scripts/python tools/package_build.py [--version v121] [--build build/v121] [--exe PATH/totk.exe]
+                                                [--out build/v121-portable] [--with-romfs] [--no-shader-cache]
 """
 import argparse
 import os
@@ -48,14 +48,18 @@ def size_of(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--build', type=Path, default=ROOT / 'build' / 'v121', help='build dir with the prepared state')
+    ap.add_argument('--version', default='v121', help='game version (v121 or v143): the defaults below follow it')
+    ap.add_argument('--build', type=Path, help='build dir with the prepared state (default build/<version>)')
     ap.add_argument('--exe', type=Path, help='totk.exe to package (default: <build>/totk.exe); its DLLs are taken from --build')
     ap.add_argument('--xlate', type=Path, default=ROOT / 'build' / 'xlate' / 'totk_xlate.exe')
-    ap.add_argument('--extracted', type=Path, default=ROOT / 'build' / 'extracted' / 'v121')
-    ap.add_argument('--out', type=Path, default=ROOT / 'build' / 'v121-portable')
+    ap.add_argument('--extracted', type=Path, help='default build/extracted/<version>')
+    ap.add_argument('--out', type=Path, help='default build/<version>-portable')
     ap.add_argument('--with-romfs', action='store_true', help='also copy romfs.bin (about 16 GB)')
     ap.add_argument('--no-shader-cache', action='store_true', help='leave out shader-cache (about 2 GB): translates again')
     a = ap.parse_args()
+    a.build = a.build or ROOT / 'build' / a.version
+    a.extracted = a.extracted or ROOT / 'build' / 'extracted' / a.version
+    a.out = a.out or ROOT / 'build' / f'{a.version}-portable'
 
     build, out = a.build.resolve(), a.out.resolve()
     exe = (a.exe or build / 'totk.exe').resolve()

@@ -187,9 +187,9 @@ def runtime_object(out, src):
     return out / 'obj' / 'runtime' / rel.with_suffix('.o')
 
 
-def module_glue(layout, linked, hashes, paths):
+def module_glue(layout, linked, hashes, paths, version):
     """C for build/<version>/modules.c: the layout table, the linked modules' function tables (dispatch.h), the
-    expected ExeFS hashes and the default game paths (host.h)."""
+    expected ExeFS hashes, the game version and the default game paths (host.h)."""
     out = [f'// Module glue written by tools/build_game.py; do not edit. {GENERATED_MARKER}',
            '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
     for name, base, size in layout:
@@ -213,7 +213,8 @@ def module_glue(layout, linked, hashes, paths):
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
-    out.append('')
+    number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
+    out += [f'const int rt_game_version = {number};', '']
     return '\n'.join(out)
 
 
@@ -584,7 +585,9 @@ def main():
                     help="totk.exe's default ExeFS directory (default build/extracted/<version>/exefs)")
     ap.add_argument('--romfs', type=Path, help="totk.exe's default RomFS directory with romfs.bin and index.json "
                                                '(default build/extracted/<version>/romfs)')
-    ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile)")
+    ap.add_argument('--profile', type=Path, help="totk.exe's default profile directory (default build/profile for v121, "
+                                                 "build/profile-<version> otherwise, so trying another version leaves "
+                                                 "the main profile alone; saves load on 1.2.1 and 1.4.3 alike)")
     ap.add_argument('--toolchain', type=Path, help='llvm-mingw directory (with bin/clang.exe) to build with instead of '
                                                    'MSYS2 UCRT64 clang')
     ap.add_argument('--ninja', type=Path, help='ninja.exe to build with (default: MSYS2 UCRT64, else bin/ninja.exe of the '
@@ -604,7 +607,8 @@ def main():
     extracted = ROOT / 'build' / 'extracted' / args.version
     paths = {'exefs': (args.exefs or extracted / 'exefs').resolve(),
              'romfs': (args.romfs or extracted / 'romfs').resolve(),
-             'profile': (args.profile or ROOT / 'build' / 'profile').resolve()}
+             'profile': (args.profile or ROOT / 'build' / ('profile' if args.version == 'v121'
+                                                           else f'profile-{args.version}')).resolve()}
     expected = args.expected
     if not expected:
         if args.version not in DISPLAY_VERSIONS:
@@ -645,7 +649,7 @@ def main():
     missing = [n for n in names if n not in hashes]
     if missing:
         sys.exit(f'{expected}: no exefs_sha256 for {missing}')
-    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths))
+    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version))
     if (paths['romfs'] / 'index.json').is_file():
         count, size, dt = romfs_index.write(paths['romfs'], out)
         print(f'romfs index: {count} files, {mib(size)}, {dt:.1f} s')

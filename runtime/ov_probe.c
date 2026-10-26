@@ -75,6 +75,7 @@ static Ov ovs[] = {
     // SDK-internal (section 5.2)
     {"nndiagStartup", "nndiagStartup"},
     {"aoc.Initialize", "_ZN2nn3aoc10InitializeEv"},
+    {"aoc.ListAddOnContent", "_ZN2nn3aoc16ListAddOnContentEPiii"},
     {"err.InitializeContextWriterApi", "_ZN2nn3err26InitializeContextWriterApiEv"},
     {"pctl.Initialize", "_ZN2nn4pctl10InitializeEv"},
     {"diag.InitializeApplicationAbortObserver", "_ZN2nn4diag34InitializeApplicationAbortObserverEv"},
@@ -374,6 +375,7 @@ static void probe_applet(void) {
     CALL("err.ShowError", 0x2a8);
     CALL("nndiagStartup", 0);
     CALL("aoc.Initialize", 0);
+    CHECK(CALL("aoc.ListAddOnContent", U(out), 0, 8) == 0, "aoc: no add-on content");
     CALL("err.InitializeContextWriterApi", 0);
     CALL("pctl.Initialize", 0);
     CALL("diag.InitializeApplicationAbortObserver", 0);
@@ -628,10 +630,12 @@ static void probe_media_gfx(void) {
            "vsync event %s\n", display, layer, window, vsync ? "bound (auto-clear)" : "FAILED");
 }
 
-// ---- software keyboard (swkbd_win.c): ShowKeyboardArg built by the 1.2.1 SDK's own setters, as main+0x1b2b3a0 does
+// ---- software keyboard (swkbd_win.c): ShowKeyboardArg built by the SDK's own setters, as the horse naming does
 enum { KB_TYPE = 0x00, KB_DISABLED = 0x1c, KB_HEADER = 0x24, KB_GUIDE = 0x1a8, KB_MAX_LEN = 0x3ac, KB_MIN_LEN = 0x3b0,
-       KB_UTF8 = 0x3bd, KB_INIT_LEN = 0x3c4, ARG_WORK = 0x4d0, ARG_WORK_SIZE = 0x4d8, ARG_SIZE = 0x500,
-       STRING_SIZE = 0x7d4, SWKBD_CANCELED = 0x29f };
+       KB_UTF8 = 0x3bd, KB_INIT_LEN = 0x3c4, STRING_SIZE = 0x7d4, SWKBD_CANCELED = 0x29f };
+#define ARG_WORK (RT_V143 ? 0x518 : 0x4d0)   // SDK 20.5 grew KeyboardConfig (swkbd_win.c)
+#define ARG_WORK_SIZE (ARG_WORK + 8)
+#define ARG_SIZE (RT_V143 ? 0x548 : 0x500)
 
 static uint64_t sdk(const char *name) {
     uint64_t a = ldr_symbol(name);
@@ -964,7 +968,9 @@ int probe_services(void) {
         for (int k = 0; k < NOBS; k++)
             if (!strcmp(observers[k], n)) obs_bound++;
     }
-    for (int k = 0; k < NOV; k++) CHECK(ovs[k].bound, "override %s matches no relocation", ovs[k].name);
+    for (int k = 0; k < NOV; k++)   // 1.2.1 lists no add-on content
+        CHECK(ovs[k].bound || (!RT_V143 && !strcmp(ovs[k].key, "aoc.ListAddOnContent")), "override %s matches no relocation",
+              ovs[k].name);
     for (int k = 0; k < NOBS; k++) CHECK(hostfn_observer(observers[k]), "observer %s is not linked", observers[k]);
     CHECK(obs_bound == NOBS, "%d of %d observers match a JUMP_SLOT", obs_bound, NOBS);
 

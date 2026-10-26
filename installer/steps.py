@@ -22,18 +22,18 @@ import time
 from pathlib import Path
 
 from . import ini
-from .layout import EXE
+from .layout import EXE, SUPPORTED, version_tag
 from .runner import InstallError, Step
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
 import extract  # noqa: E402
+import shader_list  # noqa: E402
 from extract_exefs import (common_tickets, container_entries, load_keys, nca_ctr_key, nca_inventory,  # noqa: E402
                            program_nca)
 
 GiB = 1 << 30
 DEST_EXTRA = 4 * GiB      # beside the RomFS: shader and pipeline caches (about 2 GB), exefs, totk.exe, seed files
 TEMP_NEED = 3 * GiB       # generated C (about 0.9 GB) and objects
-UPDATE_VERSION = '1.2.1'
 HOSTCHECK = Path(__file__).resolve().parent / 'hostcheck.c'
 STAMP = '.install-key'
 
@@ -138,19 +138,23 @@ def raise_if_damaged(error, name, path):
         raise InstallError('check.input_damaged', input=name, path=str(path), detail=str(error)) from None
 
 
-def expected_update():
-    return extract.load_expected()[UPDATE_VERSION]
+def game_version(ctx):
+    """The update this install is built from: what the check identified, else the recorded one (an install made before
+    1.4.3 support records none: 1.2.1)."""
+    return ctx.state.get('version', SUPPORTED[0])
+
+
+def expected_update(ctx):
+    return extract.load_expected()[game_version(ctx)]
 
 
 def shader_list_text(layout):
     if layout.shader_list:
         return layout.shader_list.read_text(encoding='utf-8')
-    refs = layout.root / 'refs' / 'MacNativeGames'
-    r = subprocess.run(['git', '-C', str(refs), 'show', 'origin/HEAD:games/totk/assets/shader_list.tsv'],
-                       capture_output=True, encoding='utf-8')
-    if r.returncode:
+    try:
+        return shader_list.history(layout.root / 'refs' / 'MacNativeGames')
+    except subprocess.CalledProcessError:
         raise InstallError('prepare.shader_list_missing')
-    return r.stdout
 
 
 class Watch(threading.Thread):
@@ -316,7 +320,8 @@ class Check(Step):
     def space(self, ctx, ncas):
         dest_need = temp_need = 0
         if ctx.will_run('extract'):
-            dest_need += expected_update()['romfs']['size'] + ncas
+            # the update is identified after this estimate: the larger RomFS of the supported ones
+            dest_need += max(extract.load_expected()[v]['romfs']['size'] for v in SUPPORTED) + ncas
             romfs = ctx.dest / 'romfs' / 'romfs.bin'
             if romfs.is_file():   # a resumed extraction replaces it
                 dest_need -= romfs.stat().st_size
@@ -361,8 +366,14 @@ class Check(Step):
             found = extract.identify_update(work / 'update' / 'exefs', versions)['display_version']
         except ValueError:
             found = 'unknown'
-        if found != UPDATE_VERSION:
-            raise InstallError('check.update_wrong_version', found=found, wanted=UPDATE_VERSION)
+        if found not in SUPPORTED:
+            raise InstallError('check.update_wrong_version', found=found, wanted=' / '.join(SUPPORTED))
+        if found != game_version(ctx):   # another update than the recorded one: every step builds again from it
+            ctx.reporter.log(f'check: update {found} (recorded {game_version(ctx)})')
+            ctx.state['version'] = found
+            ctx.keys = {}
+            ctx.plan(ctx.forced | {'extract', 'lift', 'compile', 'prepare'})
+        ctx.state['version'] = found
 
 
 # ---- 2. extract
@@ -372,10 +383,17 @@ class Extract(Step):
 
     def key(self, ctx):
         # The output is whatever matches the expected hashes, whichever files and tools produced it.
-        return fingerprint('extract-1', ctx.layout.expected)
+        return fingerprint('extract-1', ctx.layout.expected(game_version(ctx)))
 
     def current(self, ctx, record):
-        expected = expected_update()
+        # Another update file than the recorded one (1.2.1 -> 1.4.3) extracts again; the check then identifies it.
+        update, known = getattr(ctx.options, 'update', None), ctx.state['inputs'].get('update')
+        if update and known and Path(update).is_file():
+            st = Path(update).stat()
+            if (st.st_size, st.st_mtime_ns) != (known.get('size'), known.get('mtime_ns')) \
+                    and file_sha256(Path(update)) != known.get('sha256'):
+                return False
+        expected = expected_update(ctx)
         romfs = ctx.dest / 'romfs'
         if extract.exefs_problems(ctx.dest / 'exefs', expected) or not extract.romfs_verified(romfs, expected):
             return False
@@ -386,11 +404,11 @@ class Extract(Step):
         image = ctx.dest / 'romfs' / 'romfs.bin'
         rep = ctx.reporter
         digest = file_sha256(image, lambda d, t: rep.progress('check', 'verify_romfs', d, t, 'bytes'))
-        return digest == expected_update()['romfs']['sha256']
+        return digest == expected_update(ctx)['romfs']['sha256']
 
     def run(self, ctx):
         o, dest, rep = ctx.options, ctx.dest, ctx.reporter
-        expected = expected_update()
+        expected = expected_update(ctx)
         base, update, keys = Path(o.base), Path(o.update), Path(o.keys)
         inputs = {}
         for name, path in (('base', base), ('update', update)):
@@ -422,9 +440,9 @@ class Extract(Step):
         shutil.move(staged, dest / 'exefs')
         problems = extract.exefs_problems(dest / 'exefs', expected)
         if problems:
-            raise InstallError('extract.exefs_mismatch', modules=', '.join(problems))
+            raise InstallError('extract.exefs_mismatch', version=game_version(ctx), modules=', '.join(problems))
         if extract.sha256(dest / 'exefs' / 'main.npdm') != expected['exefs_sha256']['main.npdm']:
-            rep.warning('warn.npdm_differs')
+            rep.warning('warn.npdm_differs', version=game_version(ctx))
 
         romfs = dest / 'romfs'
         if self.id in ctx.forced:
@@ -433,7 +451,8 @@ class Extract(Step):
             self.merge(ctx, base, update, keys, romfs, expected)
         report = json.loads((romfs / 'index.json').read_text())
         if report['romfs_size'] != expected['romfs']['size'] or report['romfs_sha256'] != expected['romfs']['sha256']:
-            raise InstallError('extract.romfs_mismatch', size=report['romfs_size'], sha256=report['romfs_sha256'][:16])
+            raise InstallError('extract.romfs_mismatch', version=game_version(ctx), size=report['romfs_size'],
+                               sha256=report['romfs_sha256'][:16])
         (dest / 'profile').mkdir(exist_ok=True)
         st = (romfs / 'romfs.bin').stat()
         return {'romfs_size': st.st_size, 'romfs_mtime_ns': st.st_mtime_ns}
@@ -476,7 +495,7 @@ class Lift(Step):
     transient = True
 
     def key(self, ctx):
-        return fingerprint('lift-1', ctx.keys['extract'], ctx.layout.recomp, ctx.layout.patches)
+        return fingerprint('lift-1', ctx.keys['extract'], ctx.layout.recomp, ctx.layout.patches(game_version(ctx)))
 
     def current(self, ctx, record):
         gen = ctx.temp / 'gen'
@@ -494,7 +513,7 @@ class Lift(Step):
                 rep.progress('lift', 'emit', int(m.group(1)), int(m.group(2)), 'chunks')
 
         code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py',
-                             ['--exefs', ctx.dest / 'exefs', '--out', gen, '--patches', layout.patches], parse)
+                             ['--exefs', ctx.dest / 'exefs', '--out', gen, '--patches', layout.patches(game_version(ctx))], parse)
         if code:
             raise InstallError('lift.failed', code=code, log=str(log))
         (gen / STAMP).write_text(ctx.keys['lift'] + '\n')
@@ -541,7 +560,8 @@ class Compile(Step):
         code, log = run_tool(ctx, 'compile', layout.tools / 'build_game.py', [
             '--gen', ctx.temp / 'gen', '--out', build, '--toolchain', layout.llvm, '--deps', layout.deps,
             '--runtime', layout.runtime, '--runtime-lib', layout.runtime_lib, '--ninja', layout.ninja,
-            '--expected', layout.expected, '--exefs', dest / 'exefs', '--romfs', dest / 'romfs',
+            '--version', version_tag(game_version(ctx)), '--expected', layout.expected(game_version(ctx)),
+            '--exefs', dest / 'exefs', '--romfs', dest / 'romfs',
             '--profile', dest / 'profile'], parse)
         exe = build / ('totk' + EXE)
         if code or not exe.is_file():
@@ -593,7 +613,8 @@ class Prepare(Step):
         rep.progress('prepare', 'romfs_patches', force=True)
         remove(dest / 'romfs-patches')
         code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
-                             ['--romfs', dest / 'romfs', '--out', dest / 'romfs-patches'])
+                             ['--version', version_tag(game_version(ctx)), '--romfs', dest / 'romfs', '--out',
+                              dest / 'romfs-patches'])
         if code:
             raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
 
@@ -613,7 +634,8 @@ class Prepare(Step):
 
         rep.progress('prepare', 'seed', force=True)
         code, log = run_tool(ctx, 'prepare', layout.tools / 'prepare_shaders.py',
-                             [dest, '--romfs', dest / 'romfs', '--exefs', dest / 'exefs', '--list', shader_list], parse)
+                             [dest, '--version', version_tag(game_version(ctx)), '--romfs', dest / 'romfs', '--exefs',
+                              dest / 'exefs', '--list', shader_list], parse)
         if code or not (dest / 'shader-prepared.bin').is_file():
             raise InstallError('prepare.shaders_failed', code=code, log=str(log))
         return {'xlate_sha256': file_sha256(xlate)}

@@ -24,7 +24,7 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
 - ExeFS and RomFS extraction: MacNativeGames' Python extractor (Python 3.14 for `compression.zstd`, `.venv-py314`).
 - Update merging: hactool at `1d64a83`, with MacNativeGames' BKTR patches (`toolchain/hactool`).
 - Verification: MacNativeGames' `expected-v*.json` hashes of ExeFS, RomFS and fonts.
-- Primary version: 1.2.1, the update most players have. MacNativeGames supports it with the same build path as the others. 1.0.0, 1.1.2 and 1.2.1 share `sdk`, `subsdk0` and `rtld` byte for byte, so the lifted SDK modules and the host's SDK boundary serve all three; only `main` differs. 1.4.3 replaced all three modules (new SDK 20.5.22, RELR relocations, audio renderer REV15) and is a separate target; work on it has started on a branch and is not merged.
+- Primary version: 1.2.1, the update most players have. MacNativeGames supports it with the same build path as the others. 1.0.0, 1.1.2 and 1.2.1 share `sdk`, `subsdk0` and `rtld` byte for byte, so the lifted SDK modules and the host's SDK boundary serve all three; only `main` differs. 1.4.3 replaced all three modules (new SDK 20.5.22, RELR relocations, audio renderer REV15) and is a second target on the same build path: `--version v143`, `recomp/patches-v143.txt` (state in backlog item 39).
 - Windows driver: `tools/extract.py` runs the vendored extractors (`tools/vendor/macnativegames/`) and identifies the update by the SHA-256 of its `main`. hactool has no Darwin `funopen` here, so the base Program NCA is copied out of the NSP before the BKTR merge (about 17 GB of temporary space).
 
 ### 2. CPU: lift ARM64 to C

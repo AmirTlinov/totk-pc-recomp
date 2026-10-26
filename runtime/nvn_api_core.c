@@ -123,8 +123,9 @@ const pool_t *nvn_pool_find(uint64_t addr, uint64_t len) {
     return p;
 }
 
-// Physical and virtual pools (MacNativeGames totk_vpool.c:32-52 checks). A CPU-invisible one gets a GPU window range;
-// a CPU-visible one would need aliased guest storage, which this port does not support (section 3.3).
+// Physical and virtual pools (MacNativeGames totk_vpool.c:32-52 checks). A CPU-invisible one gets a GPU window range.
+// A CPU-visible physical pool (1.4.3: flags 0x18c, GPU_NO_ACCESS) keeps the game's storage for the CPU; the back end
+// gives it device memory as any physical pool (vk_memory.c vk_pool_init), which the GPU reaches through virtual pools.
 static int pool_place(pool_t *o) {
     int phys = (o->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL) != 0, virt = (o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) != 0;
     if (!phys && !virt) return 1;
@@ -136,9 +137,15 @@ static int pool_place(pool_t *o) {
     }
     if (virt && o->mem) { rt_log("nvn: virtual pool given storage %p", (void *)o->mem); return 0; }
     if (phys && !o->mem) { rt_log("nvn: physical pool without storage"); return 0; }
-    if (!(o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))
-        rt_fatal("nvn: CPU-visible %s pool (flags %#x, size %#llx) needs aliased guest storage",
-                 kind, o->flags, (unsigned long long)o->size);
+    if (!(o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) {
+        if (virt) {
+            rt_log("nvn: CPU-visible virtual pool (flags %#x, size %#llx) refused", o->flags, (unsigned long long)o->size);
+            return 0;
+        }
+        rt_log("nvn: CPU-visible physical pool %p (flags %#x, size %#llx) keeps the game's storage", (void *)o->mem,
+               o->flags, (unsigned long long)o->size);
+        return 1;
+    }
     uint64_t a = gva_alloc(o->size);
     if (!a) {
         rt_log("nvn: GPU address window full, %s pool of %#llx bytes refused", kind, (unsigned long long)o->size);

@@ -8,6 +8,7 @@ import lz4.block
 
 DT_NULL, DT_NEEDED, DT_PLTRELSZ, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_RELASZ = 0, 1, 2, 4, 5, 6, 7, 8
 DT_STRSZ, DT_JMPREL, DT_RELACOUNT = 10, 23, 0x6FFFFFF9
+DT_RELRSZ, DT_RELR, DT_GNU_HASH = 0x23, 0x24, 0x6FFFFEF5
 R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE = 257, 1025, 1026, 1027
 
 
@@ -61,12 +62,12 @@ class Nso:
         strtab = dyn.get(DT_STRTAB, 0)
         self.strtab = strtab
         self.needed = [self.cstr(strtab + n) for n in needed]
-        # dynsym count from DT_HASH nchain
+        # dynsym count from DT_HASH nchain, or from DT_GNU_HASH (1.4.3 sdk and subsdk0 have no DT_HASH)
         self.syms = []
-        if DT_HASH in dyn and DT_SYMTAB in dyn:
-            nchain = self.u32(dyn[DT_HASH] + 4)
+        nsyms = self.symbol_count()
+        if nsyms and DT_SYMTAB in dyn:
             st = dyn[DT_SYMTAB]
-            for i in range(nchain):
+            for i in range(nsyms):
                 o = st + i * 24
                 name, info, other, shndx = struct.unpack_from('<IBBH', self.image, o)
                 value, size = struct.unpack_from('<QQ', self.image, o + 8)
@@ -78,6 +79,39 @@ class Nso:
                 for i in range(n):
                     r_off, r_info, r_add = struct.unpack_from('<QQq', self.image, b + i * 24)
                     self.relocs.append((r_off, r_info & 0xFFFFFFFF, r_info >> 32, r_add))
+        # DT_RELR (1.4.3): packed RELATIVE relocations whose addend is the word in place. An even entry is an address
+        # (relocate it, continue after it); an odd entry is a bitmap of the next 63 words.
+        if DT_RELR in dyn:
+            where = 0
+            for i in range(dyn[DT_RELRSZ] // 8):
+                e = self.u64(dyn[DT_RELR] + i * 8)
+                if e & 1 == 0:
+                    self.relocs.append((e, R_AARCH64_RELATIVE, 0, self.u64(e)))
+                    where = e + 8
+                    continue
+                for k in range(63):
+                    if e >> (k + 1) & 1:
+                        a = where + k * 8
+                        self.relocs.append((a, R_AARCH64_RELATIVE, 0, self.u64(a)))
+                where += 63 * 8
+
+    def symbol_count(self):
+        """Number of .dynsym entries: DT_HASH nchain, else one past the last symbol a DT_GNU_HASH chain reaches."""
+        dyn = self.dyn
+        if DT_HASH in dyn:
+            return self.u32(dyn[DT_HASH] + 4)
+        if DT_GNU_HASH not in dyn:
+            return 0
+        h = dyn[DT_GNU_HASH]
+        nbuckets, symoffset, bloom_size = self.u32(h), self.u32(h + 4), self.u32(h + 8)
+        buckets = h + 16 + bloom_size * 8
+        last = max([self.u32(buckets + 4 * i) for i in range(nbuckets)] + [0])
+        if last < symoffset:
+            return symoffset
+        chains = buckets + 4 * nbuckets
+        while not self.u32(chains + 4 * (last - symoffset)) & 1:
+            last += 1
+        return last + 1
 
     def cstr(self, off):
         end = self.image.index(b'\0', off)

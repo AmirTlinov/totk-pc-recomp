@@ -1,17 +1,18 @@
 # Adapted from MacNativeGames games/totk/scripts/make_romfs_patches.py @ ebe621d (MIT, Copyright (c) 2026
 # MacNativeGames contributors).
-"""Build the 60 fps RomFS overlay for TotK 1.2.1 (runtime/romfs.c, TOTK_ROMFS_PATCHES).
+"""Build the 60 fps RomFS overlay for TotK 1.2.1 or 1.4.3 (runtime/romfs.c, TOTK_ROMFS_PATCHES).
 
-UI/LayoutArchive/Common.Product.110.Nin_NX_NVN.blarc.zs: the weapon / shield / material quick menus capture the game
+UI/LayoutArchive/Common.Product.<110 or 140>.Nin_NX_NVN.blarc.zs: the weapon / shield / material quick menus capture the game
 picture for their background when the panes C_CaptureBG_00, C_CaptureClearBG_00 and P_CaptureClearBG_00 become
 visible at animation frame 1.0 (anim/ShortCutBG_00_In.bflan), AutoBuilder the same with C_CaptureBG_00
 (anim/AutoBuilder_00_In.bflan). UI animations advance 0.5 frames per game frame at 60 fps, so the capture lands after
 the world stopped drawing and the background can be black. The visibility keys move to frame 0.0: the live world is
 captured at once (upstream checked weapon, shield, material and ability wheel at 60 fps, and 30 fps).
-The game-over flow fix of the same upstream script is 1.0.0 only (1.2.1 runs DmF_SY_GameOver.110) and is left out.
+The game-over flow fix of the same upstream script is 1.0.0 only (1.2.1 and 1.4.3 run DmF_SY_GameOver.110) and is
+left out.
 
-Input: build/extracted/v121/romfs (romfs.bin and index.json, verified by tools/extract.py). Output: <out>/<path> and
-<out>/manifest.tsv (path, size, SHA-256 of the overlay, SHA-256 of the original). Run with .venv-py314.
+Input: build/extracted/<version>/romfs (romfs.bin and index.json, verified by tools/extract.py). Output:
+build/<version>/romfs-patches/<path> by default, and <out>/manifest.tsv (path, size, SHA-256 of the overlay, SHA-256 of the original). Run with .venv-py314.
 """
 import argparse
 import compression.zstd as zstd
@@ -22,9 +23,12 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-ap.add_argument('--romfs', type=Path, default=root / 'build/extracted/v121/romfs')
-ap.add_argument('--out', type=Path, default=root / 'build/v121/romfs-patches')
+ap.add_argument('--version', choices=('v121', 'v143'), default='v121')
+ap.add_argument('--romfs', type=Path, help='default build/extracted/<version>/romfs')
+ap.add_argument('--out', type=Path, help='default build/<version>/romfs-patches')
 args = ap.parse_args()
+args.romfs = args.romfs or root / 'build/extracted' / args.version / 'romfs'
+args.out = args.out or root / 'build' / args.version / 'romfs-patches'
 index = json.loads((args.romfs / 'index.json').read_text())
 assert index['status'] == 'pass'
 files = {f['path']: f for f in index['files']}
@@ -73,7 +77,8 @@ def flvi_keys(data, base):
     return out
 
 
-ARCHIVE = 'UI/LayoutArchive/Common.Product.110.Nin_NX_NVN.blarc.zs'
+COMMON = {'v121': '110', 'v143': '140'}   # the version in the name of each game's Common archive
+ARCHIVE = f'UI/LayoutArchive/Common.Product.{COMMON[args.version]}.Nin_NX_NVN.blarc.zs'
 MEMBERS = {
     'anim/ShortCutBG_00_In.bflan': ('C_CaptureBG_00', 'C_CaptureClearBG_00', 'P_CaptureClearBG_00'),
     'anim/AutoBuilder_00_In.bflan': ('C_CaptureBG_00',),

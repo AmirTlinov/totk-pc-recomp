@@ -242,7 +242,9 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
 int vk_pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
-    // The GPU never sees a GPU_NO_ACCESS pool, except a physical one (0x189) through the virtual pools that map it.
+    // The GPU never sees a GPU_NO_ACCESS pool, except a physical one (0x189; 1.4.3 also 0x18c, CPU-visible) through the
+    // virtual pools that map it. Either gets device-local memory: 1.4.3's CPU never writes its 0x18c pool's storage
+    // (unchanged over 3600 frames of the intro), so the guest storage and the GPU copy need no sync.
     if ((p->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS) && !(p->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL)) return 1;
     PoolRec *r = calloc(1, sizeof *r);
     if (!r) rt_fatal("vk: out of memory for a pool record");
