@@ -67,7 +67,6 @@ typedef struct {
     VkImageViewType type;
     uint32_t aspect, level0, levels, layer0, layers, swz;
 } ViewKey;
-typedef struct { ViewKey k; VkImageView view; } ViewEnt;
 _Static_assert(sizeof(ViewKey) == 40, "ViewKey is hashed as bytes: no padding");
 typedef struct { uint64_t addr, size; } Range;
 typedef struct {
@@ -75,9 +74,6 @@ typedef struct {
     int nchunks, cchunks;
     VkDescriptorPool *pools;
     int npools, cpools;
-    ViewEnt *views;
-    int nviews, cviews;
-    nvn_hmap view_of;                    // ViewKey -> the VkImageView in views
     Range *written;
     int nwritten, cwritten;
 } CbRes;
@@ -175,7 +171,6 @@ static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
     for (int i = 0; i < r->nwritten; i++) vk_guest_written(r->written[i].addr, r->written[i].size);
-    for (int i = 0; i < r->nviews; i++) vkDestroyImageView(c->device, r->views[i].view, NULL);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         AcquireSRWLockExclusive(&spare_lock);
@@ -191,8 +186,7 @@ static void cb_done(void *arg) {   // completion thread
         ReleaseSRWLockExclusive(&spare_lock);
         if (!kept) vmaDestroyBuffer(c->vma, r->chunks[i].buf, r->chunks[i].alloc);
     }
-    free(r->view_of.keys), free(r->view_of.vals);
-    free(r->written), free(r->views), free(r->pools), free(r->chunks), free(r);
+    free(r->written), free(r->pools), free(r->chunks), free(r);
 }
 
 void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
@@ -201,7 +195,6 @@ static CbRes *cb_res(VkExec *ex) {
     if (cur && cur_fence == ex->fence) return cur;
     cur = calloc(1, sizeof *cur);
     if (!cur) rt_fatal("vk: out of memory");
-    nvn_hm_init(&cur->view_of, sizeof(ViewKey));
     cur_fence = ex->fence;
     memset(&B, 0, sizeof B);
     vk_completion_add(ex->fence, cb_done, cur);
@@ -455,8 +448,15 @@ VkImageAspectFlags vk_exec_view_aspect(const VkTexImage *img, const view_t *v, i
                                                        : VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
+// Image views of registered textures, kept for their image's lifetime: made per command buffer they were created again
+// every frame (vkCreateImageView took about 8% of the fight replay on the 7900X). Used under the texture lock, as
+// vk_exec_image_gone is (destroy_tex), which hands the views of a destroyed image to the deferred release with it.
+typedef struct ViewNode { struct ViewNode *next; ViewKey k; VkImageView view; } ViewNode;
+static nvn_hmap view_of;                 // ViewKey -> VkImageView
+static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
+
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
-// the image cannot serve it (the caller binds a stand-in).
+// the image cannot serve it (the caller binds a stand-in). Texture lock held.
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
@@ -505,9 +505,9 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
-    CbRes *r = cb_res(ex);
     ViewKey k = {img->image, img->format, vt, aspect, l0, nl, y0, ny, swz};
-    VkImageView found = (VkImageView)nvn_hm_get(&r->view_of, &k);
+    if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
+    VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
     if (found) return found;
     VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image, .viewType = vt,
                                 .format = img->format,
@@ -518,10 +518,22 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
-    if (r->nviews == r->cviews) r->views = grow(r->views, &r->cviews, sizeof *r->views);
-    r->views[r->nviews++] = (ViewEnt){k, view};
-    nvn_hm_put(&r->view_of, &k, (void *)view);
+    ViewNode *n = malloc(sizeof *n);
+    if (!n) rt_fatal("vk: out of memory");
+    *n = (ViewNode){nvn_hm_get(&views_by_image, &img->image), k, view};
+    nvn_hm_put(&views_by_image, &img->image, n);
+    nvn_hm_put(&view_of, &k, (void *)view);
     return view;
+}
+
+void vk_exec_image_gone(VkImage image) {
+    if (!views_by_image.klen) return;
+    for (ViewNode *n = nvn_hm_del(&views_by_image, &image), *next; n; n = next) {
+        next = n->next;
+        nvn_hm_del(&view_of, &n->k);
+        vk_defer_view(n->view);
+        free(n);
+    }
 }
 
 // ---- program to shaders
@@ -766,8 +778,19 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     return (VkDescriptorBufferInfo){B.c0_buf[k], B.c0_off[k], VK_C0_BYTES};
 }
 
+// The buffer range limits, read once: the device's properties are a cold cache line on every binding of every draw.
+static struct { uint64_t ubo_max, ubo_align, sbo_max, sbo_align; } LIM;
+
+static void limits_init(void) {
+    const VkPhysicalDeviceLimits *l = &vk_ctx()->props.limits;
+    LIM.ubo_align = l->minUniformBufferOffsetAlignment, LIM.sbo_max = l->maxStorageBufferRange;
+    LIM.sbo_align = l->minStorageBufferOffsetAlignment;
+    __atomic_store_n(&LIM.ubo_max, l->maxUniformBufferRange, __ATOMIC_RELEASE);
+}
+
 static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
-    uint64_t max = vk_ctx()->props.limits.maxUniformBufferRange, align = vk_ctx()->props.limits.minUniformBufferOffsetAlignment;
+    if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+    uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
     VkDescriptorBufferInfo bi;
     if (slot == 0 && c0_on()) return c0_info(ex, st);
     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
@@ -851,7 +874,8 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
 }
 
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
-    uint64_t max = vk_ctx()->props.limits.maxStorageBufferRange, align = vk_ctx()->props.limits.minStorageBufferOffsetAlignment;
+    if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+    uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
     VkDescriptorBufferInfo bi;
     int ubo, slot = ssbo_slot(r, st, &ubo);
     p_bind_buf up = {0};

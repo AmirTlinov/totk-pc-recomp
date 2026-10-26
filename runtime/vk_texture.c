@@ -426,6 +426,7 @@ static void destroy_tex(Tex *e) {
             if (p->next_at == e) { p->next_at = e->next_at; break; }
     }
     if (e->released) nreleased--;
+    vk_exec_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
     free(e);
 }
