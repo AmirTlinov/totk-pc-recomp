@@ -294,10 +294,11 @@ static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) 
 //   (interrupt_flag) is set. Such an owner is not preempted, at a checkpoint either: interrupt_flag is set and the
 //   switch happens at that SVC. Preempting it anyway hung MacNativeGames' game at "Continue" (the lock holder lost its
 //   core to a thread that then spun on that lock).
-// TOTK_ASYNC_PREEMPT=0 keeps the old scheduling exactly: raw priorities, no interruption, no disable_count.
+// TOTK_ASYNC_PREEMPT=0 keeps the old scheduling exactly: raw priorities, no interruption, no disable_count; =2 keeps
+// inheritance and the preemption disable without interrupting owners.
 #define AP_FIRST_NS 250000ull   // the waiter spins this long before the first interruption (most waits end sooner)
 #define AP_GAP_NS 1000000ull    // and interrupts the same owner at most this often
-static int g_ap = -1, g_ap_int, g_ap_noyield, g_ap_test;   // g_ap_test: TOTK_ASYNC_PREEMPT=4/5 (tests)   // g_ap_noyield: TOTK_ASYNC_PREEMPT=3, the stub only (test)   // g_ap_int: interrupt owners (TOTK_ASYNC_PREEMPT=2: inheritance and disable only)
+static int g_ap = -1, g_ap_int;   // g_ap_int: interrupt owners (TOTK_ASYNC_PREEMPT=2: inheritance and disable only)
 static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 #define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
@@ -309,8 +310,6 @@ static void ap_init(void) {
     const char *e = cfg_get("TOTK_ASYNC_PREEMPT");
     g_ap = !(e && !strcmp(e, "0"));
     g_ap_int = g_ap && !(e && !strcmp(e, "2"));
-    g_ap_noyield = e && !strcmp(e, "3");
-    g_ap_test = e && (*e == '4' || *e == '5') ? *e - '0' : 0;   // 4: set the context back unchanged; 5: only suspend
     if (g_ap) {
         RtModule m[16];
         int n = rt_linked_modules(m, 16);
@@ -489,10 +488,6 @@ static int ap_try(RtThread *w) {
     else if (tl[0]) {
         tl[1] = 1;
         g_ap_deferred++;
-    } else if (g_ap_test == 4) {
-        if (SetThreadContext(o->hthr, &ctx)) g_ap_sent++;
-    } else if (g_ap_test == 5) {
-        g_ap_sent++;
     } else {
         o->ap_rip = ctx.Rip;
         o->ap_pending = 1;
@@ -500,18 +495,18 @@ static int ap_try(RtThread *w) {
         if (SetThreadContext(o->hthr, &ctx)) {
             g_ap_sent++;
             r = AP_SENT;
-            if (g_ap_log < AP_LOG_N) {
-                g_ap_log++;
-                rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
-                       (unsigned long long)(o->ap_rip - (uintptr_t)GetModuleHandleW(NULL)), (unsigned long long)ctx.Rsp,
-                       w->handle, w->prio);
-            }
         } else {
             o->ap_pending = 0;
             g_ap_fail++;
         }
     }
     ResumeThread(o->hthr);
+    if (r == AP_SENT && g_ap_log < AP_LOG_N) {
+        g_ap_log++;
+        rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
+               (unsigned long long)(o->ap_rip - (uintptr_t)GetModuleHandleW(NULL)), (unsigned long long)ctx.Rsp,
+               w->handle, w->prio);
+    }
     return r;
 }
 
@@ -941,7 +936,7 @@ void kern_ap_yield(void) {
     RtThread *t = tcur;
     lock();
     t->ap_pending = 0;
-    if (!g_ap_noyield && t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
+    if (t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
         if (g_diag > 0) {
             t->dg_pc = t->cur->pc;
             t->dg_lr = t->cur->x[30];
