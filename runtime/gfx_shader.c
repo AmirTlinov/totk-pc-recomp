@@ -1626,18 +1626,23 @@ static int rec_append(const char *path, const char *magic, uint32_t version, uin
     return !fclose(f) && ok;
 }
 
+static SRWLOCK rec_io = SRWLOCK_INIT;   // the record files: appends in order, no read during an append
+
 void gfx_shader_record_flush(int force) {
     static volatile LONG64 last;
     LONG64 now = (LONG64)GetTickCount64();
     if (!RC.on || (!force && now - last < 2000)) return;
     last = now;
+    // The files are written outside RC.lock, which the render thread takes to record a new answer.
+    AcquireSRWLockExclusive(&rec_io);
     AcquireSRWLockExclusive(&RC.lock);
     Bytes ans = RC.ans, prg = RC.prg;
     RC.ans = (Bytes){0}, RC.prg = (Bytes){0};
     uint64_t total = RC.pairs.n, added = RC.pairs_new;
+    ReleaseSRWLockExclusive(&RC.lock);
     if (prg.n && !rec_append(RC.prg_path, "TOTKSPRG", PRG_VERSION, 0, &prg)) rt_log("gfx_shader: cannot write %s", RC.prg_path);
     if (ans.n && !rec_append(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ans)) rt_log("gfx_shader: cannot write %s", RC.ans_path);
-    ReleaseSRWLockExclusive(&RC.lock);
+    ReleaseSRWLockExclusive(&rec_io);
     if (ans.n) rt_log("gfx_shader: answers: %zu new records appended (%llu new this run, %llu recorded)", ans.n / ANS_REC,
                       (unsigned long long)added, (unsigned long long)total);
     free(ans.p), free(prg.p);
@@ -1801,9 +1806,9 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
              RC.ans_path);
     uint8_t *ab = NULL, *pb = NULL;
     size_t an = 0, pn = 0;
-    AcquireSRWLockExclusive(&RC.lock);                     // no append meanwhile
+    AcquireSRWLockExclusive(&rec_io);                      // no append meanwhile
     rec_read(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ab, &an);
-    ReleaseSRWLockExclusive(&RC.lock);
+    ReleaseSRWLockExclusive(&rec_io);
     rec_read(prp, "TOTKSPRP", PRP_VERSION, PRP_REC, &pb, &pn);
     size_t na = an / ANS_REC, np = pn / PRP_REC, n = 0;
     GfxWarmEnt *e = calloc(na + np + 1, sizeof *e);
