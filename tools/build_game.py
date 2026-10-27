@@ -569,27 +569,6 @@ def mib(n):
     return f'{n / (1 << 20):,.1f} MiB'
 
 
-def warm_driver_cache(exe):
-    """Rebuild the GPU driver's disk cache of a prepared build after its totk.exe changed.
-
-    tools/prepare_shaders.py builds every prepared variant's stage library once so the driver's own disk cache holds it
-    (vk_pipeline.c "stage library prebuild"). That cache is keyed to the exe: after a relink, a library a draw needs
-    took 40-220 ms in play instead of about 2 ms. totk.exe --warm-shaders builds them again from the shader cache
-    (about 3.5 min on 24 threads), without translating. Builds without shader-prepared.bin are left alone.
-    """
-    if not (exe.parent / 'shader-prepared.bin').is_file():
-        return
-    print('build_game: totk.exe changed in a prepared build: warming the driver cache (--no-warm skips it)', flush=True)
-    t0 = time.monotonic()
-    r = subprocess.run([str(exe), '--warm-shaders'], cwd=str(exe.parent), stdout=subprocess.PIPE, text=True,
-                       errors='replace')
-    last = (r.stdout.strip().splitlines() or [''])[-1]
-    print(f'warm: rc={r.returncode}, {time.monotonic() - t0:.0f} s; {last}')
-    if r.returncode:
-        print(f'build_game: warning: the driver cache stays cold; run python tools/prepare_shaders.py '
-              f'{below_root(exe.parent)}', file=sys.stderr)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--version', default='v121', help='game version (default v121)')
@@ -623,8 +602,6 @@ def main():
                                                     f'({", ".join(sorted(INSTALL_SIDE))} and modules.c still compile)')
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
-    ap.add_argument('--no-warm', action='store_true',
-                    help='leave the driver cache cold after relinking a prepared build (see warm_driver_cache)')
     args = ap.parse_args()
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
@@ -731,7 +708,6 @@ def main():
         return
     if args.make_runtime_lib:
         exe.unlink(missing_ok=True)   # ar rcs would keep members of deleted sources
-    before = exe.stat().st_mtime_ns if exe.exists() else 0
     code, dt, peak_one, _ = run_measured(base + [flag_path(exe)], env)
     print(f'link: {dt:.1f} s, peak {mib(peak_one)}')
     if code:
@@ -748,8 +724,6 @@ def main():
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
     if image > 3 * GiB // 2:
         print('build_game: warning: image over 1.5 GiB; RIP-relative code reaches only 2 GiB', file=sys.stderr)
-    if exe.stat().st_mtime_ns != before and not args.no_warm:
-        warm_driver_cache(exe)
 
 
 if __name__ == '__main__':
