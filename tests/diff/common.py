@@ -226,21 +226,21 @@ def build_harness(work, bodies, jobs, cflags):
     return exe
 
 
-def write_cases(path, cases):
-    """cases: (k, fpcr, x[31], sp, nzcv, v[32], memchk)."""
+def write_cases(path, cases, stubs=False):
+    """cases: (k, fpcr, x[31], sp, nzcv, v[32], memchk). stubs: calls go to harness.c's call stub (rt_stub)."""
     with open(path, 'wb') as f:
         for k, fpcr, x, sp, nzcv, v, memchk in cases:
             f.write(struct.pack(IN_FMT, k, fpcr, *(list(x[:31]) + [0]), sp, nzcv))
             for q in v:
                 f.write(q.to_bytes(16, 'little'))
-            f.write(struct.pack(IN_TAIL, int(memchk), 0))
+            f.write(struct.pack(IN_TAIL, int(memchk), int(stubs)))
 
 
-def run_harness(exe, work, buf0, cases, images):
+def run_harness(exe, work, buf0, cases, images, stubs=False):
     """Run the lifted tests. Returns (records, stderr tail or None). images: (base, path) pairs."""
     with open(work / 'buf.bin', 'wb') as f:
         f.write(buf0)
-    write_cases(work / 'cases.bin', cases)
+    write_cases(work / 'cases.bin', cases, stubs)
     out = work / 'out.bin'
     args = [str(exe), str(work / 'buf.bin'), str(work / 'cases.bin'), str(out)]
     for base, path in images:
@@ -258,14 +258,14 @@ def run_harness(exe, work, buf0, cases, images):
     return recs, err
 
 
-def diff_state(got, want, check_pc, check_mem):
+def diff_state(got, want, check_pc, check_mem, check_nzcv=True):
     """got: harness record; want: (x, sp, nzcv, pc, v, mem). Returns a list of mismatches."""
     hx, hsp, hnz, hpc, hmem, hv = got
     ex, esp, enz, epc, ev, emem = want
     d = [f'x{j}: got {hx[j]:x} want {ex[j]:x}' for j in range(31) if hx[j] != ex[j]]
     if hsp != esp:
         d.append(f'sp: got {hsp:x} want {esp:x}')
-    if hnz != enz:
+    if check_nzcv and hnz != enz:
         d.append(f'nzcv: got {hnz:x} want {enz:x}')
     if check_pc and hpc != epc:
         d.append(f'pc: got {hpc:x} want {epc:x}')
