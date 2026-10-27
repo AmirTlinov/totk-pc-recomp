@@ -89,9 +89,24 @@ machine A runs scripted routes; B and C send logs from the user's play.
 20. **GPU memory over long sessions** (port-lessons P3), never measured. MacNativeGames' TotK reached its 5000 MB GPU
     budget after 2 h 43 min (their issue #72) and grew from 4.5 to 6.25 GiB resident; their dead-serial hash sets
     reached about 1 GiB after 3 h. Our textures are destroyed when their pool range goes or a new texture takes the
-    address (`vk_texture.c` `entry_of`, `vk_texture_range_gone`), pools at Finalize, Vulkan objects deferred. Next: a
-    memory line every 1800 frames (VMA heaps, textures, pools, pipelines), a list of growing containers, then a 2-3 h
-    session. 6-8 GB cards are the risk.
+    address (`vk_texture.c` `entry_of`, `vk_texture_range_gone`), pools at Finalize, Vulkan objects deferred.
+    `mem: vram` (every 600 frames with `TOTK_TRACE=perf`, `vk_memory.c` `vram_log`) splits device-local memory. A 16,000
+    frame uncapped fight on A (`build/v121-vram/NOTES.md`): pools flat (import 1160 MiB host, physical 111 MiB), mirrors
+    440 MiB, live textures 1635 MiB, released textures up to 825 MiB (1686 entries); 3.25 GB in all and flat from frame
+    9000, no leak. The released entries are the grower: TextureFinalize keeps the image (`vk_texture_release`) for the
+    finalize-and-init-again cycle of transient textures and for finalized slots that still name the storage, and
+    `sweep_released` drops all of them at once only past 4096 entries, a count, not bytes (about 2 GB at this mix).
+    The GTX 1050 Ti of machine B (budget 3620 MiB) reaches 3300-3386 MiB within 1-2 min of play, and from then on up to
+    394 pools stay imported (`mem: mirror` "stay imported: budget"), so the GPU reads them over PCIe.
+    Next:
+    - Count the frames from release to reuse of each released entry, in `mem: vram`, on the fight and the field: where
+      transient textures end and the tail that can go begins.
+    - Drop released entries oldest first, one by one, never all at once, and only under pressure (device-local use past
+      about 85% of the budget, before a mirror is refused); unchanged on large cards. A fixed cap below the transient
+      working set would recreate images every frame and lose GPU-rendered content (flicker, empty tile maps).
+    - Check on B: mirrors refused for the budget and fps before and after; then a 2-3 h session with travel.
+    - 2-4 GB cards: ASTC kept as RGBA8 is 4x its size; BC1/BC3 recompression (yuzu, `maxwell.md` 2.13) is the larger
+      saving.
 21. **Later**: recording on several threads; descriptor buffers or bindless (touches the translator); CPU/GPU frame
     overlap as LAS Recomp 13398126d (only after item 9, and it must keep the guard of item 3); an x86-64-v2 build for
     CPUs without AVX2/FMA (SavageWindRecomp ae42014b4); render passes ended by uniform updates and clear-only work
