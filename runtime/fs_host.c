@@ -13,8 +13,9 @@
 //   <profile>/cache/<index>/           cache storage
 //
 // The save mount is journaled as on Horizon: changes go to a working copy and become the committed save atomically at
-// Commit; a crash or an Unmount before Commit leaves the previous committed save. fs_save_busy still tells a window
-// close to wait until a save in progress is committed. Paths are UTF-8 and go to the W APIs as UTF-16.
+// Commit; a crash or an Unmount before Commit leaves the previous committed save. Commit returns at once and the copy
+// runs on a background thread (section "save transactions"); fs_save_flush lets the exit paths wait for it. Paths are
+// UTF-8 and go to the W APIs as UTF-16.
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,7 +71,9 @@ static DWORD attributes(const char *path) {
 // (TotK writes a slot's files back to back and then commits; between the files nothing is open for a moment).
 static volatile LONG save_writers, save_dirty;
 static volatile LONG64 save_changed_ns;
+static void save_wait_commit(void);
 static void save_touched(void) {
+    save_wait_commit();   // every change to save data comes here first: none lands in a commit's snapshot
     InterlockedExchange64(&save_changed_ns, (LONG64)plat_now_ns());
     InterlockedExchange(&save_dirty, 1);
 }
@@ -158,7 +161,10 @@ static int remove_tree(const char *path) {
 // Commit: (1) copy work to new and flush every file (FlushFileBuffers) and directory, a file equal to the committed
 // one as a hard link to it; (2) rename save/<uid> to old;
 // (3) rename new to save/<uid>, the commit point; (4) move old to save-backup/<UTC time> and keep the newest three.
-// Both renames are MoveFileExW with MOVEFILE_WRITE_THROUGH. save/<uid> is renamed away only after new is complete
+// Both renames are MoveFileExW with MOVEFILE_WRITE_THROUGH. The game's Commit returns 0 once steps (1) to (4) are
+// queued; a thread runs them (95-135 ms on the game thread before, in the 1.4.3 fight save) while every change to the
+// working copy waits in save_touched, and Unmount and the next Commit wait too. A crash in that time loses this Commit
+// only, and a failed one is logged instead of returned. save/<uid> is renamed away only after new is complete
 // on disk, so the recovery rule at start (save_recover) is:
 //   save/<uid> present   it is the committed save (the old one if the crash came before (3), the new one after);
 //                        new, if present, is an unfinished copy and is deleted (rollback);
@@ -425,16 +431,54 @@ static uint32_t save_commit_locked(void) {
     return 0;
 }
 
-static uint32_t save_commit(void) {
+// The background commit: commit_pending from the game's Commit until the thread has run save_commit_locked.
+static SRWLOCK pend_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE pend_cv = CONDITION_VARIABLE_INIT;
+static volatile LONG commit_pending;
+
+static void save_wait_commit(void) {
+    if (!InterlockedCompareExchange(&commit_pending, 0, 0)) return;
+    AcquireSRWLockExclusive(&pend_lock);
+    while (commit_pending) SleepConditionVariableSRW(&pend_cv, &pend_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&pend_lock);
+}
+
+void fs_save_flush(void) { save_wait_commit(); }
+
+static uint32_t commit_run(void) {
     AcquireSRWLockExclusive(&tx_lock);
-    InterlockedIncrement(&save_writers);   // fs_save_busy for the duration
-    static int quiet;
-    uint32_t r = 0;
-    if (InterlockedCompareExchange(&save_dirty, 0, 0)) r = save_commit_locked();
-    else if (!quiet++) rt_log("fs commit save: nothing changed (logged once)");
+    uint32_t r = save_commit_locked();
     InterlockedDecrement(&save_writers);
     ReleaseSRWLockExclusive(&tx_lock);
+    AcquireSRWLockExclusive(&pend_lock);
+    commit_pending = 0;
+    ReleaseSRWLockExclusive(&pend_lock);
+    WakeAllConditionVariable(&pend_cv);
     return r;
+}
+
+static DWORD WINAPI commit_main(void *arg) {
+    (void)arg;
+    commit_run();
+    return 0;
+}
+
+static uint32_t save_commit(void) {
+    save_wait_commit();   // the previous Commit
+    static int quiet;
+    if (!InterlockedCompareExchange(&save_dirty, 0, 0)) {
+        if (!quiet++) rt_log("fs commit save: nothing changed (logged once)");
+        return 0;
+    }
+    InterlockedIncrement(&save_writers);   // fs_save_busy until the thread is done
+    InterlockedExchange(&commit_pending, 1);
+    HANDLE t = CreateThread(NULL, 0, commit_main, NULL, 0, NULL);
+    if (t) {
+        CloseHandle(t);
+        return 0;
+    }
+    rt_log("fs: cannot start the save commit thread (error %lu); committing on the game thread", GetLastError());
+    return commit_run();
 }
 
 // ---- storage roots
@@ -678,6 +722,7 @@ static uint32_t read_cache_list(int *count, CacheStorageInfo *out, uint64_t h, i
 static void close_cache_list(uint64_t h) { free((void *)(uintptr_t)h); }
 
 static void unmount(const char *name) {
+    save_wait_commit();   // else the working copy could go before a Commit queued just now has copied it
     AcquireSRWLockExclusive(&tx_lock);
     AcquireSRWLockExclusive(&lock);
     for (int i = 0; i < NMOUNTS; i++)
@@ -1335,6 +1380,13 @@ static void probe_restart(const uint64_t *uid) {
     CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0, "MountSaveData after a restart");
 }
 
+// Commit through the override, then wait for its background thread, as the checks read the disk next.
+static uint32_t tx_commit(void) {
+    uint32_t r = RES(S_COMMIT, U("save"));
+    fs_save_flush();
+    return r;
+}
+
 #define TX_SIZE 4096
 static uint8_t tx_buf[TX_SIZE];
 
@@ -1405,7 +1457,7 @@ static int count_dirs(const wchar_t *dir) {
 static void probe_save_tx(const uint64_t *uid) {
     const char *a = "save:/tx_a.sav", *b = "save:/tx_b.sav";
     uint64_t h = 0;
-    CHECK(tx_write(a, 1) && tx_write(b, 1) && RES(S_COMMIT, U("save")) == 0 && tx_read_committed("tx_a.sav") == 1,
+    CHECK(tx_write(a, 1) && tx_write(b, 1) && tx_commit() == 0 && tx_read_committed("tx_a.sav") == 1,
           "Commit of generation 1");
 
     // uncommitted changes: the game reads them; the committed save and the next start do not see them
@@ -1417,7 +1469,7 @@ static void probe_save_tx(const uint64_t *uid) {
     CHECK(tx_read(a) == 1 && tx_read("save:/tx_c.sav") == -1, "an uncommitted write survived a restart");
 
     // committed changes survive a restart; an Unmount without Commit drops changes
-    CHECK(tx_write(a, 3) && tx_write(b, 3) && RES(S_COMMIT, U("save")) == 0, "Commit of generation 3");
+    CHECK(tx_write(a, 3) && tx_write(b, 3) && tx_commit() == 0, "Commit of generation 3");
     probe_restart(uid);
     CHECK(tx_read(a) == 3 && tx_read(b) == 3, "a commit lost in a restart");
     CHECK(tx_write(a, 4), "write before Unmount");
@@ -1430,7 +1482,7 @@ static void probe_save_tx(const uint64_t *uid) {
     for (int k = 1; k < 64; k++) {
         int next = ++gen, ok = tx_write(a, next) && tx_write(b, next);
         tx_crash_at = k;
-        uint32_t r = RES(S_COMMIT, U("save"));
+        uint32_t r = tx_commit();
         int died = tx_dead;
         tx_crash_at = 0;
         if (!died) {
@@ -1456,10 +1508,22 @@ static void probe_save_tx(const uint64_t *uid) {
 
     // a Commit writes the changed file and links the unchanged one to the committed save it replaces
     int kept = committed;
-    CHECK(tx_write(a, ++gen) && RES(S_COMMIT, U("save")) == 0 && tx_read_committed("tx_a.sav") == gen &&
+    CHECK(tx_write(a, ++gen) && tx_commit() == 0 && tx_read_committed("tx_a.sav") == gen &&
           tx_read_committed("tx_b.sav") == kept && tx_links_committed("tx_b.sav") >= 2 &&
           tx_links_committed("tx_a.sav") == 1, "Commit of one changed file: tx_a %d links, tx_b %d links",
           tx_links_committed("tx_a.sav"), tx_links_committed("tx_b.sav"));
+    committed = gen;
+
+    // the background commit: a write right after Commit waits for it and stays out of it; an Unmount right after
+    // Commit waits for it and keeps it
+    int queued = ++gen;
+    CHECK(tx_write(a, queued) && RES(S_COMMIT, U("save")) == 0 && tx_write(a, ++gen) && tx_read(a) == gen &&
+          tx_read_committed("tx_a.sav") == queued, "a write right after Commit: committed tx_a %d, expected %d",
+          tx_read_committed("tx_a.sav"), queued);
+    CHECK(RES(S_COMMIT, U("save")) == 0, "Commit before Unmount");
+    CALL(S_UNMOUNT, U("save"));
+    CHECK(tx_read_committed("tx_a.sav") == gen && RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0 && tx_read(a) == gen,
+          "an Unmount right after Commit lost it");
     committed = gen;
 
     // the read-only mount shows the committed save and refuses changes
@@ -1468,7 +1532,7 @@ static void probe_save_tx(const uint64_t *uid) {
           FS_R_UNSUPPORTED_OPEN && RES(S_CREATE_FILE, U("ro:/x"), 0) == FS_R_UNSUPPORTED_OPEN &&
           RES(S_RENAME_FILE, U("save:/tx_a.sav"), U("ro:/y")) == FS_R_INVALID_PATH, "MountSaveDataReadOnly");
     CALL(S_UNMOUNT, U("ro"));
-    CHECK(RES(S_DELETE_FILE, U(a)) == 0 && RES(S_DELETE_FILE, U(b)) == 0 && RES(S_COMMIT, U("save")) == 0 &&
+    CHECK(RES(S_DELETE_FILE, U(a)) == 0 && RES(S_DELETE_FILE, U(b)) == 0 && tx_commit() == 0 &&
           tx_read_committed("tx_a.sav") == -1, "Commit of deletions");
     printf("save tx: uncommitted writes visible to the game and dropped by a restart and by Unmount, commits kept; a "
            "crash at each of %d commit steps recovers to the old save %d times, the new one %d times, mixed %d "
@@ -1518,7 +1582,7 @@ static void probe_storage(void) {
     CHECK(fs_save_busy(), "a save file open for writing does not count as a save in progress");
     CALL(S_CLOSE_FILE, h);
     CHECK(fs_save_busy(), "closed but uncommitted save data does not count as a save in progress");
-    CHECK(RES(S_COMMIT, U("save")) == 0 && !fs_save_busy(), "Commit");
+    CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit");
     CHECK(RES(S_COMMIT, U("nomount")) == FS_R_PATH_NOT_FOUND, "Commit of an unknown mount");
 
     // paths
@@ -1549,7 +1613,7 @@ static void probe_storage(void) {
           count == 1 && ents[0].type == FS_ENTRY_FILE, "ReadDirectory, files only");
     CALL(S_CLOSE_DIRECTORY, d);
 
-    CHECK(RES(S_COMMIT, U("save")) == 0, "Commit of the directories");
+    CHECK(tx_commit() == 0, "Commit of the directories");
 
     // reopen after unmount: the bytes come back through the overrides and are on disk
     CALL(S_UNMOUNT, U("save"));
@@ -1588,7 +1652,7 @@ static void probe_storage(void) {
           RES(S_DELETE_FILE, U("save:/renamed.sav")) == FS_R_PATH_NOT_FOUND, "DeleteFile");
     CHECK(RES(S_DELETE_RECURSIVE, U("save:/dir")) == 0 &&
           RES(S_ENTRY_TYPE, U(&type), U("save:/dir")) == FS_R_PATH_NOT_FOUND, "DeleteDirectoryRecursively");
-    CHECK(RES(S_COMMIT, U("save")) == 0 && !fs_save_busy(), "Commit after the changes");
+    CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit after the changes");
     probe_save_tx(uid);
 
     // temporary and cache storage
