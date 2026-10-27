@@ -45,7 +45,8 @@ keeps `profile/`. Saves carry over both ways: 1.4.3 converts a 1.2.1 save on loa
 2. **Extract** ExeFS and RomFS into the install folder and verify the hashes.
 3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt` or `patches-v143.txt`) into a temp folder next
    to the installer.
-4. **Compile** the generated C, `modules.c` and `romfs.c` (they bake per-install layout and RomFS hashes) and link
+4. **Compile** the generated C, `modules.c`, `romfs.c` and `patches.c` (they bake the per-install layout, RomFS
+   hashes and the game version's patch page) and link
    them with the prebuilt runtime library into `totk.exe` (`build_game.py --runtime-lib`; about 3 min on 24 cores).
 5. **Prepare** the RomFS patches and the shaders (`tools/make_romfs_patches.py`, `tools/prepare_shaders.py`,
    `totk.exe --prepare-shaders`) in the install folder.
@@ -91,7 +92,7 @@ installer/            the installer: steps, CLI, window, en/ru text catalog
 python/               Python 3.14.9 embeddable + numpy, lz4, cryptography, cffi, pycparser (+ tkinter for the window)
 recomp/, tools/       the lifter and the build, extraction and shader scripts the steps run (copied from the repo)
 llvm/                 llvm-mingw, x86_64-only subset (Apache-2.0 with LLVM exception; mingw-w64 parts permissive)
-runtime/              libtotkrt.a and the headers the generated code and modules.c/romfs.c include
+runtime/              libtotkrt.a and the headers the generated code and modules.c/romfs.c/patches.c include
 bin/                  totk_xlate.exe, hactool.exe, SDL3.dll, libopus-0.dll, ninja.exe
 data/                 shader_list.tsv (MacNativeGames, MIT)
 THIRD_PARTY_NOTICES.md

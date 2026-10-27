@@ -46,6 +46,7 @@ static volatile LONG g_focus_msgs;
 static CRITICAL_SECTION g_start_lock;       // gfx_window_start / vsync start
 static int g_started, g_wnd_failed;
 static int g_background;                   // TOTK_BACKGROUND_WINDOW: the window stays behind the user's windows
+static int g_fs_pending;                   // window thread: TOTK_FULLSCREEN waits for the first activation
 
 // ---- swapchain and present state (g_pl)
 static CRITICAL_SECTION g_pl;
@@ -180,6 +181,7 @@ HWND gfx_window_handle(void) { return g_hwnd; }
 // ---- window thread
 #define WND_STYLE WS_OVERLAPPEDWINDOW
 #define WM_APP_SETTINGS (WM_APP + 1)
+#define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, held back until the window is first activated
 
 static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
 
@@ -360,6 +362,13 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_SETTINGS:
         apply_settings(h);
         return 0;
+    case WM_APP_FULLSCREEN:
+        if (cfg_fullscreen() && !is_fullscreen(h)) {
+            input_cursor_suspend(1);
+            toggle_fullscreen(h);
+            input_cursor_suspend(0);
+        }
+        return 0;
     case WM_SIZE:
         if (w != SIZE_MINIMIZED) InterlockedExchange(&g_dirty, 1);
         refresh_rate_update(h, 0);
@@ -376,6 +385,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         oe_set_focus(in);                          // pinned to 1 by TOTK_ASSUME_FOCUS inside
         oe_push_message(OE_MSG_FOCUS_STATE_CHANGED);
         InterlockedIncrement(&g_focus_msgs);
+        if (in && g_fs_pending) {
+            g_fs_pending = 0;
+            PostMessageW(h, WM_APP_FULLSCREEN, 0, 0);
+        }
         return 0;
     }
     case WM_CLOSE:
@@ -405,8 +418,11 @@ static DWORD WINAPI window_main(void *arg) {
     cfg_window_size(&cw, &ch);
     RECT r = {0, 0, cw, ch};
     AdjustWindowRect(&r, WND_STYLE, FALSE);
-    // TOTK_BACKGROUND_WINDOW=1 (test runs): the window opens behind the user's windows without taking focus; it keeps its
-    // taskbar button and can be brought up by hand. It never goes fullscreen at start.
+    // The window opens behind the user's windows without taking focus: it shows the game's blank loading frames for a
+    // while, and must not cover what the player works on meanwhile. The game still counts itself in focus until the
+    // first WM_ACTIVATEAPP, so loading goes on, and keyboard input waits for the foreground (input_win.c). Its taskbar
+    // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
+    // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
     int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT,
                              r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
@@ -414,11 +430,12 @@ static DWORD WINAPI window_main(void *arg) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
         g_wnd_failed = 1;
     } else {
-        if (background)
-            SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        else
-            ShowWindow(g_hwnd, cfg_get("TOTK_ASSUME_FOCUS") ? SW_SHOWNOACTIVATE : SW_SHOW);   // scripted runs leave focus alone
-        if (!background && cfg_fullscreen()) toggle_fullscreen(g_hwnd);
+        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!background) {
+            FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
+            FlashWindowEx(&fw);
+            g_fs_pending = cfg_fullscreen();
+        }
         note_applied();
         refresh_rate_update(g_hwnd, 1);
     }

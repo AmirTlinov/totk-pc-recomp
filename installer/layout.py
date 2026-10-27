@@ -7,7 +7,7 @@ Release (docs/installer.md "Release layout"), root = the unpacked folder:
     recomp/, tools/         the lifter and the scripts; recomp/patches-<v>.txt, tools/data/expected-v<version>.json for
                             each supported update (SUPPORTED)
     llvm/                   llvm-mingw (bin/clang.exe)
-    runtime/                libtotkrt.a, the headers, install-side sources (romfs.c) and totk.ico; runtime/deps/ holds
+    runtime/                libtotkrt.a, the headers, install-side sources (romfs.c, patches.c) and totk.ico; runtime/deps/ holds
                             include/ + lib/ of Vulkan, SDL3, Opus, libvpx and VMA (build_game.py --deps)
     bin/                    totk_xlate.exe (+ totk_xlate.id), hactool.exe, ninja.exe, SDL3.dll, libopus-0.dll
     data/shader_list.tsv    the MacNativeGames shader list
