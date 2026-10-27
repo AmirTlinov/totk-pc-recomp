@@ -17,7 +17,7 @@ Versions are the ones the build was verified with; newer patch releases are fine
 | .NET SDK | 10.0 | winget `Microsoft.DotNet.SDK.10` | the shader translator (`totk_xlate.exe`) |
 | Vulkan SDK | 1.4.363 | winget `KhronosGroup.VulkanSDK` | validation layers, `vulkaninfo` |
 | uv | 0.13 | standalone installer from astral.sh | the two Python environments |
-| hactool | 1.4.0 @ `1d64a83` | built from source, see below | NCA and update extraction |
+| hactool | 1.4.0 @ `1d64a83` | `.venv\Scripts\python tools\build_hactool.py`, see below | NCA and update extraction |
 
 MSYS2 packages, after `pacman -Syuu` (run it twice; the first pass updates the core and exits):
 
@@ -37,13 +37,13 @@ PATH:
 
 ### hactool
 
-`tools/extract.py` runs `toolchain\hactool\hactool.exe`. Build it from SciresM/hactool at `1d64a83` in an MSYS2 UCRT64
-shell (`config.mk`: `CC=gcc EXEEXT=.exe`, static link, `make -j8`) with two changes:
+`tools/build_hactool.py` fetches SciresM/hactool at `1d64a83` into `toolchain\src\hactool`, applies the two patches in
+`tools/hactool/` and builds a static `toolchain\hactool\hactool.exe` with MSYS2 UCRT64 gcc (a few seconds):
 
-1. The portable part of MacNativeGames' `build_app.py` `build_hactool()`: the `MNG_TITLE_KEYS` variable, and the two
-   BKTR fixes in `nca.c` for the subsection table padding and the subsection layout of newer cumulative updates.
-2. A manifest with `<activeCodePage>UTF-8</activeCodePage>` embedded through a `.rc` file, so paths under a non-ASCII
-   user profile reach it intact.
+- `portable.patch`: the parts of MacNativeGames' `build_hactool()` that run on Windows, the `MNG_TITLE_KEYS` variable and
+  the two BKTR fixes in `nca.c` for the subsection table padding and the subsection layout of newer cumulative updates;
+- `unicode.patch`: a manifest with `<activeCodePage>UTF-8</activeCodePage>`, so paths under a non-ASCII user profile
+  reach it intact.
 
 hactool reads `-k <prod.keys>`; MSYS2 shells set `HOME`, which hides its default key location, so pass `-k` there.
 
