@@ -155,7 +155,8 @@ static int remove_tree(const char *path) {
 //   <profile>/save-tx/new/         Commit's staging copy of the working copy
 //   <profile>/save-tx/old/         the committed save a Commit replaced, on its way to save-backup
 //
-// Commit: (1) copy work to new and flush every file (FlushFileBuffers) and directory; (2) rename save/<uid> to old;
+// Commit: (1) copy work to new and flush every file (FlushFileBuffers) and directory, a file equal to the committed
+// one as a hard link to it; (2) rename save/<uid> to old;
 // (3) rename new to save/<uid>, the commit point; (4) move old to save-backup/<UTC time> and keep the newest three.
 // Both renames are MoveFileExW with MOVEFILE_WRITE_THROUGH. save/<uid> is renamed away only after new is complete
 // on disk, so the recovery rule at start (save_recover) is:
@@ -231,9 +232,40 @@ static int copy_file_w(const wchar_t *src, const wchar_t *dst, int durable, uint
     return ok ? 0 : -1;
 }
 
+// Whether files a and b hold the same bytes; 0 when either cannot be read.
+static int same_file_w(const wchar_t *a, const wchar_t *b) {
+    HANDLE h[2];
+    const wchar_t *p[2] = {a, b};
+    for (int i = 0; i < 2; i++)
+        h[i] = CreateFileW(p[i], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    LARGE_INTEGER na, nb;
+    int same = h[0] != INVALID_HANDLE_VALUE && h[1] != INVALID_HANDLE_VALUE && GetFileSizeEx(h[0], &na) &&
+               GetFileSizeEx(h[1], &nb) && na.QuadPart == nb.QuadPart;
+    uint8_t *buf = same ? malloc(2 * (size_t)COPY_CHUNK) : NULL;
+    if (same) need(buf != NULL, "compare buffer");
+    while (same) {
+        DWORD ga = 0, gb = 0;
+        if (!ReadFile(h[0], buf, COPY_CHUNK, &ga, NULL) || !ReadFile(h[1], buf + COPY_CHUNK, COPY_CHUNK, &gb, NULL) ||
+            ga != gb || memcmp(buf, buf + COPY_CHUNK, ga))
+            same = 0;
+        else if (!ga)
+            break;
+    }
+    free(buf);
+    for (int i = 0; i < 2; i++)
+        if (h[i] != INVALID_HANDLE_VALUE) CloseHandle(h[i]);
+    return same;
+}
+
 // Copy the tree src to dst, which must not exist; reparse points are skipped. durable: every file is flushed, and
-// every directory as far as the file system allows (NTFS journals the entries either way). 0 on success.
-static int copy_tree_w(const wchar_t *src, const wchar_t *dst, int durable, int *nfiles, uint64_t *bytes) {
+// every directory as far as the file system allows (NTFS journals the entries either way). base (or NULL): the
+// committed save; a file whose bytes equal base's file at the same path becomes a hard link to it instead of a copy
+// (*nlinked), as committed files are never written in place (the game writes the working copy). A save commit then
+// writes the 3-4 files of the slot the game saved instead of all 82 (300-380 ms of flushes on the game thread).
+// 0 on success.
+static int copy_tree_w(const wchar_t *src, const wchar_t *dst, const wchar_t *base, int durable, int *nfiles,
+                       int *nlinked, uint64_t *bytes) {
     if (!CreateDirectoryW(dst, NULL)) return -1;
     wchar_t *pattern = wjoin(src, L"*");
     WIN32_FIND_DATAW fd;
@@ -246,14 +278,18 @@ static int copy_tree_w(const wchar_t *src, const wchar_t *dst, int durable, int 
             (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
             continue;
         wchar_t *s = wjoin(src, fd.cFileName), *d = wjoin(dst, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) bad = copy_tree_w(s, d, durable, nfiles, bytes);
+        wchar_t *b = base ? wjoin(base, fd.cFileName) : NULL;
+        if (b && !exists_w(b)) free(b), b = NULL;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) bad = copy_tree_w(s, d, b, durable, nfiles, nlinked, bytes);
         else {
-            bad = copy_file_w(s, d, durable, bytes);
+            if (b && same_file_w(s, b) && CreateHardLinkW(d, b, NULL)) bad = 0, ++*nlinked;
+            else bad = copy_file_w(s, d, durable, bytes);
             *nfiles += !bad;
             if (!bad && durable && crashed()) bad = -1;
         }
         free(s);
         free(d);
+        free(b);
     } while (!bad && FindNextFileW(f, &fd));
     FindClose(f);
     if (!bad && durable) {
@@ -338,9 +374,9 @@ static void save_recover(void) {
 
 // The first save mount: a fresh working copy of the committed save.
 static void work_create(void) {
-    int n = 0;
+    int n = 0, linked = 0;
     uint64_t bytes = 0;
-    if (remove_tree_w(w_work) || copy_tree_w(w_save, w_work, 0, &n, &bytes))
+    if (remove_tree_w(w_work) || copy_tree_w(w_save, w_work, NULL, 0, &n, &linked, &bytes))
         rt_fatal("fs: cannot make the save working copy (error %lu)", GetLastError());
     rt_log("host save working copy: %d files, %.1f MiB", n, bytes / 1048576.0);
 }
@@ -354,10 +390,11 @@ static void work_discard(void) {
 // Commit of the save mount, tx_lock held. Steps (1) to (4) above; every failure before (3) leaves the committed save.
 static uint32_t save_commit_locked(void) {
     uint64_t t0 = plat_now_ns(), bytes = 0;
-    int nfiles = 0;
+    int nfiles = 0, linked = 0;
     tx_step = tx_dead = 0;
     rotate_backup();   // an old left by a failed (4)
-    if (remove_tree_w(w_new) || copy_tree_w(w_work, w_new, 1, &nfiles, &bytes)) {
+    const wchar_t *base = exists_w(w_save) ? w_save : NULL;
+    if (remove_tree_w(w_new) || copy_tree_w(w_work, w_new, base, 1, &nfiles, &linked, &bytes)) {
         if (tx_dead) return FS_R_INVALID_ARGUMENT;
         rt_log("fs: save commit: copying the working copy failed (error %lu); committed save unchanged",
                GetLastError());
@@ -383,7 +420,8 @@ static uint32_t save_commit_locked(void) {
     if (crashed()) return FS_R_INVALID_ARGUMENT;
     rotate_backup();
     InterlockedExchange(&save_dirty, 0);
-    rt_log("fs commit save: %d files, %.1f MiB in %.0f ms", nfiles, bytes / 1048576.0, (plat_now_ns() - t0) / 1e6);
+    rt_log("fs commit save: %d files, %d changed (%.1f MiB written), %d unchanged linked, in %.0f ms", nfiles,
+           nfiles - linked, bytes / 1048576.0, linked, (plat_now_ns() - t0) / 1e6);
     return 0;
 }
 
@@ -1338,6 +1376,18 @@ static int tx_read_committed(const char *name) {
     return tx_byte(ok);
 }
 
+// Hard links of a file of the committed save on disk; 0 when absent.
+static int tx_links_committed(const char *name) {
+    wchar_t *n = fs_wide(name), *p = wjoin(w_save, n);
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(n);
+    free(p);
+    BY_HANDLE_FILE_INFORMATION fi;
+    int links = f != INVALID_HANDLE_VALUE && GetFileInformationByHandle(f, &fi) ? (int)fi.nNumberOfLinks : 0;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    return links;
+}
+
 static int count_dirs(const wchar_t *dir) {
     wchar_t *pattern = wjoin(dir, L"*");
     WIN32_FIND_DATAW fd;
@@ -1403,6 +1453,14 @@ static void probe_save_tx(const uint64_t *uid) {
           mixed);
     int backups = count_dirs(w_backup);
     CHECK(backups == SAVE_BACKUPS, "save-backup holds %d saves", backups);
+
+    // a Commit writes the changed file and links the unchanged one to the committed save it replaces
+    int kept = committed;
+    CHECK(tx_write(a, ++gen) && RES(S_COMMIT, U("save")) == 0 && tx_read_committed("tx_a.sav") == gen &&
+          tx_read_committed("tx_b.sav") == kept && tx_links_committed("tx_b.sav") >= 2 &&
+          tx_links_committed("tx_a.sav") == 1, "Commit of one changed file: tx_a %d links, tx_b %d links",
+          tx_links_committed("tx_a.sav"), tx_links_committed("tx_b.sav"));
+    committed = gen;
 
     // the read-only mount shows the committed save and refuses changes
     CHECK(tx_write(a, 99) && RES(S_MOUNT_SAVE_RO, U("ro"), TOTK_APPLICATION_ID, U(uid)) == 0 &&
