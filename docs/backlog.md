@@ -161,6 +161,22 @@ Each platform item gets a written design first, agreed with the maintainer.
     the mirrored and texture-bound pages after each sync and mark them in the fault handler (Ryujinx), uploading pools
     the game rewrites every frame whole instead of tracking them. Soft-dirty (`/proc/self/clear_refs`) is process-wide
     and slow, a last resort. Under Proton the Windows build already works: Wine emulates both.
+    Frame time fixes of 2026-10 (merge 2b1e295) and what each needs on Linux:
+    - Short SleepThread spins (`kernel.c` `sleep_ns`, `SLEEP_SPIN_NS`): Windows-only cause, the high-resolution
+      waitable timer wakes 0.3-0.5 ms late. `clock_nanosleep` wakes within the timer slack (50 us default,
+      `prctl(PR_SET_TIMERSLACK)` lowers it): spin below that or not at all, and measure with `TOTK_TRACE=sched`
+      ("sleep asked / took").
+    - Background save Commit (`fs_host.c`), pipeline cache autosave thread (`vk_pipeline.c`), shader record writes
+      outside the lookup lock (`gfx_shader.c`), `.use` masks read at start: portable as written; they keep file I/O
+      and flushes off the game and render threads, which any OS needs. On Linux the Commit's FlushFileBuffers become
+      `fsync` of each file and directory, and the renames `rename()` plus an `fsync` of the parent.
+    - Recording copy index by 64 KiB block (`nvn_api_cmd.c`), world clock input (`frame_rate.c`, `input_win.c`):
+      portable logic, no OS calls.
+    - Slow-present profiler (`prof_win.c`, `TOTK_PROFILE_SLOW`): Windows-only (SuspendThread, GetThreadContext,
+      QueryThreadCycleTime, RtlVirtualUnwind). On Linux use `perf record -g` or a `SIGPROF` sampler; `tstall` has no
+      direct equivalent.
+    - VMA block allocation on the render thread (`vk_texture.c` `create_tex`, 8-11 ms per 256 MiB block on AMD
+      Windows): measure again on RADV before working around it.
 36. **Steam Deck**: RADV offers Vulkan 1.3 and `VK_EXT_external_memory_host`; 4 Zen 2 cores, so expect 30-40 fps.
 37. **Launcher**: one exe for Windows and Linux, SDL3 and Dear ImGui (SavageWindRecomp `runtime/ui/launcher.mm`), with
     Play, Settings, Game files and Quit. Settings that need a restart go there, and it is the recovery path when a
