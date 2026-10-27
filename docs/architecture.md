@@ -36,7 +36,10 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
   - jump tables resolved by our own symbolic pass instead of Unicorn, which keeps GPL code out of the shipped generator;
   - `LDXP`/`STXP` (128-bit exclusive pairs) supported;
   - no 64 MB limit on `main`; `subsdk*` loaded;
-  - guest registers kept in C locals where liveness allows, instead of memory.
+  - NZCV and the six most used general registers of each function kept in C locals instead of the `Cpu`
+    (`recomp/flags.py`, `recomp/regs.py`): registers are stored back where they changed, before calls, SVCs and
+    exits, and reloaded after them. A call reloads only X0-X18 and X30, as AAPCS64 has the callee preserve X19-X29 and
+    SP; `gen.py --no-callee-saved-trust` reloads those too.
 - Coverage oracle: MacNativeGames' NSO rewriter lists every site where game code touches the OS (SVCs, TLS reads, counter reads, `x18`, exclusive windows, jump tables): 68,968 sites in 1.4.3 `main`. The lifter must handle every one.
 - Memory: guest address equals host address, all below 2^39 (IPC encodes 39-bit addresses). The heap, stacks and the alias region are reserved with `MEM_WRITE_WATCH`, so the graphics back end can ask which pages the CPU wrote since the last upload (`runtime/memory.c`).
 - Indirect branches go through `rt_dispatch` (`runtime/dispatch.c`), which looks the target up in the address table and tail-calls it.

@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT / 'recomp'))
 import flags  # noqa: E402
 import jumptables  # noqa: E402
 import patches  # noqa: E402
+import regs  # noqa: E402
 from check_content import GENERATED_MARKER  # noqa: E402
 from layout import layout, write as write_layout  # noqa: E402
 from lifter import hx  # noqa: E402
@@ -206,10 +207,12 @@ def partition(est, max_fns, max_bytes, big_fn):
 class Emitter:
     """C for the functions of one module. starts is the set of every function start of the module."""
 
-    def __init__(self, mod, starts, patched=None):
+    def __init__(self, mod, starts, patched=None, reg_locals=regs.LOCALS, callee_saved=True):
         self.mod = mod
         self.starts = starts
         self.patched = patched or {}   # {address: (set index, [replacement words])} (recomp/patches.py)
+        self.reg_locals = reg_locals   # recomp/regs.py: registers per function in C locals
+        self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
         self.uses_patches = False
         self.stats = Counter()
         self.unsupported = Counter()
@@ -251,44 +254,48 @@ class Emitter:
         """Lifted replacement words of the patched site a."""
         return [self.mod.lifter.lift(w, a) for w in self.patched[a][1]]
 
-    def flag_plan(self, insns, entry, end, tables):
-        """recomp/flags.py plan for the function: the intra-function control flow and each instruction's flag use.
-        Index len(insns) stands for falling through into the next function."""
-        n = len(insns)
-        succ, calls, effects, exits = [], set(), [], {n}
-
+    @staticmethod
+    def flow(insns, entry, end, tables):
+        """Successors of each instruction inside the function [entry, end). Index len(insns) stands for falling
+        through into the next function and has none."""
         def idx(t):
             return [(t - entry) // 4] if entry <= t < end else []
 
+        succ = []
         for i, ins in enumerate(insns):
-            k, a = ins.kind, entry + 4 * i
-            nxt = [i + 1]
-            if k == 'op':
-                succ.append(nxt)
-            elif k in ('bl', 'blr'):
-                succ.append(nxt)
-                calls.add(i)
+            k = ins.kind
+            if k in ('op', 'bl', 'blr'):
+                succ.append([i + 1])
             elif k == 'b':
                 succ.append(idx(ins.target))
-                if not idx(ins.target):
-                    exits.add(i)
             elif k == 'bcond':
-                succ.append(idx(ins.target) + nxt)
-                if not idx(ins.target):
-                    exits.add(i)
+                succ.append(idx(ins.target) + [i + 1])
             elif k == 'br':
-                jt = tables.get(a)
+                jt = tables.get(entry + 4 * i)
                 succ.append([t for x in jt for t in idx(x)] if jt and jt != 'all' else [])
-                exits.add(i)   # through rt_dispatch, also a table's default
             else:   # ret, trap
                 succ.append([])
+        succ.append([])
+        return succ
+
+    def flag_plan(self, insns, entry, end, tables, succ):
+        """recomp/flags.py plan for the function: each instruction's flag use over the flow succ (flow())."""
+        n = len(insns)
+        calls, effects, exits = set(), [], {n}
+        for i, ins in enumerate(insns):
+            k, a = ins.kind, entry + 4 * i
+            if k in ('bl', 'blr'):
+                calls.add(i)
+            elif k in ('b', 'bcond') and not entry <= ins.target < end:
+                exits.add(i)
+            elif k == 'br':
+                exits.add(i)   # through rt_dispatch, also a table's default
             if a in self.patched:
                 effects.append(self.patched_effect(ins, a))
                 if any(r.kind == 'bl' for r in self.replacements(a)):
                     calls.add(i)
             else:
                 effects.append(flags.effect(ins.cond if k == 'bcond' else ins.code or ''))
-        succ.append([])
         effects.append((False, None))
         return flags.plan(effects, succ, calls, exits)
 
@@ -318,7 +325,11 @@ class Emitter:
             labels = set(range(entry, end, 4))
         # An unresolved computed br re-enters the function through fb_<entry>, a C function of its own, which local
         # flags would not survive; such functions keep NZCV in c->nzcv.
-        fp = None if all_labels else self.flag_plan(insns, entry, end, tables)
+        # The same holds for registers in locals (recomp/regs.py): fb_<entry> keeps them in the Cpu too.
+        local = not all_labels
+        spill, reload, reload_call = (regs.SPILL, regs.RELOAD, regs.RELOAD_CALL) if local else ('', '', '')
+        succ = self.flow(insns, entry, end, tables) if local else None
+        fp = self.flag_plan(insns, entry, end, tables, succ) if local else None
         if fp and fp.used:
             self.stats['local_flag_functions'] += 1
             self.stats['flag_reads_direct'] += sum(1 for k in fp.reader if k and k != 'nz')
@@ -339,9 +350,9 @@ class Emitter:
                 return f'goto L_{t:x};'
             if t in starts:
                 refs.add(t)
-                return f'{publish(i)}{MUSTTAIL} {fname(t)}(c);'
+                return f'{publish(i)}{spill}{MUSTTAIL} {fname(t)}(c);'
             self.stats['external_branches'] += 1
-            return f'{publish(i)}c->pc = {hx(t)}; {MUSTTAIL} rt_dispatch(c);'
+            return f'{publish(i)}{spill}c->pc = {hx(t)}; {MUSTTAIL} rt_dispatch(c);'
 
         if all_labels:
             # An unresolved computed br re-enters the function through fb_<entry>, which switches on c->pc to any
@@ -364,9 +375,13 @@ class Emitter:
         def call(t, a):
             if t in starts:
                 refs.add(t)
-                return f'c->x[30] = {hx(a + 4)}; {fname(t)}(c);'
+                return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
             self.stats['external_calls'] += 1
-            return f'c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);'
+            return f'c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
+
+        def op(i, code):
+            code = fx(i, code)
+            return f'{spill}{code}{reload}' if regs.ESCAPE.search(code) else code
 
         def patch(i, ins, a):
             """if (switch) { replacement } else { original } for a patched site (recomp/patches.py)."""
@@ -376,53 +391,76 @@ class Emitter:
             repl = []
             for j, (w, r) in enumerate(zip(words, self.replacements(a))):
                 if r.kind == 'op':
-                    repl.append(fx(i, r.code))
+                    repl.append(op(i, r.code))
                 elif r.kind == 'bl' and j == len(words) - 1:
                     repl.append(call(r.target, a))
                 else:
                     raise patches.PatchError(f'{a:#x}: replacement word {w:08x} is a {r.kind}')
-            orig = fx(i, ins.code) if ins.kind == 'op' else call(ins.target, a)
+            orig = op(i, ins.code) if ins.kind == 'op' else call(ins.target, a)
             self.uses_patches = True
             self.stats['patched_sites'] += 1
             return f'    if (rt_patch_on[{k}]) {{ {" ".join(repl)} }} else {{ {orig} }}'
+
+        body = []   # (instruction index or None for a label, line); a line belongs to the instruction it lifts
+
+        def emit(i, line):
+            body.append((i, line))
 
         k = None
         for i, ins in enumerate(insns):
             a = entry + 4 * i
             if a in labels:
-                out.append(f'L_{a:x}:;')
+                emit(None, f'L_{a:x}:;')
             k = ins.kind
             if a in self.patched:
-                out.append(patch(i, ins, a))
-            elif k == 'op' or k == 'trap':
-                out.append('    ' + fx(i, ins.code))
+                emit(i, patch(i, ins, a))
+            elif k == 'op':
+                emit(i, '    ' + op(i, ins.code))
+            elif k == 'trap':
+                emit(i, f'    {spill}{fx(i, ins.code)}')
             elif k == 'b':
-                out.append('    ' + jump(ins.target, i))
+                emit(i, '    ' + jump(ins.target, i))
             elif k == 'bcond':
-                out.append(f'    if ({fx(i, ins.cond)}) {{ {jump(ins.target, i)} }}')
+                emit(i, f'    if ({fx(i, ins.cond)}) {{ {jump(ins.target, i)} }}')
             elif k == 'bl':
-                out.append('    ' + call(ins.target, a))
+                emit(i, '    ' + call(ins.target, a))
             elif k == 'blr':
-                out.append(f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);')
+                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
-                    out.append(f'    c->pc = {ins.target}; {redispatch}')
+                    emit(i, f'    c->pc = {ins.target}; {redispatch}')
                 elif jt:
                     cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
-                    out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    out.append(f'    {publish(i)}c->pc = {ins.target}; {redispatch}')
+                    emit(i, f'    switch ({ins.target}) {{ {cases} default: break; }}')
+                    emit(i, f'    {publish(i)}{spill}c->pc = {ins.target}; {redispatch}')
                 else:
-                    out.append(f'    {publish(i)}c->pc = {ins.target}; {MUSTTAIL} rt_dispatch(c);')
+                    emit(i, f'    {publish(i)}{spill}c->pc = {ins.target}; {MUSTTAIL} rt_dispatch(c);')
             elif k == 'ret':
-                out.append('    return;')
+                emit(i, f'    {spill}return;')
             else:
                 raise ValueError(f'{a:#x}: unknown instruction kind {k!r}')
+        n = len(insns)
         if k not in TERMINATORS:  # falls through into the next function
             if end < mod.hi:
-                out.append('    ' + jump(end, len(insns)))
+                emit(n, '    ' + jump(end, n))
             else:
-                out.append(f'    rt_udf(c, {hx(end)});')
+                emit(n, f'    {spill}rt_udf(c, {hx(end)});')
+        if local:
+            texts = [''] * (n + 1)
+            for i, line in body:
+                if i is not None:
+                    texts[i] += line
+            clean = {i for i, ins in enumerate(insns) if entry + 4 * i not in self.patched
+                     and (ins.kind in ('bl', 'blr') or (ins.kind == 'op' and regs.RELOAD in texts[i]))}
+            rp = regs.plan(texts, succ, clean, self.reg_locals, self.kept)
+            if rp.regs:
+                out.append('    ' + rp.decl())
+            self.stats['local_reg_functions'] += bool(rp.regs)
+            self.stats['reg_spills'] += sum(len(s) for s in rp.spill)
+            out += [line if i is None else rp.resolve(i, line) for i, line in body]
+        else:
+            out += [line for _, line in body]
         out.append('}')
         self.stats['functions'] += 1
         self.stats['instructions'] += len(insns)
@@ -481,10 +519,11 @@ def _retry(fn, *args):
 _W = {}  # worker state: 'mods' {name: (path, base)}, 'starts' {name: sorted array}, 'emitters' {name: Emitter}
 
 
-def _worker_init(mods, starts, table):
+def _worker_init(mods, starts, table, opts):
     _W['mods'] = mods
     _W['starts'] = starts
     _W['patches'] = table
+    _W['opts'] = opts   # Emitter keyword arguments
     _W['emitters'] = {}
 
 
@@ -494,7 +533,7 @@ def _emitter(name):
         path, base = _W['mods'][name]
         mod = Module(name, path, base, 'c')
         e = _W['emitters'][name] = Emitter(mod, set(_W['starts'][name].tolist()),
-                                           _W['patches'].for_module(name, base))
+                                           _W['patches'].for_module(name, base), **_W['opts'])
     return e
 
 
@@ -556,7 +595,13 @@ def main():
     ap.add_argument('--big-fn', type=int, default=300000, help='estimated bytes of C from which a function gets '
                                                                'its own chunk')
     ap.add_argument('--patches', type=Path, help='code patch table (recomp/patches.py)')
+    ap.add_argument('--reg-locals', type=int, default=regs.LOCALS,
+                    help=f'guest registers per function kept in C locals (recomp/regs.py; default {regs.LOCALS}, 0: none)')
+    ap.add_argument('--no-callee-saved-trust', action='store_true',
+                    help='reload X19-X29 and SP after every call too, instead of trusting AAPCS64 (slower; for '
+                         'telling a broken callee from a generator bug)')
     args = ap.parse_args()
+    opts = {'reg_locals': args.reg_locals, 'callee_saved': not args.no_callee_saved_trust}
 
     t0 = time.perf_counter()
     mods = layout(args.exefs)
@@ -602,7 +647,7 @@ def main():
     done_at, errors = {}, []
     t_emit = time.perf_counter()
     ctx = mp.get_context('spawn')
-    with ctx.Pool(max(1, args.jobs), initializer=_worker_init, initargs=(paths, starts_abs, table)) as pool:
+    with ctx.Pool(max(1, args.jobs), initializer=_worker_init, initargs=(paths, starts_abs, table, opts)) as pool:
         for i, r in enumerate(pool.imap_unordered(_emit_chunk, [t for _, t in tasks], chunksize=1)):
             results[r['module']].append(r)
             if r['error']:
