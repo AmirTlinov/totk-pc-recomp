@@ -2926,6 +2926,29 @@ int vk_pipeline_prepare_shaders(void) {
     return rc;
 }
 
+// totk.exe --warm-shaders (tools/build_game.py after it relinked a prepared build): the driver's disk cache is keyed to
+// the exe, so a rebuilt totk.exe finds it cold and a new library costs 40-220 ms in play instead of about 2 ms. This
+// builds every variant of shader-prepared.bin into it again from the shader cache, without translating the seed.
+int vk_pipeline_warm_shaders(void) {
+    if (!ensure_init()) {
+        fprintf(stderr, "warm-shaders: no Vulkan device\n");
+        return 1;
+    }
+    char dir[MAX_PATH * 2];
+    snprintf(dir, sizeof dir, "%s", P.cache_path);
+    char *cut = strrchr(dir, '\\');
+    if (!cut) return 1;
+    *cut = 0;
+    char prp[MAX_PATH * 2 + 32];
+    snprintf(prp, sizeof prp, "%s\\shader-prepared.bin", dir);
+    if (GetFileAttributesA(prp) == INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
+        return 1;
+    }
+    lb_warm_prepared(dir);
+    return 0;
+}
+
 // ---- dynamic state
 
 void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
