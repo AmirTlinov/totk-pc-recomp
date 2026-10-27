@@ -22,6 +22,11 @@
 // One 64-bit and one 32-bit store per present; the guest reads the floats on its own threads, and each stays finite
 // and in range whichever store it sees.
 //
+// The world clock (frame_step_world_us) sums the steps from the first present that finds the player actor away from
+// the origin, where the title screen keeps it: the end of the first save load. Recorded and scripted input
+// (input_win.c) runs on it, so a replay presses at the same game time at any frame rate and after a first load of any
+// length; a later load (fast travel) still shifts what follows by its length.
+//
 // TOTK_TRACE=perf adds a line per 120 presents: fps, the game seconds stepped against wall seconds, and with
 // TOTK_SPEED_PROBE=1 the player's position and ground speed (an independent check: Link runs at the same speed at
 // any frame rate when game time follows wall time).
@@ -201,11 +206,30 @@ static void speed_report(uint64_t now, double step, int interval) {
     memset(win_hist, 0, sizeof win_hist);
 }
 
+static _Atomic int64_t world_us = -1;
+static uint64_t presents;
+
+int64_t frame_step_world_us(void) { return atomic_load_explicit(&world_us, memory_order_relaxed); }
+
+static void world_clock(double dt, double step) {
+    presents++;
+    int64_t w = atomic_load_explicit(&world_us, memory_order_relaxed);
+    if (w < 0) {
+        float p[3];
+        if (!player_pos(p) || fabsf(p[0]) + fabsf(p[2]) < 1.0f) return;   // a few guest reads, until the load ends
+        rt_log("frame step: world clock starts at present %llu (the player at %.1f %.1f %.1f)",
+               (unsigned long long)presents, p[0], p[1], p[2]);
+        atomic_store_explicit(&world_us, 0, memory_order_relaxed);
+        return;
+    }
+    if (!step_word) step = dt > STEP_MAX_S ? STEP_MAX_S : dt;   // whole-vsync steps: the display time stands in
+    atomic_store_explicit(&world_us, w + (int64_t)(step * 1e6 + 0.5), memory_order_relaxed);
+}
+
 void frame_step_present(uint64_t display_ns, int interval) {
     frame_limit_live();
-    double step = 0;
+    double step = 0, dt = last_ns ? (double)(display_ns - last_ns) * 1e-9 : 0;
     if (step_word && last_ns) {
-        double dt = (double)(display_ns - last_ns) * 1e-9;
         if (dt > STEP_RESET_S || dt < 0.001) {
             sample_count = sample_next = 0;
         } else {
@@ -219,5 +243,6 @@ void frame_step_present(uint64_t display_ns, int interval) {
         }
     }
     last_ns = display_ns;
+    world_clock(dt, step);
     if (rt_trace & RT_TRACE_PERF) speed_report(display_ns, step, interval);
 }

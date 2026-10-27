@@ -41,7 +41,11 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 };
 
 // TOTK_INPUT_SCRIPT=<file>: lines "<frame> <button> [hold]" or "<frame> LSTICK|RSTICK <x> <y> [hold]", ORed into the real input.
-typedef struct { uint64_t frame, hold; int bit, stick; int32_t x, y; int logged; char text[48]; } ScriptEv;
+// A line "@<ms> ..." is timed instead: <ms> and its hold are milliseconds of the world clock (frame_step_world_us, game
+// time since the loaded save's first frame), so it lands at the same game time at any frame rate and load length. A
+// timed event shorter than a frame is applied once.
+// at, hold: presents, or microseconds of the world clock when timed.
+typedef struct { uint64_t at, hold; int bit, stick, timed; int32_t x, y; int logged; char text[48]; } ScriptEv;
 static const struct { const char *name; int bit; } script_buttons[] = {
     {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
     {"ZL", B_ZL}, {"ZR", B_ZR}, {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
@@ -62,22 +66,25 @@ static void script_load(void) {
         char *h = strchr(line, '#');
         if (h) *h = 0;
         char name[32];
-        unsigned long long fr;
-        int off = 0;
-        if (sscanf(line, "%llu %31s%n", &fr, name, &off) < 2) continue;
-        ScriptEv e = {.frame = fr, .hold = 4, .bit = -1};
-        long a, b, c;
+        double at;
+        int off = 0, timed = line[0] == '@';
+        if (sscanf(line + timed, "%lf %31s%n", &at, name, &off) < 2 || at < 0) continue;
+        off += timed;
+        double unit = timed ? 1000.0 : 1.0;   // ms to us, or presents
+        ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
+        long a, b;
+        double c;
         if (!strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
-            int n = sscanf(line + off, "%ld %ld %ld", &a, &b, &c);
+            int n = sscanf(line + off, "%ld %ld %lf", &a, &b, &c);
             if (n < 2) { rt_log("input: script line %d: %s needs x y [hold]", ln, name); continue; }
             e.stick = name[0] == 'L' ? 1 : 2; e.x = (int32_t)a; e.y = (int32_t)b;
-            if (n >= 3) e.hold = (uint64_t)c;
+            if (n >= 3 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
             snprintf(e.text, sizeof e.text, "%s %d %d", name, e.x, e.y);
         } else {
             for (size_t i = 0; i < sizeof script_buttons / sizeof *script_buttons; i++)
                 if (!strcmp(name, script_buttons[i].name)) e.bit = script_buttons[i].bit;
             if (e.bit < 0) { rt_log("input: script line %d: unknown button %s", ln, name); continue; }
-            if (sscanf(line + off, "%ld", &a) == 1) e.hold = (uint64_t)a;
+            if (sscanf(line + off, "%lf", &c) == 1 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
             snprintf(e.text, sizeof e.text, "%s", name);
         }
         if (script_n == cap) {
@@ -95,10 +102,17 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     if (!script_state) script_load();
     if (!script_n) return;
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    int64_t w = frame_step_world_us();
     for (int i = 0; i < script_n; i++) {
         ScriptEv *e = &script_ev[i];
-        if (fr < e->frame || fr >= e->frame + e->hold) continue;
-        if (!e->logged) { e->logged = 1; rt_log("input: script frame %llu: %s", (unsigned long long)fr, e->text); }
+        if (e->timed && w < 0) continue;
+        uint64_t now = e->timed ? (uint64_t)w : fr;
+        if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
+        if (!e->logged) {
+            e->logged = 1;
+            if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
+            else rt_log("input: script frame %llu: %s", (unsigned long long)fr, e->text);
+        }
         if (e->stick) { int32_t *s = e->stick == 1 ? sl : sr; s[0] = e->x; s[1] = e->y; }
         else *b |= 1ull << e->bit;
     }
@@ -106,29 +120,40 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
 
 // TOTK_INPUT_RECORD=<file>: writes the merged input as TOTK_INPUT_SCRIPT lines, one per button press and per stick
 // segment, so a played session replays as a script. A stick segment ends when an axis moves by more than REC_STICK_STEP.
+// An event that begins on the world clock is written timed ("@<ms>", hold in ms), one before it in presents.
 enum { REC_STICK_STEP = 2048 };
 static FILE *rec;
 static int rec_state;                // 0 not opened, 1 recording, -1 off
 static uint64_t rec_down[16];        // frame + 1 at which each button went down, 0 while up
+static int64_t rec_down_w[16];       // the world clock then, -1 before it started
 static uint64_t rec_stick_from[2];   // frame + 1 at which the current non-zero stick segment began
+static int64_t rec_stick_w[2];
 static int32_t rec_stick[2][2];
 
-static void rec_close_stick(int s, uint64_t fr) {
+// "<frame> <what> <hold>" or "@<ms> <what> <hold ms>": from frame from and world clock from_w to now.
+static void rec_line(uint64_t from, int64_t from_w, uint64_t fr, int64_t w, const char *what) {
+    if (from_w >= 0 && w >= from_w)
+        fprintf(rec, "@%.1f %s %.1f\n", from_w / 1000.0, what, (w > from_w ? w - from_w : 1000) / 1000.0);
+    else
+        fprintf(rec, "%llu %s %llu\n", (unsigned long long)from, what, (unsigned long long)(fr > from ? fr - from : 1));
+}
+
+static void rec_close_stick(int s, uint64_t fr, int64_t w) {
     if (!rec_stick_from[s]) return;
-    uint64_t from = rec_stick_from[s] - 1;
-    fprintf(rec, "%llu %s %d %d %llu\n", (unsigned long long)from, s ? "RSTICK" : "LSTICK", rec_stick[s][0],
-            rec_stick[s][1], (unsigned long long)(fr > from ? fr - from : 1));
+    char what[48];
+    snprintf(what, sizeof what, "%s %d %d", s ? "RSTICK" : "LSTICK", rec_stick[s][0], rec_stick[s][1]);
+    rec_line(rec_stick_from[s] - 1, rec_stick_w[s], fr, w, what);
     rec_stick_from[s] = 0;
 }
 
 static void rec_flush_all(void) {
     if (rec_state != 1) return;
-    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    int64_t w = frame_step_world_us();
     for (int i = 0; i < 16; i++)
-        if (rec_down[i]) { fprintf(rec, "%llu %s %llu\n", (unsigned long long)(rec_down[i] - 1), script_buttons[i].name,
-                                   (unsigned long long)(fr - (rec_down[i] - 1) + 1)); rec_down[i] = 0; }
-    rec_close_stick(0, fr);
-    rec_close_stick(1, fr);
+        if (rec_down[i]) { rec_line(rec_down[i] - 1, rec_down_w[i], fr, w, script_buttons[i].name); rec_down[i] = 0; }
+    rec_close_stick(0, fr, w);
+    rec_close_stick(1, fr, w);
     fflush(rec);
 }
 
@@ -138,19 +163,18 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
         rec = path && *path ? fopen(path, "w") : NULL;
         rec_state = rec ? 1 : -1;
         if (path && *path && !rec) rt_log("input: cannot open TOTK_INPUT_RECORD %s", path);
-        if (rec) { fprintf(rec, "# Recorded input (TOTK_INPUT_RECORD); frame = presents.\n"); atexit(rec_flush_all);
+        if (rec) { fprintf(rec, "# Recorded input (TOTK_INPUT_RECORD); frame = presents, @ms = world clock.\n"); atexit(rec_flush_all);
                    rt_log("input: recording to %s", path); }
     }
     if (rec_state != 1) return;
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    int64_t w = frame_step_world_us();
     int wrote = 0;
     for (int i = 0; i < 16; i++) {
         int bit = script_buttons[i].bit, down = (b >> bit & 1) != 0;
-        if (down && !rec_down[i]) rec_down[i] = fr + 1;
+        if (down && !rec_down[i]) rec_down[i] = fr + 1, rec_down_w[i] = w;
         else if (!down && rec_down[i]) {
-            uint64_t from = rec_down[i] - 1;
-            fprintf(rec, "%llu %s %llu\n", (unsigned long long)from, script_buttons[i].name,
-                    (unsigned long long)(fr > from ? fr - from : 1));
+            rec_line(rec_down[i] - 1, rec_down_w[i], fr, w, script_buttons[i].name);
             rec_down[i] = 0;
             wrote = 1;
         }
@@ -160,9 +184,9 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
         int moved = abs(st[s][0] - rec_stick[s][0]) > REC_STICK_STEP || abs(st[s][1] - rec_stick[s][1]) > REC_STICK_STEP ||
                     ((st[s][0] || st[s][1]) != (rec_stick[s][0] || rec_stick[s][1]));
         if (!moved) continue;
-        if (rec_stick_from[s]) { rec_close_stick(s, fr); wrote = 1; }
+        if (rec_stick_from[s]) { rec_close_stick(s, fr, w); wrote = 1; }
         rec_stick[s][0] = st[s][0]; rec_stick[s][1] = st[s][1];
-        if (st[s][0] || st[s][1]) rec_stick_from[s] = fr + 1;
+        if (st[s][0] || st[s][1]) rec_stick_from[s] = fr + 1, rec_stick_w[s] = w;
     }
     if (wrote) fflush(rec);
 }

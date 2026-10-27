@@ -237,6 +237,7 @@ void *rt_patch_page(void);                                 // the page the patch
 void frame_step_init(void);                                // after rt_patches_init: the real-time step's first value
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
 uint64_t frame_step_cap_ns(void);                          // with the real-time step: the shortest frame in ns
+int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
                                                            // (TOTK_FPS_LIMIT, live)
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
