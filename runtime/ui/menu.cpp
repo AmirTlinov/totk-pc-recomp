@@ -30,10 +30,12 @@ extern "C" {
 #include "sysinfo.h"
 #include "ui/menu.h"
 #include "ui_text.h"
-// host.h and vk.h pull in cpu.h, which is C only: the three functions the menu needs from them, as declared there.
+// host.h and vk.h pull in cpu.h, which is C only: the functions the menu needs from them, as declared there.
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vk_queue_lock(void);
 void vk_queue_unlock(void);
+void res_sizes(unsigned out[2], unsigned scene[2]);
+double frame_step_limit_hz(void);
 }
 
 // Roboto Medium (Apache-2.0, ui/fonts/LICENSE-Roboto.txt) with Latin and Cyrillic glyphs.
@@ -122,8 +124,18 @@ static const struct { int bit; ImGuiKey key; } pad_keys[] = {
     {B_ZL, ImGuiKey_GamepadL2}, {B_ZR, ImGuiKey_GamepadR2}, {B_LEFT, ImGuiKey_GamepadDpadLeft},
     {B_UP, ImGuiKey_GamepadDpadUp}, {B_RIGHT, ImGuiKey_GamepadDpadRight}, {B_DOWN, ImGuiKey_GamepadDpadDown},
 };
-static uint64_t pad_prev;     // buttons at the last frame; a button held when the menu opened counts once released
-static float stick_prev[4];   // left stick left, right, up, down as ImGui analog values
+static uint64_t pad_prev;   // buttons at the last frame; a button held when the menu opened counts once released
+static int stick_dir = -1;  // the D-pad button the left stick holds, -1 none
+
+// The left stick moves the cursor as the D-pad does (ImGui's own stick handling only scrolls the page): past half way
+// it holds the D-pad direction of its larger axis, kept until that axis falls under 0.35; ImGui repeats a held one.
+static int stick_to_dpad(int32_t lx, int32_t ly) {
+    float x = lx / 32767.0f, y = ly / 32767.0f;   // y up
+    float along = stick_dir == B_LEFT ? -x : stick_dir == B_RIGHT ? x : stick_dir == B_UP ? y : stick_dir == B_DOWN ? -y : 0;
+    if (stick_dir >= 0 && along > 0.35f) return stick_dir;
+    if (fmaxf(fabsf(x), fabsf(y)) < 0.5f) return -1;
+    return fabsf(x) > fabsf(y) ? (x < 0 ? B_LEFT : B_RIGHT) : (y > 0 ? B_UP : B_DOWN);
+}
 
 static void pad_events(ImGuiIO &io, int reset) {
     uint64_t b;
@@ -131,9 +143,10 @@ static void pad_events(ImGuiIO &io, int reset) {
     int have = input_pad_read(&b, &lx, &ly);
     if (have) io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     else io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+    stick_dir = stick_to_dpad(lx, ly);
+    if (stick_dir >= 0) b |= 1ull << stick_dir;
     if (reset) {
         pad_prev = b;
-        for (float &s : stick_prev) s = 0;
         return;
     }
     for (const auto &k : pad_keys) {
@@ -141,15 +154,6 @@ static void pad_events(ImGuiIO &io, int reset) {
         if ((b ^ pad_prev) & m) io.AddKeyEvent(k.key, (b & m) != 0);
     }
     pad_prev = b;
-    const float dead = 0.3f;
-    float v[4] = {-lx / 32767.0f, lx / 32767.0f, ly / 32767.0f, -ly / 32767.0f};
-    static const ImGuiKey sk[4] = {ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight, ImGuiKey_GamepadLStickUp,
-                                   ImGuiKey_GamepadLStickDown};
-    for (int i = 0; i < 4; i++) {
-        float a = v[i] > dead ? (v[i] - dead) / (1 - dead) : 0;
-        if (a != stick_prev[i]) io.AddKeyAnalogEvent(sk[i], a > 0.1f, a);
-        stick_prev[i] = a;
-    }
 }
 
 // ---- ImGui and its Vulkan back end (present path)
@@ -485,17 +489,23 @@ static void row_fps_limit() {
     opt_choice_list("TOTK_FPS_LIMIT", UI_MENU_FPS_LIMIT, vals, names, N, UI_MENU_FPS_LIMIT_DESC, cur);
 }
 
-// "in use: VSync" under the Presentation value when the swapchain got another mode than the setting (a driver without
-// mailbox gets fifo); NULL when they agree or before the first swapchain.
-static const char *present_note(void) {
+// The menu's name of a TOTK_VK_PRESENT mode (gfx_window_present_mode); NULL for another.
+static const char *present_name(const char *mode) {
     static const struct { const char *mode; UiTextId name; } names[] = {
         {"mailbox", UI_MENU_PRESENT_MAILBOX}, {"fifo", UI_MENU_PRESENT_VSYNC}, {"immediate", UI_MENU_PRESENT_IMMEDIATE},
     };
-    const char *got = gfx_window_present_mode();
-    if (!*got || !strcmp(got, cfg_value("TOTK_VK_PRESENT"))) return nullptr;
-    static char note[96];
     for (const auto &n : names)
-        if (!strcmp(n.mode, got)) snprintf(note, sizeof note, menu_text(UI_MENU_PRESENT_IN_USE), menu_text(n.name));
+        if (!strcmp(n.mode, mode)) return menu_text(n.name);
+    return nullptr;
+}
+
+// "in use: VSync" under the Presentation value when the swapchain got another mode than the setting (a driver without
+// mailbox gets fifo); NULL when they agree or before the first swapchain.
+static const char *present_note(void) {
+    const char *got = gfx_window_present_mode(), *name = present_name(got);
+    if (!*got || !strcmp(got, cfg_value("TOTK_VK_PRESENT")) || !name) return nullptr;
+    static char note[96];
+    snprintf(note, sizeof note, menu_text(UI_MENU_PRESENT_IN_USE), name);
     return note;
 }
 
@@ -746,7 +756,10 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
                 g_focus_page = -1;
             }
             ImGui::Spacing();
-            ImGui::BeginChild("##page", ImVec2(0, -bottom), ImGuiChildFlags_NavFlattened);
+            // the page's rows are a NavFlattened child of this window itself: ImGui clips the items of a direct child
+            // only, so behind a second child level the rows scrolled out above the tabs won D-pad moves from the
+            // buttons and the tabs (up from "Continue" went to the tabs, down from the tabs to "Continue")
+            opt_reserve_bottom(bottom);
             switch (k) {
             case TAB_SCREEN: tab_screen(scale); break;
             case TAB_GAME: tab_game(scale); break;
@@ -755,7 +768,6 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             case TAB_MENU: tab_menu(scale); break;
             case TAB_ADVANCED: tab_advanced(scale); break;
             }
-            ImGui::EndChild();
             ImGui::EndTabItem();
         }
         g_tab_request = -1;
@@ -803,12 +815,21 @@ extern "C" void menu_perf_cycle(void) {
     g_perf_save.store(1);
 }
 
-// The device the game renders on, for perfmon's GPU counters (by LUID) and NVML (by name); once, before full mode.
+// The device the game renders on, for perfmon's GPU counters (by LUID), NVML (by name) and ADL (by PCI bus, else
+// name); once, before full mode.
 static void perf_gpu_once(const MenuTarget *t) {
     static bool done;
     if (done) return;
     done = true;
-    VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    uint32_t ne = 0;
+    vkEnumerateDeviceExtensionProperties(t->phys, NULL, &ne, NULL);
+    VkExtensionProperties *ep = (VkExtensionProperties *)calloc(ne ? ne : 1, sizeof *ep);
+    bool has_bus = false;
+    if (ep && vkEnumerateDeviceExtensionProperties(t->phys, NULL, &ne, ep) >= 0)
+        for (uint32_t i = 0; i < ne && !has_bus; i++) has_bus = !strcmp(ep[i].extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
+    free(ep);
+    VkPhysicalDevicePCIBusInfoPropertiesEXT bus = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, has_bus ? &bus : nullptr};
     VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
     vkGetPhysicalDeviceProperties2(t->phys, &p2);
     VkPhysicalDeviceMemoryProperties mp;
@@ -816,7 +837,8 @@ static void perf_gpu_once(const MenuTarget *t) {
     uint64_t vram = 0;
     for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
         if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram += mp.memoryHeaps[h].size;
-    perfmon_set_gpu(p2.properties.deviceName, id.deviceLUIDValid ? id.deviceLUID : NULL, (float)(vram >> 20));
+    perfmon_set_gpu(p2.properties.deviceName, id.deviceLUIDValid ? id.deviceLUID : NULL, has_bus ? (int)bus.pciBus : -1,
+                    (float)(vram >> 20));
 }
 
 static void perf_tick(uint64_t now, const MenuTarget *t) {
@@ -889,7 +911,44 @@ static void perf_label(UiTextId label, const ImVec4 &c) {
 
 static float perf_gb(float mb) { return mb < 0 ? -1 : mb / 1024; }
 
-static void perf_full_draw(float w, float scale) {
+// The picture lines: the window, the game image the present shows and the 3D scene it holds (resolution.c), how the
+// present scales the image to the window (gfx_window.c, the last present), the frame limit and the presentation mode
+// in use.
+static void perf_picture(const MenuTarget *t, const ImVec4 &c) {
+    unsigned out[2], scene[2];
+    res_sizes(out, scene);
+    char v[6][64];
+    snprintf(v[0], sizeof v[0], menu_text(UI_MENU_OV_FMT_SIZE), t->width, t->height);
+    snprintf(v[1], sizeof v[1], menu_text(UI_MENU_OV_FMT_SIZE), (unsigned)t->image_w, (unsigned)t->image_h);
+    snprintf(v[2], sizeof v[2], menu_text(UI_MENU_OV_FMT_SCENE), scene[0], scene[1], scene[0] * 100.0 / out[0]);
+    if (t->scaler == 2) {
+        int s = cfg_int("TOTK_SHARPNESS");
+        snprintf(v[3], sizeof v[3], menu_text(UI_MENU_OV_FMT_FSR), s < 0 ? 0 : s > 100 ? 100 : s);
+    } else {
+        snprintf(v[3], sizeof v[3], "%s", menu_text(t->scaler ? UI_MENU_OV_SCALE_BILINEAR : UI_MENU_OV_SCALE_NONE));
+    }
+    double hz = frame_step_limit_hz();
+    snprintf(v[4], sizeof v[4], "%s", menu_text(UI_MENU_OV_NONE));
+    if (hz > 0) snprintf(v[4], sizeof v[4], menu_text(UI_MENU_OV_FPS), hz);
+    const char *pm = present_name(gfx_window_present_mode());
+    snprintf(v[5], sizeof v[5], "%s", pm ? pm : menu_text(UI_MENU_OV_NONE));
+    static const UiTextId labels[6] = {UI_MENU_OV_WINDOW, UI_MENU_OV_OUTPUT, UI_MENU_OV_SCENE,
+                                       UI_MENU_OV_SCALING, UI_MENU_OV_LIMIT, UI_MENU_OV_PRESENT};
+    if (!ImGui::BeginTable("##perfp", 2, ImGuiTableFlags_SizingFixedFit)) return;
+    float vw = 0;
+    for (auto &s : v) vw = fmaxf(vw, ImGui::CalcTextSize(s).x);
+    ImGui::TableSetupColumn("##p0", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("##p1", ImGuiTableColumnFlags_WidthFixed, vw);
+    for (int i = 0; i < 6; i++) {
+        perf_label(labels[i], c);
+        ImGui::TableNextColumn();
+        perf_right(v[i], false);
+    }
+    ImGui::EndTable();
+}
+
+static void perf_full_draw(const MenuTarget *t, float scale) {
+    float w = (float)t->width;
     PerfStats s;
     perfmon_snapshot(&s);
     ImGui::SetNextWindowPos(ImVec2(w - 12 * scale, 12 * scale), ImGuiCond_Always, ImVec2(1, 0));
@@ -900,7 +959,7 @@ static void perf_full_draw(float w, float scale) {
     ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());   // over the menu while it is open
     ImGui::SetWindowFontScale(0.72f);
     const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
-        fps_c(0.95f, 0.95f, 0.95f, 1), wait_c(0.93f, 0.76f, 0.33f, 1);
+        fps_c(0.95f, 0.95f, 0.95f, 1), wait_c(0.93f, 0.76f, 0.33f, 1), pic_c(0.62f, 0.70f, 0.95f, 1);
     if (ImGui::BeginTable("##perft", 4, ImGuiTableFlags_SizingFixedFit)) {
         static const UiTextId labels[] = {UI_MENU_OV_GPU, UI_MENU_OV_VRAM, UI_MENU_OV_CPU, UI_MENU_OV_RAM};
         static const PerfCol c0[] = {{UI_MENU_OV_FPS, 888}};
@@ -960,13 +1019,15 @@ static void perf_full_draw(float w, float scale) {
         perf_cell(UI_MENU_OV_PER_FRAME, s.tex_uploads);
         ImGui::EndTable();
     }
+    perf_picture(t, pic_c);
     if (s.gpu_name[0]) ImGui::TextDisabled("%s", s.gpu_name);
     if (s.cpu_name[0]) ImGui::TextDisabled("%s", s.cpu_name);
     ImGui::End();
 }
 
-static void perf_draw(float w, float scale) {
-    if (g_perf_mode == 2) return perf_full_draw(w, scale);
+static void perf_draw(const MenuTarget *t, float scale) {
+    if (g_perf_mode == 2) return perf_full_draw(t, scale);
+    float w = (float)t->width;
     if (!g_perf_mode || !g_perf_text[0]) return;
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
@@ -1040,7 +1101,7 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (open) layout_menu(t->width, t->height, scale);
-    perf_draw((float)t->width, scale);
+    perf_draw(t, scale);
     ImGui::Render();
     if (open) g_save_pending = opt_save_tick(0);
     g_cost_ns += plat_now_ns() - t0;

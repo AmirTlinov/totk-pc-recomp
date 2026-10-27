@@ -31,6 +31,7 @@ static float g_scale = 1;
 static bool g_focus_req, g_take_first;   // opt_focus_first: requested / this page's first row takes it
 static char g_focus_key[64];             // opt_focus_key: the row that takes the cursor when it is next drawn
 static bool g_held;                      // the last row's left / right has been held a while (steppers go faster)
+static float g_bottom;                   // opt_reserve_bottom: kept free under the panes
 static bool g_disable_next;              // opt_disable_next: the next row is greyed out with g_disable_note
 static UiTextId g_disable_note;
 
@@ -54,6 +55,8 @@ void opt_focus_first(void) { g_focus_req = true; }
 
 void opt_focus_key(const char *key) { snprintf(g_focus_key, sizeof g_focus_key, "%s", key); }
 
+void opt_reserve_bottom(float h) { g_bottom = h; }
+
 void opt_disable_next(UiTextId note) {
     g_disable_next = true;
     g_disable_note = note;
@@ -66,6 +69,7 @@ void opt_begin(const char *id, float scale) {
     if (g_take_first) ImGui::NavMoveRequestCancel();   // this frame's move goes to the first row instead
     g_hover.text[0] = g_focus.text[0] = g_first.text[0] = 0;
     ImVec2 avail = ImGui::GetContentRegionAvail();
+    avail.y -= g_bottom;
     ImGui::PushID(id);
     ImGui::BeginChild("##rows", ImVec2(avail.x * 0.58f, avail.y), ImGuiChildFlags_NavFlattened);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 5 * scale));
@@ -80,6 +84,7 @@ void opt_end(void) {
     else if (!g_shown.text[0]) g_shown = g_first;
     ImGui::SameLine(0, 0);
     ImVec2 p = ImGui::GetCursorScreenPos(), avail = ImGui::GetContentRegionAvail();
+    avail.y -= g_bottom;
     float gap = 24 * g_scale;
     ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + gap * 0.5f, p.y), ImVec2(p.x + gap * 0.5f, p.y + avail.y),
                                         IM_COL32(236, 194, 84, 110), 1.0f);
@@ -130,19 +135,16 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
     int step = clicked && !off ? 2 : 0;
     g_held = false;
     if (foc && !off) {
-        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft) ||
-            ImGui::IsKeyPressed(ImGuiKey_LeftArrow))
-            step = -1;
-        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight) ||
-            ImGui::IsKeyPressed(ImGuiKey_RightArrow))
-            step = 1;
+        // the left stick arrives as the D-pad (menu.cpp pad_events)
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) step = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) || ImGui::IsKeyPressed(ImGuiKey_RightArrow)) step = 1;
         static const ImGuiKey steps[] = {ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight, ImGuiKey_LeftArrow,
-                                         ImGuiKey_RightArrow, ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight};
-        for (ImGuiKey k : steps)
+                                         ImGuiKey_RightArrow};
+        for (ImGuiKey k : steps) {
             if (ImGui::GetKeyData(k)->DownDuration > 1.0f) g_held = true;
-        // left and right belong to the row (navigation would otherwise move sideways into the description pane); the
-        // first four of steps, the stick stays with navigation
-        for (int i = 0; i < 4; i++) ImGui::SetKeyOwner(steps[i], ImGui::GetItemID());
+            // left and right belong to the row (navigation would otherwise move sideways into the description pane)
+            ImGui::SetKeyOwner(k, ImGui::GetItemID());
+        }
     }
     if (foc) desc_set(g_focus, desc, key, m, disabled);
     if (hov) desc_set(g_hover, desc, key, m, disabled);

@@ -17,6 +17,8 @@ extern "C" {
 
 void opt_begin(const char *id, float scale);
 void opt_end(void);
+// The height the next pages leave free under their panes (the menu's bottom row).
+void opt_reserve_bottom(float h);
 // The next page's first row takes the controller's cursor (opening the menu, switching tabs).
 void opt_focus_first(void);
 // The row of key (or button id) takes the cursor, scrolled into view, when it is next drawn.

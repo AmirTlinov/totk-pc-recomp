@@ -137,6 +137,16 @@ uint64_t frame_step_cap_ns(void) {
     return (uint64_t)(1e9 / hz + 0.5);
 }
 
+// The frame rate the limit gives, for the performance overlay: the setting, the monitor's rate for "display", 60 at
+// most without the real-time step; 0 before the first frame read the setting.
+double frame_step_limit_hz(void) {
+    int hz = limit_hz;
+    if (hz < 0) return 0;
+    double r = hz ? hz : gfx_window_refresh_hz();
+    if (r < LIMIT_MIN_HZ) r = 60;
+    return !step_word && r > 60 ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
+}
+
 // ---- TOTK_TRACE=perf speed lines
 static uint64_t win_t0, win_frames, win_hist[4];   // win_hist: frames by present interval 1, 2, 3+ ([0] unused)
 static double win_game;

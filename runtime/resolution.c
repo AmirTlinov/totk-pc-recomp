@@ -47,6 +47,7 @@ static struct {
     unsigned ow, oh, sw, sh;   // output and scene
     int scene_set;             // the scene differs from the game's 5/6 of the output
     int heapdef_ok;            // romfs.c serves the grown HeapDef
+    int on;                    // res_init switched the patch sets on
 } R;
 
 static void decide(void) {
@@ -216,6 +217,13 @@ void res_init(void) {
     memcpy(page + 48, &out, 8);
     rt_patch_switch(output, R.ow != BASE_W || R.oh != BASE_H);
     rt_patch_switch(scene, scene_on);
+    R.on = 1;
     rt_log("resolution: output %ux%u, scene %ux%u%s; texture heap +%llu KiB", R.ow, R.oh, R.sw, R.sh,
            scene_on ? "" : " (the game's own 5/6 of the output)", (unsigned long long)res_heap_extra_kib());
+}
+
+void res_sizes(unsigned out[2], unsigned scene[2]) {
+    decide();
+    out[0] = R.on ? R.ow : BASE_W, out[1] = R.on ? R.oh : BASE_H;
+    scene[0] = R.on ? R.sw : SCENE_W, scene[1] = R.on ? R.sh : SCENE_H;
 }

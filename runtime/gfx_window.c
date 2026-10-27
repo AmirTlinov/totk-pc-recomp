@@ -54,6 +54,7 @@ static CRITICAL_SECTION g_pl;
 static VkSwapchainKHR g_sc;
 static VkFormat g_sc_fmt;
 static VkExtent2D g_sc_ext;
+static int g_scaler;                        // the last present: 0 the game image 1:1, 1 scaled by the blit, 2 by FSR
 static uint32_t g_sc_n;
 static VkImage g_sc_img[MAX_IMAGES];
 static VkImageView g_sc_view[MAX_IMAGES];   // colour attachment views for the menu overlay
@@ -780,7 +781,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     // The menu overlay: laid out before recording (its first frame starts the ImGui back end and uploads the font)
     const char *menu_shot = NULL;
     MenuTarget mt = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue, g_sc_fmt, g_sc_ext.width,
-                     g_sc_ext.height};
+                     g_sc_ext.height, cw, ch, g_scaler};
     int overlay = g_sc_view[idx] &&
                   menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot);
     int cap = (g_capture || menu_shot) && ensure_capture_buffer();
@@ -796,7 +797,9 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     const int rect[4] = {cx, cy, cw, ch};
     // FSR (TOTK_UPSCALER) when the swapchain is larger than the crop; else the bilinear blit
-    if (!general || !vk_fsr_record(cb, slot, src, fmt, w, h, rect, dst, g_sc_ext.width, g_sc_ext.height)) {
+    int fsr = general && vk_fsr_record(cb, slot, src, fmt, w, h, rect, dst, g_sc_ext.width, g_sc_ext.height);
+    g_scaler = fsr ? 2 : (uint32_t)cw != g_sc_ext.width || (uint32_t)ch != g_sc_ext.height;
+    if (!fsr) {
         if (general)   // a GENERAL source (vk_texture.c images): earlier submissions' writes become visible to the blit here
             sync_barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                          VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
