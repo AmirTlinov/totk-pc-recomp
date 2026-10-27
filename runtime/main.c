@@ -27,6 +27,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 
 #define MAX_MODULES 16
 
@@ -105,17 +106,19 @@ void rt_udf(Cpu *c, uint64_t pc) {
              ldr_describe(c->x[30], lr, sizeof lr));
 }
 
-// CNTPCT_EL0: the Switch counter runs at 19.2 MHz.
+// CNTPCT_EL0: the Switch counter runs at 19.2 MHz. The scale is set before main, so no thread reads it half written.
+static PlatScale tick_scale;
+
+__attribute__((constructor)) static void tick_scale_init(void) {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    tick_scale = plat_scale(19200000u, (uint64_t)f.QuadPart);
+}
+
 uint64_t rt_ticks(void) {
-    static uint64_t freq;
     LARGE_INTEGER t;
-    if (!freq) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        freq = (uint64_t)f.QuadPart;
-    }
     QueryPerformanceCounter(&t);
-    return (uint64_t)((unsigned __int128)(uint64_t)t.QuadPart * 19200000u / freq);
+    return plat_scaled(tick_scale, (uint64_t)t.QuadPart);
 }
 
 // ---- crash reporter

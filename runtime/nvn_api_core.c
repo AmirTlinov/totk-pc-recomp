@@ -24,8 +24,15 @@
 #define EVENT_MAGIC MAGIC('E', 'V', 'N', 'T')
 
 // ---------- shared helpers (nvn_api.h)
+// The call count goes to the shared counter 1024 at a time: the main thread and the job workers all record command
+// buffers, and one locked add per call kept the counter's cache line moving between their cores (0.8k samples a
+// fight). The count lags by at most 1023 calls per thread.
 void nvn_called(uint8_t *seen, const char *name) {
-    __atomic_fetch_add(&gfx_counters.nvn_calls, 1, __ATOMIC_RELAXED);
+    static _Thread_local uint32_t calls;
+    if (++calls == 1024) {
+        __atomic_fetch_add(&gfx_counters.nvn_calls, calls, __ATOMIC_RELAXED);
+        calls = 0;
+    }
     if (__atomic_load_n(seen, __ATOMIC_RELAXED) || __atomic_exchange_n(seen, 1, __ATOMIC_RELAXED)) return;
     uint64_t n = __atomic_add_fetch(&gfx_counters.nvn_distinct, 1, __ATOMIC_RELAXED);
     NVN_LOG("first call %llu: %s", (unsigned long long)n, name);
@@ -260,7 +267,11 @@ NVN_API(nvnMemoryPoolBuilderSetStorage) {
 // void nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder *b, int flags)
 NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags = (uint32_t)arg_x(c, 1); }
 // NVNboolean nvnMemoryPoolInitialize(NVNmemoryPool *p, const NVNmemoryPoolBuilder *b)
+// Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
+// loader threads, which held a virtual core through it while job workers waited (TOTK_CORE_DIAG). The thread gives
+// the core up, as for any blocking host call.
 NVN_API(nvnMemoryPoolInitialize) {
+    NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
     memset(o, 0, sizeof *o);
@@ -290,6 +301,7 @@ NVN_API(nvnMemoryPoolInitialize) {
 }
 // void nvnMemoryPoolFinalize(NVNmemoryPool *p)
 NVN_API(nvnMemoryPoolFinalize) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC) return;
     if (pool_gpu_visible(o)) index_del(o);
@@ -365,6 +377,7 @@ static int check_request(const pool_t *v, const nvn_mapping_t *r, int i) {
 }
 // NVNboolean nvnMemoryPoolMapVirtual(NVNmemoryPool *p, int n, const NVNmappingRequest *requests)
 NVN_API(nvnMemoryPoolMapVirtual) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *v = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
     const nvn_mapping_t *r = arg_p(c, 2);

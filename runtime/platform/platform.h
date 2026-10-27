@@ -23,6 +23,16 @@ uint32_t plat_cpu_count(void);            // logical processors
 
 // ---- time
 uint64_t plat_now_ns(void);               // monotonic, high resolution, arbitrary epoch
+// t * num / den for a fixed num / den without a 128-bit division per call (__udivti3 took 5% of the game's running
+// samples through plat_now_ns and rt_ticks): t * q + (t * f >> 64) with q = num / den and f = (num % den) * 2^64 / den.
+// Monotonic in t and at most one below the exact quotient while t * (num % den) / den fits 64 bits.
+typedef struct { uint64_t q, f; } PlatScale;
+static inline PlatScale plat_scale(uint64_t num, uint64_t den) {
+    return (PlatScale){num / den, (uint64_t)(((unsigned __int128)(num % den) << 64) / den)};
+}
+static inline uint64_t plat_scaled(PlatScale s, uint64_t t) {
+    return t * s.q + (uint64_t)(((unsigned __int128)t * s.f) >> 64);
+}
 void plat_sleep_ns(uint64_t ns);          // returns no earlier than ns later; overshoot well under 1 ms
 
 // ---- locks (not recursive) and condition variables; zero-initialised storage is a valid unlocked lock and an empty

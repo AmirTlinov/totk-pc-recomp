@@ -78,10 +78,14 @@ static uint64_t qpc_freq(void) {
     return freq;
 }
 
+static PlatScale qpc_ns;   // set before main, so no thread reads it half written
+
+__attribute__((constructor)) static void qpc_ns_init(void) { qpc_ns = plat_scale(1000000000u, qpc_freq()); }
+
 uint64_t plat_now_ns(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (uint64_t)((unsigned __int128)(uint64_t)t.QuadPart * 1000000000u / qpc_freq());
+    return plat_scaled(qpc_ns, (uint64_t)t.QuadPart);
 }
 
 // A high-resolution waitable timer per sleeping thread (Windows 10 1803+; one handle per thread, kept until exit)
