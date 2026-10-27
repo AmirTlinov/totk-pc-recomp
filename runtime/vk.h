@@ -175,6 +175,11 @@ void vk_mem_census(uint64_t frame);               // at each present: pool censu
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
+// VRAM headroom (vk_headroom.c): the VMA callbacks that see new device memory, and the thread that allocates the next
+// block of each memory type in use ahead of the render thread.
+const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
+void vk_headroom_start(void);
+void vk_headroom_stop(void);   // before vmaDestroyAllocator
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
