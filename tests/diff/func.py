@@ -7,8 +7,8 @@ Emits them with the generator's own Emitter, compiles them with tests/diff/harne
 states: x0-x7 point into the scratch buffer (or hold small integers), the buffer holds pointers into itself and random
 data, SP sits near the buffer's top and LR is a sentinel address. Unicorn (Cortex-A57) stops when PC reaches the
 sentinel. A case is skipped when Unicorn faults, writes outside the scratch buffer (module images are mapped
-read-only), leaves the function, or runs longer than --steps instructions. Compares X0-X30, SP, NZCV, V0-V31 and the
-scratch buffer.
+read-only), leaves the function, or runs longer than --steps instructions. Compares X0-X30, SP, V0-V31 and the
+scratch buffer; NZCV is local to a generated function (recomp/flags.py).
 
 Every BL and BLR goes to one stub on both sides (rt_stub in harness.c, Runner.stub here) instead of its callee. The
 stub folds the guest state at the call into a digest and sets the caller-saved registers from it, so the test sees
@@ -387,7 +387,9 @@ def main():
 
     fails, nfail = {}, 0
     for case, want_state, got in zip(cases, expect, recs):
-        d = diff_state(got, want_state, check_pc=False, check_mem=True)
+        # Generated functions keep NZCV in a local (recomp/flags.py) and leave c->nzcv as it was: flags only count
+        # where the function reads them, which the registers and memory show.
+        d = diff_state(got, want_state, check_pc=False, check_mem=True, check_nzcv=False)
         if d:
             nfail += 1
             fails.setdefault(case[0], d[:4])

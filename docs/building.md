@@ -138,7 +138,7 @@ change passes these, all run with `.venv`:
 | `tests\diff\lift.py` | instructions sampled from the extracted modules; `--coverage` lists every word the lifter rejects or traps | yes |
 | `tests\diff\simd.py` | the whole FP/SIMD encoding space | no |
 | `tests\diff\atomic.py` | exclusive load/store sequences and ARMv8.1 atomics | no |
-| `tests\diff\func.py` | whole leaf functions as the generator emits them, loops and jump tables included | yes |
+| `tests\diff\func.py` | whole functions as the generator emits them, loops, jump tables and calls included (calls go to a stub that checks the registers at the call) | yes |
 | `tests\excl_mt.py` | the exclusive monitor helpers under contention and ABA, on several threads | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
 

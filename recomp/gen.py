@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 sys.path.insert(0, str(ROOT / 'recomp'))
 
+import flags  # noqa: E402
 import jumptables  # noqa: E402
 import patches  # noqa: E402
 from check_content import GENERATED_MARKER  # noqa: E402
@@ -246,6 +247,66 @@ class Emitter:
                 raise ValueError(f'{entry + 4 * i:#x}: asm instruction from the portable lifter')
         return labels, tables
 
+    def replacements(self, a):
+        """Lifted replacement words of the patched site a."""
+        return [self.mod.lifter.lift(w, a) for w in self.patched[a][1]]
+
+    def flag_plan(self, insns, entry, end, tables):
+        """recomp/flags.py plan for the function: the intra-function control flow and each instruction's flag use.
+        Index len(insns) stands for falling through into the next function."""
+        n = len(insns)
+        succ, calls, effects, exits = [], set(), [], {n}
+
+        def idx(t):
+            return [(t - entry) // 4] if entry <= t < end else []
+
+        for i, ins in enumerate(insns):
+            k, a = ins.kind, entry + 4 * i
+            nxt = [i + 1]
+            if k == 'op':
+                succ.append(nxt)
+            elif k in ('bl', 'blr'):
+                succ.append(nxt)
+                calls.add(i)
+            elif k == 'b':
+                succ.append(idx(ins.target))
+                if not idx(ins.target):
+                    exits.add(i)
+            elif k == 'bcond':
+                succ.append(idx(ins.target) + nxt)
+                if not idx(ins.target):
+                    exits.add(i)
+            elif k == 'br':
+                jt = tables.get(a)
+                succ.append([t for x in jt for t in idx(x)] if jt and jt != 'all' else [])
+                exits.add(i)   # through rt_dispatch, also a table's default
+            else:   # ret, trap
+                succ.append([])
+            if a in self.patched:
+                effects.append(self.patched_effect(ins, a))
+                if any(r.kind == 'bl' for r in self.replacements(a)):
+                    calls.add(i)
+            else:
+                effects.append(flags.effect(ins.cond if k == 'bcond' else ins.code or ''))
+        succ.append([])
+        effects.append((False, None))
+        return flags.plan(effects, succ, calls, exits)
+
+    def patched_effect(self, ins, a):
+        """Flag effect of a patched site: both alternatives must have the same one, in at most one word each."""
+        alts = []
+        for words in ([ins], self.replacements(a)):
+            fx = [flags.effect(w.code or '') for w in words if w.kind == 'op']
+            fx = [e for e in fx if e[0] or e[1]]
+            if len(fx) > 1:
+                raise patches.PatchError(f'{a:#x}: several flag-using words in one alternative')
+            alts.append(fx[0] if fx else (False, None))
+        if alts[0][1] != alts[1][1]:
+            raise patches.PatchError(f'{a:#x}: the alternatives write different flags ({alts[0][1]}, {alts[1][1]})')
+        if (alts[0][1] or alts[0][0] or alts[1][0]) and ins.kind == 'bl':
+            raise patches.PatchError(f'{a:#x}: a patched call that uses flags')
+        return alts[0][0] or alts[1][0], alts[0][1]
+
     def function(self, entry, end):
         """(lines of C, referenced function starts) for the guest function [entry, end)."""
         mod, starts = self.mod, self.starts
@@ -255,15 +316,32 @@ class Emitter:
         all_labels = 'all' in tables.values()
         if all_labels:
             labels = set(range(entry, end, 4))
+        # An unresolved computed br re-enters the function through fb_<entry>, a C function of its own, which local
+        # flags would not survive; such functions keep NZCV in c->nzcv.
+        fp = None if all_labels else self.flag_plan(insns, entry, end, tables)
+        if fp and fp.used:
+            self.stats['local_flag_functions'] += 1
+            self.stats['flag_reads_direct'] += sum(1 for k in fp.reader if k and k != 'nz')
+            self.stats['flag_reads_packed'] += sum(1 for k in fp.reader if k == 'nz')
+            self.stats['flag_entry_functions'] += fp.entry
+            self.stats['flag_entry_reads'] += fp.entry_read
+            self.stats['flag_reads_after_call'] += fp.after_call
+            self.stats['flag_publishing_exits'] += sum(1 for k in fp.exit if k)
 
-        def jump(t):
+        def fx(i, code):
+            return fp.rewrite(i, code) if fp and fp.used else code
+
+        def publish(i):
+            return fp.publish(i) if fp and fp.used else ''
+
+        def jump(t, i):
             if entry <= t < end:
                 return f'goto L_{t:x};'
             if t in starts:
                 refs.add(t)
-                return f'{MUSTTAIL} {fname(t)}(c);'
+                return f'{publish(i)}{MUSTTAIL} {fname(t)}(c);'
             self.stats['external_branches'] += 1
-            return f'c->pc = {hx(t)}; {MUSTTAIL} rt_dispatch(c);'
+            return f'{publish(i)}c->pc = {hx(t)}; {MUSTTAIL} rt_dispatch(c);'
 
         if all_labels:
             # An unresolved computed br re-enters the function through fb_<entry>, which switches on c->pc to any
@@ -280,6 +358,9 @@ class Emitter:
         else:
             redispatch = f'{MUSTTAIL} rt_dispatch(c);'
             out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+            if fp.used:
+                out.append('    ' + fp.decl())
+
         def call(t, a):
             if t in starts:
                 refs.add(t)
@@ -287,21 +368,20 @@ class Emitter:
             self.stats['external_calls'] += 1
             return f'c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);'
 
-        def patch(ins, a):
+        def patch(i, ins, a):
             """if (switch) { replacement } else { original } for a patched site (recomp/patches.py)."""
             k, words = self.patched[a]
             if ins.kind not in ('op', 'bl'):
                 raise patches.PatchError(f'{a:#x}: patched instruction is a {ins.kind}')
             repl = []
-            for j, w in enumerate(words):
-                r = mod.lifter.lift(w, a)
+            for j, (w, r) in enumerate(zip(words, self.replacements(a))):
                 if r.kind == 'op':
-                    repl.append(r.code)
+                    repl.append(fx(i, r.code))
                 elif r.kind == 'bl' and j == len(words) - 1:
                     repl.append(call(r.target, a))
                 else:
                     raise patches.PatchError(f'{a:#x}: replacement word {w:08x} is a {r.kind}')
-            orig = ins.code if ins.kind == 'op' else call(ins.target, a)
+            orig = fx(i, ins.code) if ins.kind == 'op' else call(ins.target, a)
             self.uses_patches = True
             self.stats['patched_sites'] += 1
             return f'    if (rt_patch_on[{k}]) {{ {" ".join(repl)} }} else {{ {orig} }}'
@@ -313,13 +393,13 @@ class Emitter:
                 out.append(f'L_{a:x}:;')
             k = ins.kind
             if a in self.patched:
-                out.append(patch(ins, a))
+                out.append(patch(i, ins, a))
             elif k == 'op' or k == 'trap':
-                out.append('    ' + ins.code)
+                out.append('    ' + fx(i, ins.code))
             elif k == 'b':
-                out.append('    ' + jump(ins.target))
+                out.append('    ' + jump(ins.target, i))
             elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+                out.append(f'    if ({fx(i, ins.cond)}) {{ {jump(ins.target, i)} }}')
             elif k == 'bl':
                 out.append('    ' + call(ins.target, a))
             elif k == 'blr':
@@ -331,16 +411,16 @@ class Emitter:
                 elif jt:
                     cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {ins.target}; {redispatch}')
+                    out.append(f'    {publish(i)}c->pc = {ins.target}; {redispatch}')
                 else:
-                    out.append(f'    c->pc = {ins.target}; {MUSTTAIL} rt_dispatch(c);')
+                    out.append(f'    {publish(i)}c->pc = {ins.target}; {MUSTTAIL} rt_dispatch(c);')
             elif k == 'ret':
                 out.append('    return;')
             else:
                 raise ValueError(f'{a:#x}: unknown instruction kind {k!r}')
         if k not in TERMINATORS:  # falls through into the next function
             if end < mod.hi:
-                out.append('    ' + jump(end))
+                out.append('    ' + jump(end, len(insns)))
             else:
                 out.append(f'    rt_udf(c, {hx(end)});')
         out.append('}')
@@ -562,6 +642,13 @@ def main():
                 'br_dispatch': stats['br_dispatch'],
                 'traps': stats['traps'],
                 'patched_sites': stats['patched_sites'],
+                'local_flag_functions': stats['local_flag_functions'],
+                'flag_reads_direct': stats['flag_reads_direct'],
+                'flag_reads_packed': stats['flag_reads_packed'],
+                'flag_entry_functions': stats['flag_entry_functions'],
+                'flag_entry_reads': stats['flag_entry_reads'],
+                'flag_reads_after_call': stats['flag_reads_after_call'],
+                'flag_publishing_exits': stats['flag_publishing_exits'],
                 'unsupported': stats['unsupported'],
                 'external_branches': stats['external_branches'],
                 'external_calls': stats['external_calls'],

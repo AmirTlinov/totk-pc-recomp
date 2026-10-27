@@ -258,14 +258,14 @@ def run_harness(exe, work, buf0, cases, images, stubs=False):
     return recs, err
 
 
-def diff_state(got, want, check_pc, check_mem):
+def diff_state(got, want, check_pc, check_mem, check_nzcv=True):
     """got: harness record; want: (x, sp, nzcv, pc, v, mem). Returns a list of mismatches."""
     hx, hsp, hnz, hpc, hmem, hv = got
     ex, esp, enz, epc, ev, emem = want
     d = [f'x{j}: got {hx[j]:x} want {ex[j]:x}' for j in range(31) if hx[j] != ex[j]]
     if hsp != esp:
         d.append(f'sp: got {hsp:x} want {esp:x}')
-    if hnz != enz:
+    if check_nzcv and hnz != enz:
         d.append(f'nzcv: got {hnz:x} want {enz:x}')
     if check_pc and hpc != epc:
         d.append(f'pc: got {hpc:x} want {epc:x}')
