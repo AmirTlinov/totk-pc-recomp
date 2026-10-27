@@ -1,14 +1,19 @@
 """Differential test of whole emitted functions: recomp/gen.py's C for a guest function against Unicorn running the
 same function from its entry until it returns.
 
-Picks leaf functions from the ExeFS modules: no calls, no branches out of the function, no SVC, BRK, system
-register, exclusive or atomic instructions; with conditional branches, and loops, jump tables and SIMD where the
-module has them. Emits them with the generator's own Emitter, compiles them with tests/diff/harness.c, and runs each
-from random states: x0-x7 point into the scratch buffer (or hold small integers), the buffer holds pointers into
-itself and random data, SP sits near the buffer's top and LR is a sentinel address. Unicorn (Cortex-A57) stops when
-PC reaches the sentinel. A case is skipped when Unicorn faults, writes outside the scratch buffer (module images are
-mapped read-only), leaves the function, or runs longer than --steps instructions. Compares X0-X30, SP, NZCV, V0-V31
-and the scratch buffer.
+Picks functions from the ExeFS modules: no branches out of the function, no SVC, BRK, system register, exclusive or
+atomic instructions; with conditional branches, and loops, jump tables, SIMD and calls where the module has them.
+Emits them with the generator's own Emitter, compiles them with tests/diff/harness.c, and runs each from random
+states: x0-x7 point into the scratch buffer (or hold small integers), the buffer holds pointers into itself and random
+data, SP sits near the buffer's top and LR is a sentinel address. Unicorn (Cortex-A57) stops when PC reaches the
+sentinel. A case is skipped when Unicorn faults, writes outside the scratch buffer (module images are mapped
+read-only), leaves the function, or runs longer than --steps instructions. Compares X0-X30, SP, NZCV, V0-V31 and the
+scratch buffer.
+
+Every BL and BLR goes to one stub on both sides (rt_stub in harness.c, Runner.stub here) instead of its callee. The
+stub folds the guest state at the call into a digest and sets the caller-saved registers from it, so the test sees
+whether the emitted code had every register in the Cpu at the call and reads them back after it. Callers of another
+picked function are dropped, as the C side would run that function instead of the stub.
 
 Usage: func.py [--exefs DIR] [--modules main,subsdk0,sdk] [--functions N] [--cases K] [--seed S] [--jobs J]
 """
@@ -38,11 +43,24 @@ STACK_TOP = BUF + 0x3F000
 MIN_INSNS, MAX_INSNS = 6, 600
 
 
+FNV = 0x100000001B3
+M64 = (1 << 64) - 1
+
+
+def splitmix(z):
+    z = (z + 0x9E3779B97F4A7C15) & M64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
+    return z ^ (z >> 31)
+
+
+def call_mask(w):
+    return ((w & 0xFC000000) == 0x94000000) | ((w & 0xFFFFFC1F) == 0xD63F0000)   # BL, BLR
+
+
 def forbidden_mask(w):
     """Words a picked function must not contain."""
-    m = (w & 0xFC000000) == 0x94000000                    # BL
-    m |= (w & 0xFFFFFC1F) == 0xD63F0000                   # BLR
-    m |= (w & 0xFF000000) == 0xD4000000                   # SVC, HVC, SMC, BRK, HLT, DCPS
+    m = (w & 0xFF000000) == 0xD4000000                    # SVC, HVC, SMC, BRK, HLT, DCPS
     sysi = (w & 0xFFC00000) == 0xD5000000                 # system: MRS, MSR, SYS (DC ZVA), hints, barriers
     hint_or_barrier = ((w & 0xFFFFF000) == 0xD5032000) | ((w & 0xFFFFF000) == 0xD5033000)
     m |= sysi & ~hint_or_barrier
@@ -61,7 +79,7 @@ def simd_mask(w):
 
 
 def pick_functions(name, mod, count, r):
-    """[(entry, end, tags)] of up to count leaf functions of mod, plus the Emitter that will emit them."""
+    """[(entry, end, tags)] of up to count functions of mod, plus the Emitter that will emit them."""
     starts, _ = gen.discover(mod)
     w = mod.words
     ends = np.append(starts[1:], len(w))
@@ -73,15 +91,18 @@ def pick_functions(name, mod, count, r):
     size = ends - starts
     ok = (per_fn(forbidden_mask(w)) == 0) & (per_fn(cond_mask(w)) > 0) & (size >= MIN_INSNS) & (size <= MAX_INSNS)
     has_br = per_fn((w & 0xFFFFFC1F) == 0xD61F0000) > 0
+    has_call = per_fn(call_mask(w)) > 0
     cand = np.flatnonzero(ok)
     with_br = [int(i) for i in cand if has_br[i]]
-    rest = [int(i) for i in cand if not has_br[i]]
-    r.shuffle(with_br)
-    r.shuffle(rest)
+    with_call = [int(i) for i in cand if has_call[i] and not has_br[i]]
+    rest = [int(i) for i in cand if not has_br[i] and not has_call[i]]
+    for pool in (with_br, with_call, rest):
+        r.shuffle(pool)
     emitter = gen.Emitter(mod, set((mod.lo + starts * 4).tolist()))
     picks, tags_seen = [], Counter()
-    # Functions with a br first (jump tables, fallbacks), at most a quarter of the picks.
-    for pool, quota in ((with_br, count // 4), (rest, count)):
+    # Functions with a br first (jump tables, fallbacks), at most a quarter of the picks; then functions with calls,
+    # at most half.
+    for pool, quota in ((with_br, count // 4), (with_call, count // 2), (rest, count)):
         taken = 0
         for i in pool:
             if len(picks) >= count or taken >= quota:
@@ -91,11 +112,26 @@ def pick_functions(name, mod, count, r):
             if tags is None:
                 continue
             picks.append((entry, end, tags))
-            tags_seen.update(tags)
             taken += 1
-    print(f'{name}: {len(starts)} functions, {len(cand)} leaf candidates, picked {len(picks)}: '
+    picked = {e for e, _, _ in picks}
+    picks = [p for p in picks if not callees(emitter, p[0], p[1]) & picked]
+    for _, _, tags in picks:
+        tags_seen.update(tags)
+    print(f'{name}: {len(starts)} functions, {len(cand)} candidates, picked {len(picks)}: '
           f'{dict(tags_seen)}', flush=True)
     return picks, emitter
+
+
+def call_sites(mod, entry, end):
+    """Addresses of the BL and BLR instructions of [entry, end)."""
+    return [a for a in range(entry, end, 4) if mod.lift(a).kind in ('bl', 'blr')]
+
+
+def callees(emitter, entry, end):
+    """Function starts the emitted C of [entry, end) calls directly (`f_<addr>(c)`, not through rt_dispatch)."""
+    mod = emitter.mod
+    return {mod.lift(a).target for a in call_sites(mod, entry, end)
+            if mod.lift(a).kind == 'bl' and mod.lift(a).target in emitter.starts}
 
 
 def check_function(emitter, entry, end):
@@ -108,7 +144,7 @@ def check_function(emitter, entry, end):
     for k, ins in enumerate(insns):
         a = entry + 4 * k
         if ins.kind in ('bl', 'blr'):
-            return None
+            tags.add('calls')
         if ins.kind in ('b', 'bcond'):
             if not entry <= ins.target < end:
                 return None
@@ -147,9 +183,14 @@ def build(work, emitted, jobs, cflags):
             path.write_text(gen.chunk_text(name, j // per, emitter, fns[j:j + per]))
             srcs.append(path)
     table = work / 'table.c'
+    called = set()
+    for _, entry, end, emitter in emitted:
+        called |= callees(emitter, entry, end)
     table.write_text('#include "cpu.h"\n' + ''.join(f'void {gen.fname(e)}(Cpu *c);\n' for _, e, _, _ in emitted) +
                      'GuestFn tests[] = {' + ','.join(gen.fname(e) for _, e, _, _ in emitted) + '};\n' +
-                     f'int ntests = {len(emitted)};\n')
+                     f'int ntests = {len(emitted)};\n' + 'void rt_stub_call(Cpu *c, uint64_t target);\n' +
+                     ''.join(f'void {gen.fname(t)}(Cpu *c) {{ rt_stub_call(c, {hex(t)}ull); }}\n'
+                             for t in sorted(called)))
     srcs += [table, ROOT / 'tests' / 'diff' / 'harness.c']
     objs, procs = [], []
     for s in srcs:
@@ -191,9 +232,12 @@ def make_case(r):
 
 
 class Runner:
-    """Unicorn with the module images read-only and a block hook that stops when execution leaves the function."""
+    """Unicorn with the module images read-only, a block hook that stops when execution leaves the function, and a
+    code hook on every call site of the picked functions that stops before the call, for the stub."""
 
-    def __init__(self, images, buf0):
+    MAX_CALLS = 1000
+
+    def __init__(self, images, buf0, sites):
         self.emu = Emu(images)
         mu = self.emu.mu
         for base, data in images:
@@ -201,25 +245,70 @@ class Runner:
         mu.mem_map(SENTINEL, 0x1000)
         mu.mem_write(BUF, buf0)
         self.buf0 = buf0
-        self.lo = self.hi = 0
+        self.lo = self.hi = self.h = 0
         self.left = False
+        self.at_call = None
         mu.hook_add(uc.UC_HOOK_BLOCK, self._block)
+        # One hook per call site, all added before anything is translated, so no cached block lacks one.
+        for a in sorted(sites):
+            mu.hook_add(uc.UC_HOOK_CODE, self._call, begin=a, end=a)
 
     def _block(self, mu, address, size, user):
         if not self.lo <= address < self.hi and address != SENTINEL:
             self.left = True
             mu.emu_stop()
 
+    def _call(self, mu, address, size, user):
+        if self.lo <= address < self.hi:
+            self.at_call = address
+            mu.emu_stop()
+
+    def stub(self, a):
+        """harness.c rt_stub for the call at a, which Unicorn has not executed yet. Returns the address to resume at."""
+        e, mu = self.emu, self.emu.mu
+        w = int.from_bytes(mu.mem_read(a, 4), 'little')
+        if (w & 0xFC000000) == 0x94000000:   # BL
+            imm = w & 0x03FFFFFF
+            target = (a + ((imm - (1 << 26) if imm >> 25 else imm) << 2)) & M64
+        else:                                 # BLR
+            target = mu.reg_read(e.xregs[(w >> 5) & 31])
+        mu.reg_write(A.UC_ARM64_REG_X30, a + 4)
+        h = ((self.h ^ target) * FNV) & M64
+        for val in list(mu.reg_read_batch(e.xregs)) + [mu.reg_read(A.UC_ARM64_REG_SP)]:
+            h = ((h ^ val) * FNV) & M64
+        for val in mu.reg_read_batch(e.qregs[:8]):
+            h = ((h ^ (val & M64)) * FNV) & M64
+            h = ((h ^ (val >> 64)) * FNV) & M64
+        self.h = h
+        regs = []
+        for i in range(19):
+            s = splitmix((h + i) & M64)
+            regs.append((e.xregs[i], PTR_LO + ((s >> 4) % ((PTR_HI - PTR_LO) // 16)) * 16 if i < 8 and s & 3 else s))
+        regs.append((A.UC_ARM64_REG_NZCV, splitmix((h + 19) & M64) >> 60 << 28))
+        for i in range(8):
+            regs.append((e.qregs[i], splitmix((h + 33 + 2 * i) & M64) << 64 | splitmix((h + 32 + 2 * i) & M64)))
+        mu.reg_write_batch(regs)
+        top = BUF + BUF_SIZE - 16
+        n = int.from_bytes(mu.mem_read(top, 8), 'little')
+        mu.mem_write(top, ((n + 1) & M64).to_bytes(8, 'little') + h.to_bytes(8, 'little'))
+        return a + 4
+
     def run(self, entry, end, case, steps):
         """(x, sp, nzcv, pc, v, crc of the buffer) or None if the case is skipped."""
         fpcr, x, sp, nzcv, v = case
         e, mu = self.emu, self.emu.mu
-        self.lo, self.hi, self.left = entry, end, False
+        self.lo, self.hi, self.left, self.h = entry, end, False, 0
         mu.reg_write_batch(list(zip(e.xregs, x[:31])) + list(zip(e.qregs, v)) +
                            [(A.UC_ARM64_REG_SP, sp), (A.UC_ARM64_REG_NZCV, nzcv), (A.UC_ARM64_REG_FPCR, fpcr)])
+        pc, ok = entry, False
         try:
-            mu.emu_start(entry, SENTINEL, count=steps)
-            ok = not self.left and mu.reg_read(A.UC_ARM64_REG_PC) == SENTINEL
+            for _ in range(self.MAX_CALLS):
+                self.at_call = None
+                mu.emu_start(pc, SENTINEL, count=steps)
+                if self.at_call is None:
+                    ok = not self.left and mu.reg_read(A.UC_ARM64_REG_PC) == SENTINEL
+                    break
+                pc = self.stub(self.at_call)
         except uc.UcError:
             ok = False
         if not ok:
@@ -268,7 +357,10 @@ def main():
     print(f'compiled ({time.time() - t1:.0f}s)', flush=True)
 
     buf0 = make_buffer(r)
-    runner = Runner([(base, data) for base, _, data in images], buf0)
+    sites = set()
+    for _, entry, end, emitter in emitted:
+        sites.update(call_sites(emitter.mod, entry, end))
+    runner = Runner([(base, data) for base, _, data in images], buf0, sites)
     cases, expect, tested, skipped = [], [], set(), 0
     t2 = time.time()
     for k, (name, entry, end, _) in enumerate(emitted):
@@ -286,7 +378,7 @@ def main():
           flush=True)
 
     t3 = time.time()
-    recs, err = run_harness(exe, work, buf0, cases, [(base, img) for base, img, _ in images])
+    recs, err = run_harness(exe, work, buf0, cases, [(base, img) for base, img, _ in images], stubs=True)
     print(f'harness: {len(recs)} of {len(cases)} cases ({time.time() - t3:.0f}s)')
     if err:
         k = cases[len(recs)][0] if len(recs) < len(cases) else None
