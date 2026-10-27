@@ -89,6 +89,8 @@ struct RtThread {
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
+    uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
+    uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
     // TOTK_ASYNC_PREEMPT (holding G)
     HANDLE hthr;               // the host thread, for SuspendThread / Get/SetThreadContext; open while it may own a core
@@ -214,6 +216,7 @@ static void wake(RtThread *t, uint32_t res) {
     t->woke = 1;
     t->wres = res;
     t->waker = tcur ? tcur->handle : 0;
+    if (rt_trace & RT_TRACE_SCHED) t->wake_at = kern_now_ns();
     WakeConditionVariable(&t->cv);
 }
 
@@ -254,6 +257,13 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
         }
         uint64_t ms = (deadline - now + 999999) / 1000000;
         SleepConditionVariableSRW(&t->cv, &G, ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (DWORD)ms, 0);
+    }
+    if (t->wake_at) {
+        uint64_t d = kern_now_ns() - t->wake_at;
+        t->lw_ns += d;
+        t->lw_n++;
+        if (d > t->lw_max) t->lw_max = d;
+        t->wake_at = 0;
     }
     return t->wres;
 }
@@ -747,6 +757,7 @@ static void core_grant(int c) {
     g_core_owner[c] = b;
     core_count();
     if (g_diag > 0) b->dg_rel = g_dg_rel;
+    if (rt_trace & RT_TRACE_SCHED) b->grant_at = kern_now_ns();
     WakeConditionVariable(&b->cv);
 }
 
@@ -873,6 +884,13 @@ static void core_take(RtThread *t) {
         }
     }
     if (g_diag > 0) dg_done(t);
+    if (t->grant_at) {
+        uint64_t d = kern_now_ns() - t->grant_at;
+        t->lg_ns += d;
+        t->lg_n++;
+        if (d > t->lg_max) t->lg_max = d;
+        t->grant_at = 0;
+    }
     t->target = NULL;
     acct(t, S_RUN);
 }
@@ -988,7 +1006,11 @@ void kern_core_stats_reset(void) {
 #define REP_N 8
 void kern_sched_report(uint64_t frame) {
     static uint64_t last;
-    typedef struct { uint32_t h; int prio, render; uint64_t mask, entry, ns[S_N], nblk, npre, cpu; } Row;
+    typedef struct {
+        uint32_t h;
+        int prio, render;
+        uint64_t mask, entry, ns[S_N], nblk, npre, cpu, lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;
+    } Row;
     Row rows[REP_N + 1];
     WaitRec rw[2][4] = {0};   // the render and the main thread's longest waits
     int nr = 0;
@@ -1036,6 +1058,9 @@ void kern_sched_report(uint64_t frame) {
         memcpy(r->ns, t->st_ns, sizeof r->ns);
         r->nblk = t->nblk;
         r->npre = t->npre;
+        r->lw_ns = t->lw_ns, r->lw_n = t->lw_n, r->lw_max = t->lw_max;
+        r->lg_ns = t->lg_ns, r->lg_n = t->lg_n, r->lg_max = t->lg_max;
+        r->sl_n = t->sl_n, r->sl_req = t->sl_req, r->sl_act = t->sl_act;
         r->cpu = 0;
         HANDLE th = t->tid ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, t->tid) : NULL;
         FILETIME a, b, k, u;
@@ -1062,6 +1087,7 @@ void kern_sched_report(uint64_t frame) {
     for (RtThread *t = g_all; t; t = t->all) {
         memset(t->st_ns, 0, sizeof t->st_ns);
         t->nblk = t->npre = 0;
+        t->lw_ns = t->lw_n = t->lw_max = t->lg_ns = t->lg_n = t->lg_max = t->sl_n = t->sl_req = t->sl_act = 0;
     }
     memset(g_rw, 0, sizeof g_rw);
     memset(g_mw, 0, sizeof g_mw);
@@ -1084,6 +1110,11 @@ void kern_sched_report(uint64_t frame) {
         rt_log("sched: %s%#x p%d m%llx%s cpu %.0f%% blocks %llu preempted %llu (%s)", r->render ? "render " : "",
                r->h, r->prio, (unsigned long long)r->mask, s, 100.0 * r->cpu / span, (unsigned long long)r->nblk,
                (unsigned long long)r->npre, r->entry ? d : "main");
+        rt_log("sched:   %#x wake to run avg %.1f us max %.0f us (%llu), core grant to run avg %.1f us max %.0f us "
+               "(%llu), sleep %llu asked avg %.1f us took avg %.1f us", r->h, r->lw_n ? r->lw_ns / 1e3 / r->lw_n : 0.0,
+               r->lw_max / 1e3, (unsigned long long)r->lw_n, r->lg_n ? r->lg_ns / 1e3 / r->lg_n : 0.0, r->lg_max / 1e3,
+               (unsigned long long)r->lg_n, (unsigned long long)r->sl_n, r->sl_n ? r->sl_req / 1e3 / r->sl_n : 0.0,
+               r->sl_n ? r->sl_act / 1e3 / r->sl_n : 0.0);
     }
     for (int k = 0; k < 2; k++)
         for (int j = 0; j < 4 && rw[k][j].ns; j++) {
@@ -1300,7 +1331,16 @@ void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
     CloseHandle(h);
 }
 
+// The high-resolution waitable timer ends a wait 0.3-0.5 ms late at best: the SDK's 20 us polling sleeps (main thread
+// and job workers, about 1.5 per frame each) took 460-515 us. Sleeps up to SLEEP_SPIN_NS spin on the performance
+// counter instead; the virtual core is already given up.
+#define SLEEP_SPIN_NS 1000000
 static void sleep_ns(RtThread *t, int64_t ns) {
+    if (ns <= SLEEP_SPIN_NS) {
+        uint64_t end = kern_now_ns() + (uint64_t)ns;
+        while (kern_now_ns() < end) YieldProcessor();
+        return;
+    }
     if (!t->timer) {
         t->timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!t->timer) t->timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
@@ -1444,8 +1484,13 @@ int kern_svc(Cpu *c, uint32_t imm) {
             t->wobj = (uint64_t)ns;
             t->nblk++;
             unlock();
+            uint64_t t0 = kern_now_ns();
             sleep_ns(t, ns);
+            uint64_t took = kern_now_ns() - t0;
             lock();
+            t->sl_n++;
+            t->sl_req += (uint64_t)ns;
+            t->sl_act += took;
             core_take(t);
             unlock();
             return 1;

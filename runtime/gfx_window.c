@@ -19,6 +19,7 @@
 
 #include "cfg.h"
 #include "flight.h"
+#include "fs.h"
 #include "gfx.h"
 #include "input.h"
 #include "nvn_api.h"
@@ -392,8 +393,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
-        // The process ends with the window, as in MNG. Save writes go straight to files (runtime/fs_host.c).
+        // The process ends with the window, as in MNG, once a save Commit still running in the background is done.
         rt_log("gfx: window closed; exiting");
+        fs_save_flush();
         vk_pipeline_save();
         prof_write();   // ExitProcess runs no atexit handlers
         ExitProcess(0);

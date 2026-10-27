@@ -191,6 +191,8 @@ static void xlate_identity(void) {
 
 // The repository root is the nearest parent of totk.exe that holds build/xlate/totk_xlate.exe. The shader cache lives
 // next to totk.exe, so every build dir has its own (as the pipeline cache, vk_pipeline.c cache_path_init).
+static void use_preload_start(void);
+
 static BOOL CALLBACK init_paths(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     (void)once, (void)param, (void)ctx;
     char exe[PATH_CAP], root[PATH_CAP] = "", exe_dir[PATH_CAP] = "";
@@ -216,6 +218,7 @@ static BOOL CALLBACK init_paths(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s\\shader-cache", exe_dir);
     xlate_identity();
+    use_preload_start();
     return TRUE;
 }
 
@@ -701,13 +704,93 @@ static UseMask use_of(const GfxShader *s) {
 }
 
 // <sha256("TKSU", translator identity, code hash)>.use: masks are per translator.
-static void use_path(const uint8_t h[32], char *p) {
-    uint8_t buf[4 + 32 + 32], name[32];
-    char hex[65];
+static void use_name(const uint8_t h[32], uint8_t name[32]) {
+    uint8_t buf[4 + 32 + 32];
     memcpy(buf, "TKSU", 4), memcpy(buf + 4, xlate_id, 32), memcpy(buf + 36, h, 32);
     rt_sha256(buf, sizeof buf, name);
+}
+
+static void use_path_of(const uint8_t name[32], char *p) {
+    char hex[65];
     key_hex(name, hex);
     snprintf(p, PATH_CAP + 80, "%s\\%s.use", cache_dir, hex);
+}
+
+static void use_path(const uint8_t h[32], char *p) {
+    uint8_t name[32];
+    use_name(h, name);
+    use_path_of(name, p);
+}
+
+// Every .use file of the cache, read by a background thread when the paths are set (use_preload), by file name: a
+// lookup on the render thread then opens no file. Opening one took 0.1 ms alone but 11-40 ms in play, behind the
+// translator's and the pipeline cache's writes and flushes on the same volume, and each new shader of a draw opened one.
+// The table is complete and read-only once use_files_ready is 1; masks found later are in use_buckets.
+#define USE_FILE_BUCKETS 65536
+typedef struct UseFile { struct UseFile *next; uint8_t name[32]; UseMask m; } UseFile;
+static UseFile *use_files[USE_FILE_BUCKETS];
+static volatile LONG use_files_ready;
+
+static UseFile **use_file_slot(const uint8_t name[32]) {
+    UseFile **e = &use_files[(name[0] | name[1] << 8) % USE_FILE_BUCKETS];
+    while (*e && memcmp((*e)->name, name, 32)) e = &(*e)->next;
+    return e;
+}
+
+static int hex_byte(const char *c) {
+    int v = 0;
+    for (int i = 0; i < 2; i++) {
+        int d = isdigit((unsigned char)c[i]) ? c[i] - '0' : c[i] >= 'a' && c[i] <= 'f' ? c[i] - 'a' + 10 : -1;
+        if (d < 0) return -1;
+        v = v << 4 | d;
+    }
+    return v;
+}
+
+static DWORD WINAPI use_preload(void *arg) {
+    (void)arg;
+    uint64_t t0 = plat_now_ns();
+    char pattern[PATH_CAP + 16], p[PATH_CAP + 80];
+    snprintf(pattern, sizeof pattern, "%s\\*.use", cache_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE f = FindFirstFileExA(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    int n = 0, bad = 0;
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            UseFile e = {0};
+            int ok = strlen(fd.cFileName) == 68;
+            for (int i = 0; ok && i < 32; i++) {
+                int v = hex_byte(fd.cFileName + 2 * i);
+                ok = v >= 0, e.name[i] = (uint8_t)v;
+            }
+            uint64_t len = 0;
+            uint32_t *u = NULL;
+            if (ok) {
+                snprintf(p, sizeof p, "%s\\%s", cache_dir, fd.cFileName);
+                u = (uint32_t *)read_file(p, &len);
+                ok = u && len == 20 && u[0] == USE_MAGIC && u[1] == USE_VERSION;
+            }
+            UseFile **slot = ok ? use_file_slot(e.name) : NULL, *x;
+            if (slot && !*slot && (x = malloc(sizeof *x))) {
+                e.m.slots = u[2], e.m.attrs = u[3], e.m.fouts = u[4];
+                *x = e, *slot = x, n++;
+            } else if (!ok) {
+                bad++;
+            }
+            free(u);
+        } while (FindNextFileA(f, &fd));
+        FindClose(f);
+    }
+    InterlockedExchange(&use_files_ready, 1);
+    rt_log("gfx_shader: %d use masks read in %.0f ms on a background thread (%d unreadable)", n,
+           (plat_now_ns() - t0) / 1e6, bad);
+    return 0;
+}
+
+static void use_preload_start(void) {
+    if (!cache_dir[0]) return;
+    HANDLE t = CreateThread(NULL, 0, use_preload, NULL, 0, NULL);
+    if (t) SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL), CloseHandle(t);
 }
 
 static UseEnt **use_slot(const uint8_t h[32]) {         // caller holds cache_lock
@@ -732,13 +815,20 @@ static int use_find(const uint8_t h[32], UseMask *m) {
     if (known) *m = e->m;
     ReleaseSRWLockShared(&cache_lock);
     if (seen) return known;
-    char p[PATH_CAP + 80];
-    use_path(h, p);
-    uint64_t n = 0;
-    uint32_t *f = (uint32_t *)read_file(p, &n);
-    known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
-    if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
-    free(f);
+    uint8_t name[32];
+    use_name(h, name);
+    if (InterlockedCompareExchange(&use_files_ready, 0, 0)) {   // complete: a name not in it has no file
+        UseFile *u = *use_file_slot(name);
+        if ((known = u != NULL)) *m = u->m;
+    } else {
+        char p[PATH_CAP + 80];
+        use_path_of(name, p);
+        uint64_t n = 0;
+        uint32_t *f = (uint32_t *)read_file(p, &n);
+        known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
+        if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
+        free(f);
+    }
     AcquireSRWLockExclusive(&cache_lock);
     use_put(h, known, m);
     ReleaseSRWLockExclusive(&cache_lock);
@@ -917,6 +1007,12 @@ void gfx_shader_drop_memory(void) {
         n_keys = 0;
         for (UseEnt *e = use_buckets[i], *n; e; e = n) n = e->next, free(e);
         use_buckets[i] = NULL;
+    }
+    // the preloaded .use table misses the masks this run wrote, which only use_buckets held: back to the disk
+    InterlockedExchange(&use_files_ready, 0);
+    for (int i = 0; i < USE_FILE_BUCKETS; i++) {
+        for (UseFile *e = use_files[i], *n; e; e = n) n = e->next, free(e);
+        use_files[i] = NULL;
     }
     ReleaseSRWLockExclusive(&cache_lock);
 }
@@ -1626,18 +1722,23 @@ static int rec_append(const char *path, const char *magic, uint32_t version, uin
     return !fclose(f) && ok;
 }
 
+static SRWLOCK rec_io = SRWLOCK_INIT;   // the record files: appends in order, no read during an append
+
 void gfx_shader_record_flush(int force) {
     static volatile LONG64 last;
     LONG64 now = (LONG64)GetTickCount64();
     if (!RC.on || (!force && now - last < 2000)) return;
     last = now;
+    // The files are written outside RC.lock, which the render thread takes to record a new answer.
+    AcquireSRWLockExclusive(&rec_io);
     AcquireSRWLockExclusive(&RC.lock);
     Bytes ans = RC.ans, prg = RC.prg;
     RC.ans = (Bytes){0}, RC.prg = (Bytes){0};
     uint64_t total = RC.pairs.n, added = RC.pairs_new;
+    ReleaseSRWLockExclusive(&RC.lock);
     if (prg.n && !rec_append(RC.prg_path, "TOTKSPRG", PRG_VERSION, 0, &prg)) rt_log("gfx_shader: cannot write %s", RC.prg_path);
     if (ans.n && !rec_append(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ans)) rt_log("gfx_shader: cannot write %s", RC.ans_path);
-    ReleaseSRWLockExclusive(&RC.lock);
+    ReleaseSRWLockExclusive(&rec_io);
     if (ans.n) rt_log("gfx_shader: answers: %zu new records appended (%llu new this run, %llu recorded)", ans.n / ANS_REC,
                       (unsigned long long)added, (unsigned long long)total);
     free(ans.p), free(prg.p);
@@ -1801,9 +1902,9 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
              RC.ans_path);
     uint8_t *ab = NULL, *pb = NULL;
     size_t an = 0, pn = 0;
-    AcquireSRWLockExclusive(&RC.lock);                     // no append meanwhile
+    AcquireSRWLockExclusive(&rec_io);                      // no append meanwhile
     rec_read(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ab, &an);
-    ReleaseSRWLockExclusive(&RC.lock);
+    ReleaseSRWLockExclusive(&rec_io);
     rec_read(prp, "TOTKSPRP", PRP_VERSION, PRP_REC, &pb, &pn);
     size_t na = an / ANS_REC, np = pn / PRP_REC, n = 0;
     GfxWarmEnt *e = calloc(na + np + 1, sizeof *e);

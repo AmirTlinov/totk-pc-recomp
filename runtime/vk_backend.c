@@ -84,7 +84,7 @@ static DWORD WINAPI present_main(void *arg) {
                    j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0);
         last = t1;
         last_queued = j.queued;
-        vk_pipeline_autosave();   // off the render thread, outside the present lock
+        vk_pipeline_autosave();   // starts the autosave thread once
         AcquireSRWLockExclusive(&pl);
     }
     return 0;

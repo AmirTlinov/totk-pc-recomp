@@ -3009,6 +3009,8 @@ void vk_pipeline_stats(VkPipeStats *s) {
     ReleaseSRWLockShared(&P.lock);
 }
 
+static SRWLOCK save_lock = SRWLOCK_INIT;   // one cache save at a time; shutdown takes it to destroy the cache
+
 void vk_pipeline_save(void) {
     if (P.ready) keys_flush();
     if (P.ready && P.gpl) {
@@ -3036,7 +3038,13 @@ void vk_pipeline_save(void) {
     }
     gfx_shader_record_flush(1);
     if (!P.ready || !P.cache || !P.cache_path[0]) return;
-    AcquireSRWLockExclusive(&P.lock);
+    // Not under P.lock: the driver synchronises P.cache, and holding P.lock through the copy and the file write (about
+    // 60 ms on the 1.4.3 fight) stopped every pipeline lookup of the replay, a freeze at each 20 s autosave.
+    AcquireSRWLockExclusive(&save_lock);
+    if (!P.cache) {   // vk_pipeline_shutdown destroyed it
+        ReleaseSRWLockExclusive(&save_lock);
+        return;
+    }
     size_t size = 0;
     void *data = NULL;
     if (vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
@@ -3044,12 +3052,12 @@ void vk_pipeline_save(void) {
         if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
     }
     free(data);
-    ReleaseSRWLockExclusive(&P.lock);
+    ReleaseSRWLockExclusive(&save_lock);
 }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
 // runs: at most every 20 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
-void vk_pipeline_autosave(void) {
+static void autosave_once(void) {
     static uint64_t last_n, last_ms, last_keys;
     if (!P.ready) return;
     uint64_t now = GetTickCount64();
@@ -3061,6 +3069,24 @@ void vk_pipeline_autosave(void) {
     if (s.graphics + s.compute == last_n) return;
     last_n = s.graphics + s.compute, last_ms = now;
     vk_pipeline_save();
+}
+
+// On its own thread: the save (vkGetPipelineCacheData and the file write, about 60 ms) and the key appends (a flush to
+// the disk each) ran on the present thread, and the render thread waited for it to take the next frame.
+static DWORD WINAPI autosave_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(500);
+        autosave_once();
+    }
+}
+
+void vk_pipeline_autosave(void) {
+    static LONG started;
+    if (!P.ready || InterlockedExchange(&started, 1)) return;
+    HANDLE t = CreateThread(NULL, 0, autosave_main, NULL, 0, NULL);
+    if (t) SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL), CloseHandle(t);
+    else rt_log("vk_pipeline: cannot start the autosave thread; the cache is saved at exit only");
 }
 
 void vk_pipeline_shutdown(void) {
@@ -3094,8 +3120,10 @@ void vk_pipeline_shutdown(void) {
         }
         layouts[i] = NULL;
     }
+    AcquireSRWLockExclusive(&save_lock);   // not while the autosave thread copies it
     if (P.cache) vkDestroyPipelineCache(P.device, P.cache, NULL);
     P.cache = VK_NULL_HANDLE;
+    ReleaseSRWLockExclusive(&save_lock);
     memset(&P.stats, 0, sizeof P.stats);
     InterlockedExchange(&P.ready, 0);
     ReleaseSRWLockExclusive(&P.lock);

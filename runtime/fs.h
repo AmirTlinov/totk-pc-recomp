@@ -48,3 +48,5 @@ void fs_host_set_profile(const char *dir);                 // profile directory;
                                                            // (default rt_config()->profile)
 int fs_save_busy(void);                                    // a save is being written: a save file open for writing,
                                                            // or save data changed in the last 3 s and not committed
+void fs_save_flush(void);                                  // wait for a save Commit still running in the background;
+                                                           // every exit path calls it before the process ends

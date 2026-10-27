@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "fs.h"
 #include "gfx.h"
 #include "nvn_api.h"
 #include "vk.h"
@@ -283,6 +284,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     stats_line();
     fflush(stdout);
     fflush(stderr);
+    fs_save_flush();
     vk_pipeline_save();   // no-op without the Vulkan back end
     prof_write();
     fflush(stderr);
