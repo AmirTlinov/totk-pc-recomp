@@ -530,6 +530,34 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     return view;
 }
 
+// An attachment view of a registered texture, kept with its sampled views for the image's lifetime: made per command
+// buffer, every render target's views were created again each frame (vkCreateImageView under vk_exec_pass_begin, 2%
+// of the fight replay on the 7900X). Attachment keys carry a swizzle word no sampled key has (those hold four NVN
+// selectors, each below 8). The texture lock guards the tables, as for get_view; vk_exec_pass_begin may already hold it.
+VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageViewType type, uint32_t aspect,
+                                uint32_t level, uint32_t base, uint32_t layers, int blocks) {
+    ViewKey k = {img->image, format, type, aspect, level, 1, base, layers, blocks ? 0xfffffffeu : 0xffffffffu};
+    vk_texture_lock();
+    if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
+    VkImageView view = (VkImageView)nvn_hm_get(&view_of, &k);
+    if (!view) {
+        VkImageViewCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img->image,
+                                    .viewType = type, .format = format, .subresourceRange = {aspect, level, 1, base, layers}};
+        VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+                                          .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        if (blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
+        if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
+            rt_fatal("vk: render target view (format %d) could not be created", (int)format);
+        ViewNode *n = malloc(sizeof *n);
+        if (!n) rt_fatal("vk: out of memory");
+        *n = (ViewNode){nvn_hm_get(&views_by_image, &img->image), k, view};
+        nvn_hm_put(&views_by_image, &img->image, n);
+        nvn_hm_put(&view_of, &k, (void *)view);
+    }
+    vk_texture_unlock();
+    return view;
+}
+
 void vk_exec_image_gone(VkImage image) {
     if (!views_by_image.klen) return;
     for (ViewNode *n = nvn_hm_del(&views_by_image, &image), *next; n; n = next) {

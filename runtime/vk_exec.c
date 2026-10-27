@@ -264,7 +264,11 @@ static void resolve_rt(VkExec *ex) {
     ex->pipe.samples = (uint8_t)ex->pass_samples;
 }
 
+// The attachment view of a target. A registered texture's view lives as long as its image (vk_exec_target_view); any
+// other image's view is made for this command buffer and freed at its fence.
 static VkImageView view_of(VkExec *ex, const VkExecTarget *t) {
+    if (t->img && t->img->image == t->image)
+        return vk_exec_target_view(t->img, t->format, t->view_type, t->aspect, t->level, t->base_layer, t->layers, t->blocks);
     ViewEnt *v = ex->views;
     for (int i = 0; i < ex->nviews; i++)
         if (v[i].image == t->image && v[i].format == t->format && v[i].type == t->view_type && v[i].aspect == t->aspect &&
