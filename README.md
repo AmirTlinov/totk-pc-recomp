@@ -16,7 +16,7 @@ The Switch code is lifted from ARM64 to C ahead of time, compiled with Clang, an
 
 ## Status
 
-This is an early build: version 1.2.1 starts, loads saves and runs in the world at 60 fps with keyboard, mouse or gamepad input and with sound, and it has been tested on AMD, NVIDIA and Intel GPUs. Visual bugs and crashes are expected; the known ones are listed in [docs/backlog.md](docs/backlog.md). No release has been published yet, and macOS, Linux, other game versions and an in-game settings menu are not supported yet.
+This is an early build: version 1.2.1 starts, loads saves and runs in the world at 60 fps with keyboard, mouse or gamepad input and with sound, and it has been tested on AMD, NVIDIA and Intel GPUs. Visual bugs and crashes are expected. No release has been published yet, and macOS, Linux, other game versions and an in-game settings menu are not supported yet.
 
 To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md). Testers: [docs/tester-guide.md](docs/tester-guide.md) says what to send back.
 
@@ -32,86 +32,18 @@ To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## How this project is made
 
-Most of the code and documentation here is written by AI coding agents (Claude Code) under the maintainer's direction. The maintainer sets the goals, plays every build, decides what is merged and reviews the result; the agents read the upstream code, write and test the changes and measure them. [AGENTS.md](AGENTS.md) and [docs/agent-playbook.md](docs/agent-playbook.md) are the rules they work under. The same standards apply to every contribution, whoever or whatever wrote it: [CONTRIBUTING.md](CONTRIBUTING.md).
+Most of the code and documentation here is written by AI coding agents (Claude Code) under the maintainer's direction. The maintainer sets the goals, plays every build, decides what is merged and reviews the result; the agents read the upstream code, write and test the changes and measure them. [AGENTS.md](AGENTS.md) holds the rules they work under. The same standards apply to every contribution, whoever or whatever wrote it: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
 
 - Players and testers: [controls](docs/controls.md), [tester guide](docs/tester-guide.md).
-- How it works: [architecture](docs/architecture.md), with research notes on the upstream projects, Maxwell GPU behaviour and what other ports learned in [docs/research/](docs/research/).
-- What is being worked on: [backlog](docs/backlog.md).
-- Building: [toolchain-windows.md](docs/toolchain-windows.md), [toolchain-msys2-python.md](docs/toolchain-msys2-python.md), and the [installer](docs/installer.md) that builds the game on a player's machine.
-- Coding agents: [AGENTS.md](AGENTS.md) and [docs/agent-playbook.md](docs/agent-playbook.md).
+- How it works: [architecture](docs/architecture.md), and the [Maxwell GPU behaviour](docs/maxwell.md) the Vulkan back end has to match.
+- Building: [building](docs/building.md), and the [installer](docs/installer.md) that builds the game on a player's machine.
+- Coding agents: [AGENTS.md](AGENTS.md).
 
 ## Building from source
 
-Windows 10 or later, an x86-64 CPU with AVX2, and a GPU with Vulkan 1.3 and `VK_EXT_external_memory_host`. Allow about 60 GB for the work folder. Extraction wants about 55 GB free while it runs and keeps about 35 GB afterwards.
-
-Install the toolchain from [docs/toolchain-windows.md](docs/toolchain-windows.md) and [docs/toolchain-msys2-python.md](docs/toolchain-msys2-python.md): MSYS2 UCRT64 (Clang, Ninja, SDL3, Vulkan, shaderc), Python 3.12 and 3.14, the Vulkan SDK, the .NET 10 SDK, Visual Studio Build Tools, and hactool. A 32-bit `cmake` or `ninja` earlier on `PATH` will be picked up by accident; the build calls the MSYS2 copies itself.
-
-From the repository root, in PowerShell:
-
-1. Python environments (once):
-
-   ```powershell
-   uv venv --python 3.12 .venv
-   uv pip install --python .venv/Scripts/python.exe -r tools/requirements.txt
-   uv venv --python 3.14 .venv-py314
-   uv pip install --python .venv-py314/Scripts/python.exe -r tools/requirements-py314.txt
-   ```
-
-2. Copy `config.example.toml` to `config.local.toml` and set the paths to your base game, the 1.2.1 update and `prod.keys`. `config.local.toml` is ignored by git. The tools read the keys file themselves.
-
-3. Extract and verify:
-
-   ```powershell
-   .venv-py314\Scripts\python tools\extract.py
-   ```
-
-   This writes `build\extracted\v0` (base 1.0.0) and `build\extracted\v121` (1.2.1). A hash mismatch stops the run.
-
-4. Shader translator (once; no game files):
-
-   ```powershell
-   .venv\Scripts\python tools\build_xlate.py
-   ```
-
-   This publishes `build\xlate\totk_xlate.exe`.
-
-5. Lift the 1.2.1 modules, then compile and link:
-
-   ```powershell
-   .venv\Scripts\python recomp\gen.py --exefs build\extracted\v121\exefs --out generated\v121 --patches recomp\patches-v121.txt
-   .venv-py314\Scripts\python tools\make_romfs_patches.py
-   .venv\Scripts\python tools\build_game.py
-   ```
-
-   `--patches` builds in the 60 fps and frame-step patches; `make_romfs_patches.py` writes their RomFS half to `build\v121\romfs-patches`. The link copies `SDL3.dll`, `libiconv-2.dll` and `libopus-0.dll` next to the exe.
-
-6. Prepare the shaders (once per build). It needs `refs\MacNativeGames` (`tools\fetch_refs.sh`) for the shared shader list:
-
-   ```powershell
-   .venv-py314\Scripts\python tools\prepare_shaders.py build\v121
-   ```
-
-   Without this step the first launch compiles shaders and pipelines during play and stutters until the caches fill.
-
-7. Package a portable folder (optional):
-
-   ```powershell
-   .venv\Scripts\python tools\package_build.py
-   ```
-
-   This writes `build\v121-portable`, which runs on another of your machines without MSYS2, Python or .NET. `romfs.bin` stays out unless you pass `--with-romfs`; otherwise put it in `romfs\` next to the exe or point `TOTK_ROMFS` at its folder. After copying, run `totk.exe --prepare-shaders` once in the new folder, because the driver keeps its pipeline cache per exe path. The folder holds game code and data derived from your game: it is for your own machines only, never share it.
-
-8. Run:
-
-   ```powershell
-   build\v121\totk.exe
-   ```
-
-   Keep the window in the foreground; an unfocused window stalls the game. Close the window to quit.
-
-`build\v121\totk.exe --selftest` checks the build without game files.
+Windows 10 or later, an x86-64 CPU with AVX2, a Vulkan 1.3 GPU and about 60 GB of disk. [docs/building.md](docs/building.md) lists the toolchain (MSYS2 UCRT64 Clang, Python 3.12 and 3.14, .NET 10, the Vulkan SDK, hactool) and the steps: extract and verify your game files, build the shader translator, lift the modules to C, compile and link `build\v121\totk.exe`, prepare the shaders.
 
 Settings live in `totk.ini` next to `totk.exe`; copy [totk.ini.example](totk.ini.example), which lists them, and edit it. A `TOTK_*` environment variable of the same name overrides the file (`TOTK_FPS_LIMIT=30` beats `fps_limit = 60`). Saves go to `build\profile`, created on first use. Everything the build writes stays under `build\` and `generated\`, which git ignores.
 
@@ -136,8 +68,6 @@ This project stands on two MIT codebases and the projects they came from. Code t
 - **[SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp)** (MIT), a static recompilation of *Breath of the Wild*, is the model for preemption at indirect calls and a reference for frame pacing and the platform split.
 - The Switch homebrew community's documentation ([Switchbrew](https://switchbrew.org)).
 
-Research notes on each of them: [docs/research/](docs/research/).
-
 ## Legal
 
 TotK Recomp is an independent, non-commercial fan project. It is not affiliated with, endorsed by or sponsored by Nintendo. *The Legend of Zelda*, *Tears of the Kingdom* and *Nintendo Switch* are trademarks of Nintendo.
@@ -148,7 +78,7 @@ No game files, game code, assets, shaders, fonts or keys are included in this re
 
 The project's own code is under the [MIT License](LICENSE). The license covers this project's code only and grants nothing for Nintendo's game, which you supply yourself.
 
-Third-party code keeps its own license. The full list, with the commit each copy was taken from, is [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). A local build links or ships these pieces (versions are the MSYS2 UCRT64 packages the toolchain doc was written against; a newer package from the same source is fine):
+Third-party code keeps its own license. The full list, with the commit each copy was taken from, is [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). A local build links or ships these pieces (versions are the MSYS2 UCRT64 packages [docs/building.md](docs/building.md) was verified with; a newer package from the same source is fine):
 
 | Component | Version | License | How it is used |
 |---|---|---|---|

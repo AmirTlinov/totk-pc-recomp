@@ -211,13 +211,13 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
 21. **Report timestamps: unit and instant.** `write_counter` (`vk_exec_xfer.c`) writes host `ns * 12 / 625` (19.2 MHz
     ticks) at fence completion for every report; `nvnDeviceGetTimestampInNanoseconds` converts back with the same factor
     (`nvn_ext.c`). DK3D: GPU ticks convert at 625/384 ns (614.4 MHz), TIMESTAMP is written when the ROP has retired
-    the earlier work, TIMESTAMP_TOP when the command processor reaches it (4.2). Two consequences for port-lessons T1:
+    the earlier work, TIMESTAMP_TOP when the command processor reaches it (4.2). Two consequences for the engine's GPU time (dynamic resolution and speed follow it):
     (a) if the 1.2.1 consumer scales raw report ticks with its own constant rather than the NVN conversion call, our
     19.2 MHz unit is 32x off from the hardware's; find that consumer before fixing the unit; (b) the delta needs
     `vkCmdWriteTimestamp2` with `TOP_OF_PIPE` for TIMESTAMP_TOP and `BOTTOM_OF_PIPE` for TIMESTAMP, per submission
     segment, converted to whichever unit (a) shows. **Mismatch (instant); unit unverified.**
 
-## 8. Sources not read yet (TODO)
+## 8. Sources not read yet
 
 - Mesa NVK (`src/nouveau/vulkan`, MIT): how it maps Vulkan provoking vertex, depth clip, restart, feedback loops onto B197.
 - envytools rnndb `graph/gf100_3d.xml`, `tsc.xml`, `tic.xml` (MIT): field-level TIC/TSC meanings (LOD snap, trilinear opt).

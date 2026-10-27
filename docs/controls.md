@@ -51,14 +51,18 @@ The stick direction bits (`StickLLeft` to `StickRDown`) are derived from the sti
 
 ## Scripted input
 
-`TOTK_INPUT_SCRIPT=<file>` replays presses by presented-frame number (`gfx_counters.frames`). It is ORed with real input and still applies under `TOTK_INPUT=none`. One event per line, `#` starts a comment:
+`TOTK_INPUT_SCRIPT=<file>` replays presses. It is ORed with real input and still applies under `TOTK_INPUT=none`. One event per line, `#` starts a comment:
 
 ```
 <frame> <button> [hold_frames]            # A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LCLICK RCLICK; hold defaults to 4
 <frame> LSTICK|RSTICK <x> <y> [hold_frames]   # -32767..32767, up is +y
+@<ms> <button> [hold_ms]                  # timed on the world clock
+@<ms> LSTICK|RSTICK <x> <y> [hold_ms]
 ```
 
-Each event logs once (`input: script frame N: A`). `tools/input/load_save.txt` loads the first save from the title screen.
+`<frame>` counts presented frames. `@<ms>` counts milliseconds of the world clock: game time stepped since the end of the first save load (the player leaves the title screen's origin), so a timed event lands at the same game time at any frame rate and load length. A later load, such as fast travel, still shifts what follows. Each event logs once (`input: script frame N: A`). `tools/input/load_save.txt` loads the first save from the title screen.
+
+`TOTK_INPUT_RECORD=<file>` (`input_record` in `totk.ini`, or Input recording in the menu) writes the merged input in the same format, one line per button press and per stick segment: events before the world clock starts by frame, the rest timed. The file replays as a script, which makes it the repro to attach to a bug report.
 
 ## RenderDoc capture (blocked)
 

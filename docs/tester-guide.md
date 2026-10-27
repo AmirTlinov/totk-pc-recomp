@@ -13,16 +13,13 @@ from it may be shared.
 
 ## Build
 
-1. Install the toolchain: [toolchain-windows.md](toolchain-windows.md) and
-   [toolchain-msys2-python.md](toolchain-msys2-python.md).
-2. Follow steps 1-5 of "Building from source" in the [README](../README.md): Python environments, `config.local.toml`
-   with your own paths, extraction, the shader translator, then lifting and linking. The result is
+1. Follow [building.md](building.md): the toolchain, then build steps 1-6 (Python environments, `config.local.toml`
+   with your own paths, extraction, the shader translator, lifting and linking, shader preparation). The result is
    `build\v121\totk.exe`.
-3. Check the build without the game: `build\v121\totk.exe --selftest` must print a pass.
-4. To run the build on another of your machines, package a portable folder as in step 7 of "Building from source"
-   in the README, and run `totk.exe --prepare-shaders` once in the copied folder. The folder holds game code: for your
-   own machines only.
-5. The installer ([installer.md](installer.md)) is the other route to a machine without the toolchain: it builds the
+2. Check the build without the game: `build\v121\totk.exe --selftest` must print a pass.
+3. To run the build on another of your machines, package a portable folder ([building.md](building.md), "Portable
+   folder"). The folder holds game code: for your own machines only.
+4. The installer ([installer.md](installer.md)) is the other route to a machine without the toolchain: it builds the
    game there from your own files. No installer release is published yet.
 
 ## Run and collect the log
@@ -37,7 +34,8 @@ build\v121\totk.exe 2> totk-log.txt
 `TOTK_VK_VALIDATION=1` turns on the Vulkan validation layer (it comes with the Vulkan SDK). It makes the game slower;
 do one run with it and one without (`set TOTK_VK_VALIDATION=`).
 
-Keep the window in the foreground: an unfocused window stalls the game. The first launch spends minutes on shaders.
+Keep the window in the foreground: an unfocused window stalls the game. Shaders the preparation did not cover compile on first use, so
+the first minutes of play can stutter.
 Play into the open field (load a save, walk around for a minute, fight something if you can), then close the window.
 
 ## Choosing the GPU
@@ -57,6 +55,8 @@ The line `vk: using gpu N: <name>` says which one ran.
 3. What you saw: how far it got (menu, loading, field), roughly how smooth it ran, and screenshots of anything wrong
    (black or missing areas, flickering, wrong colours, missing grass). Win+Shift+S is fine.
 4. If it crashed or hung: the last 50 lines of the log and what you were doing.
+5. For a bug you can trigger again: a recording of your input (`set TOTK_INPUT_RECORD=input.txt`, see
+   [controls.md](controls.md), "Scripted input") and the save you started from.
 
 ## Switches for the developer's questions
 
