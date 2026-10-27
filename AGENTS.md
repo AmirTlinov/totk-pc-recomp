@@ -27,6 +27,7 @@ Read the note before working on its area; each cites `file:line` in `refs/`.
 - Other ports and recompilers: [docs/research/prior-art.md](docs/research/prior-art.md)
 - Sizes, function and instruction counts, OS touch-points of the 1.2.1 modules: [docs/research/totk-v121-inventory.md](docs/research/totk-v121-inventory.md)
 - Maxwell GPU semantics our Vulkan path must match, TotK bugs other ports and emulators fixed: [docs/research/maxwell.md](docs/research/maxwell.md)
+- Windows host costs (timers, file I/O and flushes, thread sampling, VMA allocation, bit flips, run-to-run spread): read before adding a wait, file access or allocation on a game or render thread, or comparing frame times: [docs/research/windows-host.md](docs/research/windows-host.md)
 - Symptoms other ports already solved (artifacts, crashes, pacing, scheduling) and whether we have the fix; search it before investigating any symptom: [docs/research/port-lessons.md](docs/research/port-lessons.md)
 
 ## Toolchain
