@@ -44,7 +44,7 @@ runtime is libc++ from llvm-mingw. Such a build never reuses another build's gen
 
 Split build. --make-runtime-lib compiles only runtime/ into <out>/libtotkrt.a (what CI prebuilds). --runtime-lib PATH
 then compiles only the generated C and the install-time files (modules.c and INSTALL_SIDE, which bake the player's
-game hashes in) and links them with that library. The library holds no game-derived data.
+game hashes and version in) and links them with that library. The library holds no game-derived data.
 
 Standard library only.
 """
@@ -84,7 +84,9 @@ VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package 
 LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lvulkan-1', '-lSDL3', '-lopus',
                   '-l:libvpx.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
 DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
-INSTALL_SIDE = {'romfs.c'}   # runtime sources that include romfs_config.h: compiled per install, not in the library
+# Runtime sources compiled per install, not in the library: romfs.c includes romfs_config.h, patches.c the patches.h
+# of the player's game version (its patch page is the page after that version's main).
+INSTALL_SIDE = {'romfs.c', 'patches.c'}
 LIB_NAME = 'libtotkrt.a'
 AR = UCRT / 'llvm-ar.exe'
 WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
