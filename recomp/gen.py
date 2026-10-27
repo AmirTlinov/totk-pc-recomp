@@ -205,10 +205,11 @@ def partition(est, max_fns, max_bytes, big_fn):
 class Emitter:
     """C for the functions of one module. starts is the set of every function start of the module."""
 
-    def __init__(self, mod, starts, patched=None):
+    def __init__(self, mod, starts, patched=None, spins=None):
         self.mod = mod
         self.starts = starts
         self.patched = patched or {}   # {address: (set index, [replacement words])} (recomp/patches.py)
+        self.spins = spins or {}       # {spin wait back-edge: its head} (recomp/patches.py `spin`)
         self.uses_patches = False
         self.stats = Counter()
         self.unsupported = Counter()
@@ -316,10 +317,12 @@ class Emitter:
                 out.append(patch(ins, a))
             elif k == 'op' or k == 'trap':
                 out.append('    ' + ins.code)
-            elif k == 'b':
-                out.append('    ' + jump(ins.target))
-            elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+            elif k in ('b', 'bcond'):
+                j = jump(ins.target)
+                if self.spins.get(a) == ins.target and entry <= ins.target < end:
+                    j = f'rt_spin_gate(c, {hx(ins.target)}); {j}'   # a pass of a spin wait
+                    self.stats['spin_gates'] += 1
+                out.append('    ' + j if k == 'b' else f'    if ({ins.cond}) {{ {j} }}')
             elif k == 'bl':
                 out.append('    ' + call(ins.target, a))
             elif k == 'blr':
@@ -414,7 +417,7 @@ def _emitter(name):
         path, base = _W['mods'][name]
         mod = Module(name, path, base, 'c')
         e = _W['emitters'][name] = Emitter(mod, set(_W['starts'][name].tolist()),
-                                           _W['patches'].for_module(name, base))
+                                           _W['patches'].for_module(name, base), _W['patches'].spins_for(name, base))
     return e
 
 
@@ -562,6 +565,7 @@ def main():
                 'br_dispatch': stats['br_dispatch'],
                 'traps': stats['traps'],
                 'patched_sites': stats['patched_sites'],
+                'spin_gates': stats['spin_gates'],
                 'unsupported': stats['unsupported'],
                 'external_branches': stats['external_branches'],
                 'external_calls': stats['external_calls'],

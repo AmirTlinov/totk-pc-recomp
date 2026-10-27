@@ -10,7 +10,11 @@ PC reaches the sentinel. A case is skipped when Unicorn faults, writes outside t
 mapped read-only), leaves the function, or runs longer than --steps instructions. Compares X0-X30, SP, NZCV, V0-V31
 and the scratch buffer.
 
+With --patches, the spin waits of the table (recomp/patches.py `spin`) are emitted with their gates, and functions
+that hold one come first (a quarter of the picks at most); a case whose loop does not leave runs into --steps.
+
 Usage: func.py [--exefs DIR] [--modules main,subsdk0,sdk] [--functions N] [--cases K] [--seed S] [--jobs J]
+               [--patches FILE]
 """
 import argparse
 import os
@@ -29,6 +33,7 @@ from unicorn import arm64_const as A
 
 from common import BUF, BUF_SIZE, MSYS_BIN, ROOT, Emu, compiler, diff_state, rand_fpcr, rand_v, rand_x, run_harness
 import gen
+import patches
 from layout import layout
 from module import Module
 
@@ -60,8 +65,9 @@ def simd_mask(w):
     return ((w & 0x0E000000) == 0x0E000000) | (((w & 0x0A000000) == 0x08000000) & (((w >> 26) & 1) == 1))
 
 
-def pick_functions(name, mod, count, r):
-    """[(entry, end, tags)] of up to count leaf functions of mod, plus the Emitter that will emit them."""
+def pick_functions(name, mod, count, r, spins=None):
+    """[(entry, end, tags)] of up to count leaf functions of mod, plus the Emitter that will emit them. spins: {spin
+    wait back-edge: head}, emitted with gates."""
     starts, _ = gen.discover(mod)
     w = mod.words
     ends = np.append(starts[1:], len(w))
@@ -78,18 +84,26 @@ def pick_functions(name, mod, count, r):
     rest = [int(i) for i in cand if not has_br[i]]
     r.shuffle(with_br)
     r.shuffle(rest)
-    emitter = gen.Emitter(mod, set((mod.lo + starts * 4).tolist()))
+    spins = spins or {}
+    gated = np.searchsorted(mod.lo + starts * 4, np.array(sorted(spins), dtype=np.int64), side='right') - 1
+    with_spin = sorted({int(i) for i in gated} & set(cand.tolist()))
+    r.shuffle(with_spin)
+    emitter = gen.Emitter(mod, set((mod.lo + starts * 4).tolist()), None, spins)
     picks, tags_seen = [], Counter()
-    # Functions with a br first (jump tables, fallbacks), at most a quarter of the picks.
-    for pool, quota in ((with_br, count // 4), (rest, count)):
+    # Functions with a spin wait first, then with a br (jump tables, fallbacks), at most a quarter of the picks each.
+    for pool, quota in ((with_spin, count // 4), (with_br, count // 4), (rest, count)):
         taken = 0
         for i in pool:
             if len(picks) >= count or taken >= quota:
                 break
             entry, end = mod.lo + int(starts[i]) * 4, mod.lo + int(ends[i]) * 4
+            if any(e == entry for e, _, _ in picks):
+                continue
             tags = check_function(emitter, entry, end)
             if tags is None:
                 continue
+            if any(spins.get(x) is not None for x in range(entry, end, 4)):
+                tags.add('spin_gate')
             picks.append((entry, end, tags))
             tags_seen.update(tags)
             taken += 1
@@ -241,6 +255,7 @@ def main():
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--show', type=int, default=20)
+    ap.add_argument('--patches', type=Path, help='patch table whose spin waits are emitted with their gates')
     ap.add_argument('--cflags', default='-march=x86-64-v3' if platform.machine().lower() in ('amd64', 'x86_64') else '')
     args = ap.parse_args()
     r = random.Random(args.seed)
@@ -250,14 +265,16 @@ def main():
     work = ROOT / 'build' / 'test' / 'func'
     work.mkdir(parents=True, exist_ok=True)
     images, emitted, tags = [], [], []
-    for name, base, _ in layout(args.exefs):
+    mods = layout(args.exefs)
+    table = patches.load(args.patches, mods) if args.patches else patches.Table()
+    for name, base, _ in mods:
         if name not in want:
             continue
         mod = Module(name, args.exefs / name, base, 'c')
         img = work / f'{name}.img'
         img.write_bytes(mod.image)
         images.append((base, img, mod.image))
-        picks, emitter = pick_functions(name, mod, args.functions, r)
+        picks, emitter = pick_functions(name, mod, args.functions, r, table.spins_for(name, base))
         for entry, end, t in picks:
             emitted.append((name, entry, end, emitter))
             tags.append(t)
