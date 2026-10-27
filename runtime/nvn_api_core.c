@@ -24,8 +24,15 @@
 #define EVENT_MAGIC MAGIC('E', 'V', 'N', 'T')
 
 // ---------- shared helpers (nvn_api.h)
+// The call count goes to the shared counter 1024 at a time: the main thread and the job workers all record command
+// buffers, and one locked add per call kept the counter's cache line moving between their cores (0.8k samples a
+// fight). The count lags by at most 1023 calls per thread.
 void nvn_called(uint8_t *seen, const char *name) {
-    __atomic_fetch_add(&gfx_counters.nvn_calls, 1, __ATOMIC_RELAXED);
+    static _Thread_local uint32_t calls;
+    if (++calls == 1024) {
+        __atomic_fetch_add(&gfx_counters.nvn_calls, calls, __ATOMIC_RELAXED);
+        calls = 0;
+    }
     if (__atomic_load_n(seen, __ATOMIC_RELAXED) || __atomic_exchange_n(seen, 1, __ATOMIC_RELAXED)) return;
     uint64_t n = __atomic_add_fetch(&gfx_counters.nvn_distinct, 1, __ATOMIC_RELAXED);
     NVN_LOG("first call %llu: %s", (unsigned long long)n, name);
