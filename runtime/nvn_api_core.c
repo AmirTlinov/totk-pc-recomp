@@ -267,7 +267,11 @@ NVN_API(nvnMemoryPoolBuilderSetStorage) {
 // void nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder *b, int flags)
 NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags = (uint32_t)arg_x(c, 1); }
 // NVNboolean nvnMemoryPoolInitialize(NVNmemoryPool *p, const NVNmemoryPoolBuilder *b)
+// Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
+// loader threads, which held a virtual core through it while job workers waited (TOTK_CORE_DIAG). The thread gives
+// the core up, as for any blocking host call.
 NVN_API(nvnMemoryPoolInitialize) {
+    NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
     memset(o, 0, sizeof *o);
@@ -297,6 +301,7 @@ NVN_API(nvnMemoryPoolInitialize) {
 }
 // void nvnMemoryPoolFinalize(NVNmemoryPool *p)
 NVN_API(nvnMemoryPoolFinalize) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC) return;
     if (pool_gpu_visible(o)) index_del(o);
@@ -372,6 +377,7 @@ static int check_request(const pool_t *v, const nvn_mapping_t *r, int i) {
 }
 // NVNboolean nvnMemoryPoolMapVirtual(NVNmemoryPool *p, int n, const NVNmappingRequest *requests)
 NVN_API(nvnMemoryPoolMapVirtual) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *v = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
     const nvn_mapping_t *r = arg_p(c, 2);

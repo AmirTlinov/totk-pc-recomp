@@ -25,6 +25,7 @@ typedef struct {
     GuestFn fn;
     uint64_t original;   // observers: the guest definition rt_original calls
     uint64_t calls;
+    int blocking;        // runs with the virtual core given up (hostfn_blocking)
 } Slot;
 static Slot slots[MAX_HOSTFN];
 static int nslots;
@@ -82,7 +83,7 @@ uint64_t hostfn_register(const char *name, GuestFn fn) {
     if (nslots == MAX_HOSTFN) rt_fatal("hostfn_register: more than %d host functions", MAX_HOSTFN);
     uint64_t a = slot_addr(nslots);
     if (a >= RT_RET_HOST) rt_fatal("hostfn_register: host-function window full");
-    slots[nslots] = (Slot){.name = name, .fn = fn};
+    slots[nslots] = (Slot){.name = name, .fn = fn, .blocking = !strncmp(name, "_ZN2nn2fs", 9)};
     rt_register_host(a, hostfn_entry);
     nslots++;
     return a;
@@ -120,6 +121,16 @@ __attribute__((noinline)) static void hostfn_tracked(Cpu *c, GuestFn fn) {
     if (!n && kern_preempt_pending(t)) kern_host_left(t);
 }
 
+// nn::fs: the call waits for the disk and the OS, and on the Switch it is an IPC request that blocks its thread, so
+// the thread gives its virtual core up for it. TOTK_CORE_DIAG found the game's loader threads (priority 58) holding
+// a core through CloseFile and CreateCacheStorage while job workers and better threads waited 2-6 ms for it.
+__attribute__((noinline)) static void hostfn_blocking(Cpu *c, GuestFn fn) {
+    int away = kern_core_away();
+    if (kern_host_track && c->thread) hostfn_tracked(c, fn);
+    else fn(c);
+    kern_core_back(&away);
+}
+
 static void hostfn_entry(Cpu *c) {
     uint64_t i = (c->pc - RT_HOSTFN_BASE) >> 4;
     if (__builtin_expect((c->pc & 15) || i >= (uint64_t)nslots, 0)) bad_entry(c);
@@ -128,6 +139,10 @@ static void hostfn_entry(Cpu *c) {
     if (__builtin_expect(!n && (rt_trace & RT_TRACE_HOSTCALL), 0)) {
         char lr[96];
         rt_log("host call %s from %s", s->name, ldr_describe(c->x[30] - 4, lr, sizeof lr));
+    }
+    if (s->blocking) {
+        hostfn_blocking(c, s->fn);
+        return;
     }
     if (__builtin_expect(kern_host_track && c->thread, 0)) {
         hostfn_tracked(c, s->fn);

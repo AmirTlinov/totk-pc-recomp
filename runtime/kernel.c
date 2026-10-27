@@ -104,6 +104,7 @@ struct RtThread {
     uint64_t dg_host_end;      // as an owner: the return from the host call or SVC it was in at the request
     uint64_t dg_pc, dg_lr;     // as an owner: guest pc and lr at the checkpoint that gave the core up
     int dg_host_kick;          // as an owner: in a host call or SVC at the request
+    uint32_t dg_svc;           // the thread's latest SVC (TOTK_CORE_DIAG: what an owner in a host call is in)
     struct DgRel { uint64_t kick, host_end, pc, lr; int host, pre, prio; uint32_t h; } dg_rel;   // as a waiter: the
                                                                                                  // owner that released
 };
@@ -627,7 +628,7 @@ static void dg_done(RtThread *t) {
     while (b < DG_NB - 1 && w >= dg_edge[b]) b++;
     g_dgw.n[top]++;
     g_dgw.hist[top][b]++;
-    if (part[DG_GAME] >= 2000000 && g_dg_lines < DG_LONG_LINES) {
+    if ((part[DG_GAME] >= 2000000 || part[DG_HOST] >= 2000000) && g_dg_lines < DG_LONG_LINES) {
         g_dg_lines++;
         char a[128], l[128];
         rt_log("core-diag: wait %.2f ms (game %.2f host %.2f): %#x p%d mask %llx; released by %#x p%d%s at %s lr %s",
@@ -639,8 +640,8 @@ static void dg_done(RtThread *t) {
     memset(&t->dg_rel, 0, sizeof t->dg_rel);
 }
 
-// Once per long DG_GAME wait: where the owner's host thread runs (exe RVA). Holding G; the owner is resumed before
-// anything that could take a lock it holds.
+// Once per long DG_GAME or DG_HOST wait: where the owner's host thread runs (module and offset), its latest SVC and
+// its guest lr. Holding G; the owner is resumed before anything that could take a lock it holds.
 static void dg_sample(RtThread *t) {
     RtThread *o = t->target;
     if (!o || o->cur_core < 0 || !o->tid || g_dg_samples >= DG_SAMPLES) return;
@@ -658,9 +659,17 @@ static void dg_sample(RtThread *t) {
     CloseHandle(h);
     if (!ok) return;
     g_dg_samples++;
-    uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
-    rt_log("core-diag: sample owner %#x p%d depth %d rip exe+%#llx (waiter %#x p%d, %.2f ms)", o->handle, o->prio, depth,
-           (unsigned long long)(ctx.Rip - base), t->handle, t->prio, (kern_now_ns() - t->dg_since) / 1e6);
+    HMODULE m = NULL;
+    wchar_t mw[MAX_PATH] = L"?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(uintptr_t)ctx.Rip, &m) && m)
+        GetModuleFileNameW(m, mw, MAX_PATH);
+    const wchar_t *mn = wcsrchr(mw, L'\\') ? wcsrchr(mw, L'\\') + 1 : mw;
+    char lr[128];
+    rt_log("core-diag: sample owner %#x p%d depth %d rip %ls+%#llx, last svc %#x, guest lr %s (waiter %#x p%d, %s, "
+           "%.2f ms)", o->handle, o->prio, depth, mn, (unsigned long long)(ctx.Rip - (uintptr_t)m), o->dg_svc,
+           o->cur ? ldr_describe(o->cur->x[30], lr, sizeof lr) : "-", t->handle, t->prio,
+           t->dg_cls == DG_HOST ? "host" : "game", (kern_now_ns() - t->dg_since) / 1e6);
 }
 
 
@@ -875,7 +884,7 @@ static void core_take(RtThread *t) {
     while (t->cur_core < 0) {
         DWORD ms = INFINITE;
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
-        int sample = g_diag > 0 && !sampled && t->dg_cls == DG_GAME;
+        int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST);
         if (sample && ms == INFINITE) ms = 2;
         SleepConditionVariableSRW(&t->cv, &G, ms, 0);
         if (sample && t->cur_core < 0 && kern_now_ns() - t->dg_since >= 2000000) {
@@ -1426,6 +1435,7 @@ static void cv_hook(void) {
 
 int kern_svc(Cpu *c, uint32_t imm) {
     uint64_t *x = c->x;
+    if (g_diag > 0 && tcur) tcur->dg_svc = imm;
     switch (imm) {
     case 0x08: {   // CreateThread(-> w1 handle; x1 entry, x2 arg, x3 stack top, w4 priority, w5 core)
         int prio = (int)x[4], core = (int)x[5];

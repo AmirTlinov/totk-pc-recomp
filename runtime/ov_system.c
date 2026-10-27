@@ -327,7 +327,8 @@ static void obs_main(Cpu *c) { observe(c, "nnMain"); }
 static void obs_address_region(Cpu *c) {
     uint64_t *out = arg_p(c, 0), size = arg_x(c, 1);
     uint32_t r = (uint32_t)rt_original(c);
-    rt_log("AllocateAddressRegion size %#llx result %#x address %#llx", (unsigned long long)size, r,
+    if (rt_trace & RT_TRACE_HOSTCALL)   // 20,000 lines a session otherwise, each a write on a game thread
+        rt_log("AllocateAddressRegion size %#llx result %#x address %#llx", (unsigned long long)size, r,
            (unsigned long long)(r || !out ? 0 : *out));
 }
 
@@ -335,7 +336,8 @@ static void obs_address_region(Cpu *c) {
 static void obs_memory_pages(Cpu *c) {
     uint64_t a = arg_x(c, 0), size = arg_x(c, 1);
     uint32_t r = (uint32_t)rt_original(c);
-    rt_log("AllocateMemoryPages address %#llx size %#llx result %#x", (unsigned long long)a, (unsigned long long)size, r);
+    if (rt_trace & RT_TRACE_HOSTCALL)
+        rt_log("AllocateMemoryPages address %#llx size %#llx result %#x", (unsigned long long)a, (unsigned long long)size, r);
 }
 
 // ==== nn::account (account.c): one offline local user whose Uid survives restarts in <profile>/account.uid
