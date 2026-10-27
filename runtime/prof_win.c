@@ -48,6 +48,8 @@ static volatile LONG stop, written;
 static uintptr_t exe_lo, exe_hi;
 static volatile DWORD render_tid;   // the thread that presents (perf_present)
 static int only_render;             // TOTK_PROFILE_RENDER=1: sample the render thread only
+static volatile DWORD main_tid;     // the guest main thread (kern_main_thread)
+static int only_main;               // TOTK_PROFILE_MAIN=1: sample the guest main thread only
 static int chains;                  // call chains are kept: TOTK_PROFILE_RENDER or TOTK_PROFILE_CHAINS
 static volatile uint64_t cur_frame; // last presented frame
 static uint64_t frame_lo, frame_hi; // TOTK_PROFILE_FRAMES=<lo>-<hi>: sample only while presents lo..hi-1 are pending
@@ -154,7 +156,7 @@ static DWORD WINAPI sampler_main(void *arg) {
         if (frame_hi && (cur_frame < frame_lo || cur_frame >= frame_hi)) continue;
         for (int i = 0; i < n_threads; i++) {
             ThreadSlot *t = &threads[i];
-            if (only_render && t->tid != render_tid) continue;
+            if ((only_render && t->tid != render_tid) || (only_main && t->tid != main_tid)) continue;
             ctx.ContextFlags = chains ? CONTEXT_CONTROL | CONTEXT_INTEGER : CONTEXT_CONTROL;
             if (SuspendThread(t->h) == (DWORD)-1) continue;
             BOOL ok = GetThreadContext(t->h, &ctx);
@@ -263,8 +265,9 @@ void prof_start(void) {
         return;
     }
     only_render = cfg_get("TOTK_PROFILE_RENDER") != NULL;
+    only_main = !only_render && cfg_get("TOTK_PROFILE_MAIN") != NULL;
     const char *ch = cfg_get("TOTK_PROFILE_CHAINS");
-    chains = only_render || (ch && *ch && strcmp(ch, "0"));
+    chains = only_render || only_main || (ch && *ch && strcmp(ch, "0"));
     const char *fr = cfg_get("TOTK_PROFILE_FRAMES");
     if (fr && sscanf(fr, "%llu-%llu", (unsigned long long *)&frame_lo, (unsigned long long *)&frame_hi) != 2) frame_hi = 0;
     MODULEINFO mi;
@@ -290,6 +293,7 @@ uint64_t perf_begin(void) { return kern_now_ns(); }
 static volatile DWORD replay_tid;   // asynchronous replay (vk_backend.c): its waits hold up the frame too
 
 void perf_replay_thread(void) { replay_tid = GetCurrentThreadId(); }
+void perf_main_thread(void) { main_tid = GetCurrentThreadId(); }
 
 void perf_end(int kind, uint64_t t0) {
     if (!t0) return;

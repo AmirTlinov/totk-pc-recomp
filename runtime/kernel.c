@@ -88,6 +88,7 @@ struct RtThread {
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
+    uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
     // TOTK_ASYNC_PREEMPT (holding G)
     HANDLE hthr;               // the host thread, for SuspendThread / Get/SetThreadContext; open while it may own a core
@@ -122,16 +123,18 @@ uint64_t kern_now_ns(void) { return plat_now_ns(); }
 // ---- TOTK_TRACE=sched accounting (holding G)
 #define RW_N 32
 static RtThread *g_render;                               // the thread that presents (sched trace, core diag)
-static struct { int st; uint64_t obj, ns; } g_rw[RW_N];   // the render thread's waits by object
+typedef struct { int st; uint32_t waker; uint64_t obj, ns; } WaitRec;
+static WaitRec g_rw[RW_N], g_mw[RW_N];                   // the render and main thread's waits by object and waker
 static uint64_t g_pre_req, g_pre_n, g_pre_ns, g_pre_max, g_pre_stale;  // preempt requests; releases after one and their latency
 static uint64_t g_sync_calls, g_sync_blocks;              // WaitSynchronization calls and the blocks inside them
 
-static void render_wait(int st, uint64_t obj, uint64_t ns) {
+static void wait_add(WaitRec *w, int st, uint64_t obj, uint32_t waker, uint64_t ns) {
     for (int i = 0; i < RW_N; i++)
-        if (!g_rw[i].ns || (g_rw[i].st == st && g_rw[i].obj == obj)) {
-            g_rw[i].st = st;
-            g_rw[i].obj = obj;
-            g_rw[i].ns += ns;
+        if (!w[i].ns || (w[i].st == st && w[i].obj == obj && w[i].waker == waker)) {
+            w[i].st = st;
+            w[i].obj = obj;
+            w[i].waker = waker;
+            w[i].ns += ns;
             return;
         }
 }
@@ -142,7 +145,10 @@ static void acct(RtThread *t, int st) {
     uint64_t now = kern_now_ns();
     if (t->st_since) {
         t->st_ns[t->st] += now - t->st_since;
-        if (t == g_render && t->st >= S_HOST) render_wait(t->st, t->wobj, now - t->st_since);
+        if (t->st >= S_HOST && (t == g_render || t->is_main)) {
+            uint32_t waker = t->st == S_HOST || t->st == S_SLEEP ? 0 : t->waker;
+            wait_add(t == g_render ? g_rw : g_mw, t->st, t->wobj, waker, now - t->st_since);
+        }
     }
     t->st = st;
     t->st_since = now;
@@ -207,6 +213,7 @@ static void wake(RtThread *t, uint32_t res) {
     t->wkind = W_NONE;
     t->woke = 1;
     t->wres = res;
+    t->waker = tcur ? tcur->handle : 0;
     WakeConditionVariable(&t->cv);
 }
 
@@ -871,6 +878,7 @@ static void core_take(RtThread *t) {
 }
 
 static uint32_t block(RtThread *t, int kind, int64_t ns) {
+    t->waker = 0;
     if (ns == 0) return block_inner(t, kind, ns);
     core_put(t);
     acct(t, st_of(kind));
@@ -975,13 +983,14 @@ void kern_core_stats_reset(void) {
 }
 
 // TOTK_TRACE=sched: every 120 presents, the time split of the busiest threads (running, waiting for a core, host
-// calls) and of the render thread, the render thread's longest waits by object, and the preemption latency.
+// calls) and of the render thread, the render and the main thread's longest waits by object and by the thread whose
+// signal ended them, and the preemption latency.
 #define REP_N 8
 void kern_sched_report(uint64_t frame) {
     static uint64_t last;
     typedef struct { uint32_t h; int prio, render; uint64_t mask, entry, ns[S_N], nblk, npre, cpu; } Row;
     Row rows[REP_N + 1];
-    struct { int st; uint64_t obj, ns; } rw[3] = {0};
+    WaitRec rw[2][4] = {0};   // the render and the main thread's longest waits
     int nr = 0;
     RtThread *self = tcur;
     lock();
@@ -1038,15 +1047,16 @@ void kern_sched_report(uint64_t frame) {
         }
         if (th) CloseHandle(th);
     }
-    for (int i = 0; i < RW_N && g_rw[i].ns; i++)
-        for (int j = 0; j < 3; j++)
-            if (g_rw[i].ns > rw[j].ns) {
-                memmove(rw + j + 1, rw + j, (2 - j) * sizeof *rw);
-                rw[j].st = g_rw[i].st;
-                rw[j].obj = g_rw[i].obj;
-                rw[j].ns = g_rw[i].ns;
-                break;
-            }
+    for (int k = 0; k < 2; k++) {
+        const WaitRec *src = k ? g_mw : g_rw;
+        for (int i = 0; i < RW_N && src[i].ns; i++)
+            for (int j = 0; j < 4; j++)
+                if (src[i].ns > rw[k][j].ns) {
+                    memmove(rw[k] + j + 1, rw[k] + j, (3 - j) * sizeof **rw);
+                    rw[k][j] = src[i];
+                    break;
+                }
+    }
     uint64_t pre_stale = g_pre_stale, pre_req = g_pre_req, pre_n = g_pre_n, pre_ns = g_pre_ns, pre_max = g_pre_max;
     uint64_t sc = g_sync_calls, sb = g_sync_blocks;
     for (RtThread *t = g_all; t; t = t->all) {
@@ -1054,6 +1064,7 @@ void kern_sched_report(uint64_t frame) {
         t->nblk = t->npre = 0;
     }
     memset(g_rw, 0, sizeof g_rw);
+    memset(g_mw, 0, sizeof g_mw);
     g_pre_req = g_pre_n = g_pre_ns = g_pre_max = g_pre_stale = 0;
     g_sync_calls = g_sync_blocks = 0;
     unlock();
@@ -1074,10 +1085,13 @@ void kern_sched_report(uint64_t frame) {
                r->h, r->prio, (unsigned long long)r->mask, s, 100.0 * r->cpu / span, (unsigned long long)r->nblk,
                (unsigned long long)r->npre, r->entry ? d : "main");
     }
-    for (int j = 0; j < 3 && rw[j].ns; j++)
-        rt_log("sched: render wait %d: %s on %s%#llx: %.1f%%", j + 1, s_name[rw[j].st], rw[j].st == S_HOST ? "exe+" : "",
-               (unsigned long long)rw[j].obj,
-               100.0 * rw[j].ns / span);
+    for (int k = 0; k < 2; k++)
+        for (int j = 0; j < 4 && rw[k][j].ns; j++) {
+            char by[32] = "";
+            if (rw[k][j].waker) snprintf(by, sizeof by, ", woken by %#x", rw[k][j].waker);
+            rt_log("sched: %s wait %d: %s on %s%#llx%s: %.1f%%", k ? "main" : "render", j + 1, s_name[rw[k][j].st],
+                   rw[k][j].st == S_HOST ? "exe+" : "", (unsigned long long)rw[k][j].obj, by, 100.0 * rw[k][j].ns / span);
+        }
 }
 
 // ---- locks: tag word = owner handle | WAITERS_BIT
@@ -1250,6 +1264,7 @@ uint32_t kern_main_thread(Cpu **cpu) {
     t->stack_top = stack + MAIN_STACK;
     t->cpu->sp = t->stack_top;
     t->tid = GetCurrentThreadId();
+    perf_main_thread();
     HANDLE self = ap_open_self();
     lock();
     t->hthr = self;
