@@ -1,8 +1,8 @@
 // Submission, fences and the completion thread of the Vulkan back end.
 // One timeline semaphore (VkCtx.timeline) orders everything: each submission records its command handles into a
-// primary command buffer (vk_exec_record, task T6c) and signals the next timeline value, which is the NVN fence value
+// primary command buffer (vk_exec_record) and signals the next timeline value, which is the NVN fence value
 // the front end hands to syncs. The completion thread waits on the timeline and, in submit order, runs the CPU side
-// effects queued for each value (event writes, counter reports, sync state), then frees the T5 objects whose users
+// effects queued for each value (event writes, counter reports, sync state), then frees the memory and texture objects whose users
 // completed. A value counts as done only after its side effects ran, so a guest woken by fence_wait sees them.
 //
 // The submission shape (one timeline value per submission, signalled at ALL_COMMANDS, vkWaitSemaphores for waits, a
@@ -161,13 +161,13 @@ static void gpu_stats(PerfGpu *g) {
     g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);
 }
 
-// Without the replay (T6c) only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
+// Weak stand-in for vk_exec.c's replay: only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
 WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
     (void)cb, (void)fence;
     for (int i = 0; i < n; i++) {
         const op_hdr *h = handles[i] ? nvn_op_first(handles[i]) : NULL;
         if (!h || h->op != OP_BEGIN || h->size < sizeof *h || nvn_op_next(h)->op != OP_END)
-            rt_fatal("vk: op replay is not implemented (T6c)");
+            rt_fatal("vk: op replay is not linked");
     }
     return 0;
 }

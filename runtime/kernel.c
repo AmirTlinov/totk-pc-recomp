@@ -1334,7 +1334,7 @@ void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
 // The high-resolution waitable timer ends a wait 0.3-0.5 ms late at best: the SDK's 20 us polling sleeps (main thread
 // and job workers, about 1.5 per frame each) took 460-515 us. Sleeps up to SLEEP_SPIN_NS spin on the performance
 // counter instead; the virtual core is already given up. Linux: clock_nanosleep wakes within about 50 us (timer slack),
-// so a Linux host spins only below that, or not at all (docs/backlog.md item 35).
+// so a Linux host spins only below that, or not at all.
 #define SLEEP_SPIN_NS 1000000
 static void sleep_ns(RtThread *t, int64_t ns) {
     if (ns <= SLEEP_SPIN_NS) {

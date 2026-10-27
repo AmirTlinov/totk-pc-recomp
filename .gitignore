@@ -47,12 +47,16 @@ __pycache__/
 /tools/xlate/bin/
 /tools/xlate/obj/
 
-# Third-party agent skills, restored from skills-lock.json with `npx skills`
-/.agents/skills/reverse-engineer-anything/
-/.claude/skills/reverse-engineer-anything/
+# Coding-agent setup and working notes (skills, hooks, playbook, backlog, research notes, milestone plans): local to
+# the maintainer's machine. tools/worktree.py links .claude and notes into task worktrees.
+/.claude/
+/.agents/
+/CLAUDE.local.md
+/skills-lock.json
+/notes/
+/docs/milestones/
 
-# Local agent and editor settings
-/.claude/settings.local.json
+# Editor settings
 .vs/
 .vscode/
 .idea/
@@ -64,9 +68,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
-
-# Milestone plans and task splits: working notes for local agents, not published
-/docs/milestones/
 
 # Agent task worktrees (tools/worktree.py)
 /.worktrees/

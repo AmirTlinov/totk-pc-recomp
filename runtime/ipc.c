@@ -714,7 +714,7 @@ static uint64_t stub(const char *sym) {
 //   ThreadType+0x1B0 (sdk+0x13186c), which nnosInitialize sets to the thread's handle; a zero there makes every free
 //   mutex look owned by the caller (__cxa_guard_acquire in nn::sm::Initialize aborts);
 // - sdk's full DT_INIT needs nn::os initialised (its TLS slot constructor reaches ThreadManager), which is the boot
-//   sequence's job (T6). The audio client only needs its two sf heap constructors: 16 KiB ExpHeaps on static buffers,
+//   sequence's job. The audio client only needs its two sf heap constructors: 16 KiB ExpHeaps on static buffers,
 //   stored at sdk+0xd37e90 and sdk+0xd3bec0 (CreateAudioRendererManagerByHipc reads the second). The 1.4.3 SDK creates
 //   that heap lazily; its OpenAudioRenderer takes nn::audio::detail::g_RendererResourceSemaphore first, which the
 //   constructor at sdk+0x221fb0 initializes (two renderers).

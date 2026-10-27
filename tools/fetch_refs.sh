@@ -1,6 +1,6 @@
 #!/bin/sh
-# Clone the upstream projects studied in docs/research/ into refs/, at the
-# commits the notes cite. refs/ is read-only reference material and ignored by git.
+# Clone the upstream projects this port builds on into refs/, at pinned commits. refs/ is read-only reference
+# material and ignored by git.
 set -eu
 
 cd "$(dirname "$0")/.."

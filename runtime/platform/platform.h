@@ -1,5 +1,5 @@
 // Platform layer: threads, time, locks. New runtime code calls this instead of the OS;
-// one implementation per OS (win32.c in M5). The FP control register lives in the per-architecture fp_*.h headers,
+// one implementation per OS (win32.c). The FP control register lives in the per-architecture fp_*.h headers,
 // inline, because lifted FP code touches it on every operation.
 #pragma once
 #include <stdint.h>

@@ -1,5 +1,5 @@
-// CPU-side texture code of the M4 graphics layer: block-linear <-> linear
-// copies, ASTC decode, NVN format -> VkFormat. Vulkan memory and the texture objects are T5b.
+// CPU-side texture code: block-linear <-> linear copies, ASTC decode, NVN format -> VkFormat. Vulkan memory and
+// the texture objects are in vk_memory.c and vk_texture.c.
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>

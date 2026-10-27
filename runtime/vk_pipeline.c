@@ -24,7 +24,7 @@
 //
 // Fragment inputs the vertex stage does not write (stages are translated separately; MNG nvn_mtl.m msl_varyings) get
 // outputs added to the vertex module, as Vulkan rejects such pairs, initialised to (0, 0, 0, 1) as Maxwell reads an
-// unwritten output (docs/research/maxwell.md 1.2). The unwritten components of an output the vertex stage does write
+// unwritten output (docs/maxwell.md 1.2). The unwritten components of an output the vertex stage does write
 // start at (0, 0, 0, 1) in the translator (tools/xlate/patches/0006).
 //
 // Pipeline key. Everything Vulkan 1.3 can take as dynamic state is dynamic: viewports and scissors with count, depth
@@ -649,7 +649,7 @@ static uint32_t *spirv_set(const uint32_t *w, uint64_t n, uint32_t set) {
     return o;
 }
 
-// Dual-source blending (docs/research/maxwell.md 5.6): SRC1 blend factors read the fragment shader's colour output 1,
+// Dual-source blending (docs/maxwell.md 5.6): SRC1 blend factors read the fragment shader's colour output 1,
 // which Vulkan takes from Location 0, Index 1. The Output variable at Location 1 moves there, as Ryujinx declares it
 // with DualSourceBlendEnable (CodeGen/Spirv/Declarations.cs); the pipeline is keyed by GKey.dsb, so only pipelines
 // that blend with SRC1 get this module. NULL when the module has no Output at Location 1.
@@ -1446,7 +1446,7 @@ out:
     return pipe;
 }
 
-// ---- graphics pipeline library (vk_caps.gpl, Task 2.4)
+// ---- graphics pipeline library (vk_caps.gpl)
 // A pipeline is linked from four libraries, each cached by the part of the pipeline key it depends on: vertex input
 // (topology class, vertex attributes without dynamic vertex input), pre-rasterization (vertex shader, the outputs its
 // union adds, static rasterization state), fragment shader (fragment shader, dual-source rewrite, samples) and fragment
@@ -1954,7 +1954,7 @@ static void keys_open(void) {
     char *slash = strrchr(K.path, '\\'), *fslash = strrchr(K.path, '/');
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
-    gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c, Task 2.3)
+    gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;

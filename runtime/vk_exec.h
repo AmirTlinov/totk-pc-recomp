@@ -21,7 +21,7 @@ enum {
     VK_EXEC_DIRTY_ALL = (1 << 5) - 1,
 };
 
-// One render target of OP_SET_RT, resolved to its T5b image for the current command buffer.
+// One render target of OP_SET_RT, resolved to its vk_texture.c image for the current command buffer.
 typedef struct {
     const tex_t *tex;                    // payload copy (lives for the run); NULL: no target in this slot
     VkImage image;                       // VK_NULL_HANDLE: no target or not renderable (logged once)

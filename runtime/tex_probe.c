@@ -1,5 +1,5 @@
-// totk.exe --probe-vkmem: texture memory checks of M4 T5. The CPU part (task T5a): block-linear copies against an
-// independent reference, ASTC void-extent blocks, and the NVN -> VkFormat table against GPU0. The GPU part (task T5b):
+// totk.exe --probe-vkmem: texture memory checks. The CPU part: block-linear copies against an
+// independent reference, ASTC void-extent blocks, and the NVN -> VkFormat table against GPU0. The GPU part:
 // guest heap imported as a VkBuffer, write watch against CPU, GPU and ReadFile writes, the virtual-pool page table,
 // and textures uploaded from block-linear storage and read back.
 // The reference swizzler walks the GOBs in storage order and places each byte by bit operations, so it shares no
@@ -290,7 +290,7 @@ static int test_formats(void) {
     return 0;
 }
 
-// ---- GPU part (T5b) ----
+// ---- GPU part ----
 #define GCHECK(cond, ...)                                                                                              \
     do {                                                                                                               \
         if (!(cond)) {                                                                                                 \

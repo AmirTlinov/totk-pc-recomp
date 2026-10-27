@@ -958,7 +958,7 @@ int probe_services(void) {
     if (child && *child) return run_as_child(child);
     ldr_load(rt_config()->exefs);
 
-    // Names bound by the loader: each override and observer of T4 must match a relocation.
+    // Names bound by the loader: each override and observer probed here must match a relocation.
     int bound = 0, obs_bound = 0;
     for (int i = 0; i < 4096; i++) {
         const char *n = hostfn_name(RT_HOSTFN_BASE + 16ull * (uint64_t)i);
@@ -974,7 +974,7 @@ int probe_services(void) {
     for (int k = 0; k < NOBS; k++) CHECK(hostfn_observer(observers[k]), "observer %s is not linked", observers[k]);
     CHECK(obs_bound == NOBS, "%d of %d observers match a JUMP_SLOT", obs_bound, NOBS);
 
-    // Every linked override is either probed here or belongs to another probe or owner (nn::fs: T5, fibers: T2,
+    // Every linked override is either probed here or belongs to another probe or owner (nn::fs: fs probe, fibers: kernel probe,
     // movie::Decoder: --probe-movie, memcpy: the graphics write-back in nvn_api_core.c).
     int linked = hostfn_table_size(0), others = 0;
     for (int i = 0; i < linked; i++) {
@@ -988,7 +988,7 @@ int probe_services(void) {
         others += theirs;
         CHECK(mine || theirs, "override %s is linked but not probed", n);
     }
-    printf("bound: %d of %d T4 overrides and %d of %d observers match relocations of the loaded modules\n", bound, NOV,
+    printf("bound: %d of %d overrides and %d of %d observers match relocations of the loaded modules\n", bound, NOV,
            obs_bound, NOBS);
 
     bind_addresses();
@@ -1001,8 +1001,8 @@ int probe_services(void) {
         called += ovs[k].calls > 0;
         CHECK(ovs[k].calls > 0, "override %s was not called", ovs[k].key);
     }
-    printf("called: %d of %d T4 overrides through rt_dispatch (%d named fatal stubs in child processes); %d other "
-           "overrides are T2/T5's\n", called, NOV, NFATAL, others);
+    printf("called: %d of %d overrides through rt_dispatch (%d named fatal stubs in child processes); %d other "
+           "overrides belong to the kernel and fs probes\n", called, NOV, NFATAL, others);
     printf("overrides %d, observers %d\n", linked, hostfn_table_size(1));
     if (failures) {
         printf("probe-services: FAILED (%d of %d checks)\n", failures, checks);
