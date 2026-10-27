@@ -43,6 +43,8 @@ typedef struct {
     VkQueue queue;                        // submissions take vk_queue_lock
     VkFormat format;                      // of the swapchain image, a colour attachment
     uint32_t width, height;
+    int image_w, image_h;                 // the game image this present shows (its crop)
+    int scaler;                           // how the last present scaled it to the window: 0 not, 1 bilinear blit, 2 FSR 1
 } MenuTarget;
 // Lays out this frame's overlay; 1 when there is something to draw. frame: the presented frame (0 unknown). *shot: a
 // path when the test hook wants this frame's swapchain image saved, else NULL. The first open starts ImGui's Vulkan

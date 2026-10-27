@@ -1,15 +1,22 @@
 // Performance overlay numbers (runtime/perfmon.h). Frame times come from the game's presents (perf_present, only while
 // the overlay is on); the per-frame waits from the perf counters prof_win.c keeps. The machine's numbers are sampled
 // twice a second on a thread of their own (some calls take milliseconds), which runs only while the overlay is full.
-// The OS calls sit behind platform.h (plat_cpu_load, plat_mem_info, plat_gpu_load); NVML (NVIDIA's driver library,
-// for temperature, power and clock) is loaded at run time and is missing on other machines: its numbers stay -1.
+// The OS calls sit behind platform.h (plat_cpu_load, plat_mem_info, plat_gpu_load). Temperature, power and clock come
+// from the GPU vendor's driver library, loaded at run time: NVML on NVIDIA, ADL's PM log on AMD; on a machine without
+// either their numbers stay -1.
 //
 // Adapted from SavageWindRecomp's runtime/perfmon.c (https://github.com/Revivedx/SavageWindRecomp @
 // 575ad88e02f9a89a9a885d90039d48af33c982f4, MIT, Copyright (c) 2026 Revivedx and the Savage Wind Recomp contributors,
 // Copyright (c) 2026 Peiikai): the frame ring and its one-second summary, the NVML calls, the sampler loop. The
 // Windows, Linux and macOS sampling moved behind platform.h, GPU load and video memory come from the system's counters
 // for every vendor, and the sampler stops when the overlay leaves full.
+//
+// The ADL declarations (AdapterInfo, ADLSingleSensorData, ADLPMLogDataOutput, the ADL_PMLOG_* sensor numbers and the
+// ADL2_* signatures) are copied from AMD's display-library include/adl_structures.h, adl_defines.h and adl_sdk.h
+// (https://github.com/GPUOpen-LibrariesAndSDKs/display-library @ 84c881cb2136f04287eb3af12de00a9e2867aa9e, MIT,
+// Copyright (c) 2016 - 2022 Advanced Micro Devices, Inc.).
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
@@ -106,13 +113,15 @@ static struct {
 static char g_gpu_name[96];
 static uint8_t g_gpu_luid[8];
 static int g_gpu_luid_ok;
+static int g_gpu_bus = -1;
 static float g_vram_total_mb = -1;
 
-void perfmon_set_gpu(const char *name, const uint8_t *luid, float vram_total_mb) {
+void perfmon_set_gpu(const char *name, const uint8_t *luid, int pci_bus, float vram_total_mb) {
     plat_mutex_lock(&g_lock);
     snprintf(g_gpu_name, sizeof g_gpu_name, "%s", name ? name : "");
     g_gpu_luid_ok = luid != NULL;
     if (luid) memcpy(g_gpu_luid, luid, sizeof g_gpu_luid);
+    g_gpu_bus = pci_bus;
     g_vram_total_mb = vram_total_mb > 0 ? vram_total_mb : -1;
     plat_mutex_unlock(&g_lock);
 }
@@ -166,6 +175,99 @@ static void nvml_sample(PerfStats *s) {
     if (nv.clock && nv.clock(nv.dev, 0 /* NVML_CLOCK_GRAPHICS */, &v) == 0) s->gpu_clock_mhz = (float)v;
 }
 
+// ---- ADL (AMD): loaded once on the sampler thread, kept for the process. ADL2_New_QueryPMLogData_Get reads the PM log
+// the driver keeps for Radeon RX 5000 and later (the numbers Adrenalin's overlay shows); older GPUs answer with an
+// error and their numbers stay -1. Windows only: the Linux driver gives these through sysfs, which this does not read.
+#ifdef _WIN32
+#define ADL_MAX_PATH 256
+#define ADL_PMLOG_MAX_SENSORS 256
+enum {
+    ADL_PMLOG_CLK_GFXCLK = 1,
+    ADL_PMLOG_TEMPERATURE_EDGE = 8,
+    ADL_PMLOG_INFO_ACTIVITY_GFX = 19,
+    ADL_PMLOG_ASIC_POWER = 23,
+    ADL_PMLOG_TEMPERATURE_HOTSPOT = 27,
+    ADL_PMLOG_BOARD_POWER = 73,
+};
+typedef struct {   // AdapterInfo, the Windows layout
+    int iSize, iAdapterIndex;
+    char strUDID[ADL_MAX_PATH];
+    int iBusNumber, iDeviceNumber, iFunctionNumber, iVendorID;
+    char strAdapterName[ADL_MAX_PATH], strDisplayName[ADL_MAX_PATH];
+    int iPresent, iExist;
+    char strDriverPath[ADL_MAX_PATH], strDriverPathExt[ADL_MAX_PATH], strPNPString[ADL_MAX_PATH];
+    int iOSDisplayIndex;
+} AdlAdapterInfo;
+typedef struct { int supported, value; } AdlSensor;
+typedef struct { int size; AdlSensor sensors[ADL_PMLOG_MAX_SENSORS]; } AdlPmLog;
+typedef void *(__stdcall *AdlAlloc)(int);
+
+static struct {
+    int tried, ok, index;
+    void *ctx;
+    int (*pmlog)(void *, int, AdlPmLog *);
+    AdlPmLog log;   // the sampler thread's buffer
+} adl;
+
+static void *__stdcall adl_alloc(int n) { return malloc((size_t)n); }
+
+// The adapter Vulkan renders on: the PCI bus when the device gave one, else the name. ADL lists one index per display
+// output of a GPU; the first whose PM log answers is taken.
+static void adl_open(const char *hint, int bus) {
+    adl.tried = 1;
+    void *lib = plat_lib_open("atiadlxx.dll");
+    if (!lib) return;
+    int (*create)(AdlAlloc, int, void **) = (int (*)(AdlAlloc, int, void **))plat_lib_sym(lib, "ADL2_Main_Control_Create");
+    int (*count)(void *, int *) = (int (*)(void *, int *))plat_lib_sym(lib, "ADL2_Adapter_NumberOfAdapters_Get");
+    int (*info)(void *, AdlAdapterInfo *, int) =
+        (int (*)(void *, AdlAdapterInfo *, int))plat_lib_sym(lib, "ADL2_Adapter_AdapterInfo_Get");
+    adl.pmlog = (int (*)(void *, int, AdlPmLog *))plat_lib_sym(lib, "ADL2_New_QueryPMLogData_Get");
+    int n = 0;
+    if (!create || !count || !info || !adl.pmlog || create(adl_alloc, 1, &adl.ctx) != 0 || count(adl.ctx, &n) != 0 ||
+        n <= 0 || n > 256)
+        return;
+    AdlAdapterInfo *a = (AdlAdapterInfo *)calloc((size_t)n, sizeof *a);
+    if (a) {
+        for (int i = 0; i < n; i++) a[i].iSize = sizeof *a;
+        if (info(adl.ctx, a, n * (int)sizeof *a) == 0) {
+            for (int i = 0; i < n && !adl.ok; i++) {
+                if (a[i].iVendorID != 1002) continue;   // ADL writes the PCI vendor id 0x1002 as decimal 1002
+                const char *nm = a[i].strAdapterName;
+                if (bus >= 0 ? a[i].iBusNumber != bus : !hint[0] || !nm[0] || !(strstr(hint, nm) || strstr(nm, hint)))
+                    continue;
+                memset(&adl.log, 0, sizeof adl.log);
+                adl.log.size = sizeof adl.log;
+                if (adl.pmlog(adl.ctx, a[i].iAdapterIndex, &adl.log) != 0) continue;
+                adl.index = a[i].iAdapterIndex;
+                adl.ok = 1;
+            }
+        }
+        free(a);
+    }
+    rt_log("perfmon: ADL %s", adl.ok ? "found the rendering GPU" : "has no PM log for the rendering GPU");
+}
+
+static void adl_sample(PerfStats *s) {
+    if (!adl.ok) return;
+    memset(&adl.log, 0, sizeof adl.log);
+    adl.log.size = sizeof adl.log;
+    if (adl.pmlog(adl.ctx, adl.index, &adl.log) != 0) return;
+    const AdlSensor *v = adl.log.sensors;
+    if (s->gpu_pct < 0 && v[ADL_PMLOG_INFO_ACTIVITY_GFX].supported)   // the system's counters first
+        s->gpu_pct = (float)v[ADL_PMLOG_INFO_ACTIVITY_GFX].value;
+    if (v[ADL_PMLOG_TEMPERATURE_EDGE].supported) s->gpu_temp_c = (float)v[ADL_PMLOG_TEMPERATURE_EDGE].value;
+    else if (v[ADL_PMLOG_TEMPERATURE_HOTSPOT].supported) s->gpu_temp_c = (float)v[ADL_PMLOG_TEMPERATURE_HOTSPOT].value;
+    // the whole card's draw where the driver reports it (RDNA 4 reports no ASIC power), else the GPU chip's
+    if (v[ADL_PMLOG_BOARD_POWER].supported) s->gpu_power_w = (float)v[ADL_PMLOG_BOARD_POWER].value;
+    else if (v[ADL_PMLOG_ASIC_POWER].supported) s->gpu_power_w = (float)v[ADL_PMLOG_ASIC_POWER].value;
+    if (v[ADL_PMLOG_CLK_GFXCLK].supported) s->gpu_clock_mhz = (float)v[ADL_PMLOG_CLK_GFXCLK].value;
+}
+#else
+static struct { int tried; } adl;
+static void adl_open(const char *hint, int bus) { (void)hint, (void)bus, adl.tried = 1; }
+static void adl_sample(PerfStats *s) { (void)s; }
+#endif
+
 // ---- the machine sampler: runs while want is set, twice a second
 static struct {
     int want, alive;
@@ -196,10 +298,12 @@ static void sampler(void *arg) {
     int have_luid = g_gpu_luid_ok;
     memcpy(luid, g_gpu_luid, sizeof luid);
     snprintf(s.gpu_name, sizeof s.gpu_name, "%s", g_gpu_name);
+    int bus = g_gpu_bus;
     float vram_total = g_vram_total_mb;
     plat_mutex_unlock(&g_lock);
     sysinfo_cpu_name(s.cpu_name, sizeof s.cpu_name);
     if (!nv.tried) nvml_open(s.gpu_name);
+    if (!nv.ok && !adl.tried) adl_open(s.gpu_name, bus);
     PlatLoad *l = plat_load_open(have_luid ? luid : NULL);
     plat_mutex_lock(&g_lock);
     while (g_smp.want) {
@@ -210,6 +314,7 @@ static void sampler(void *arg) {
         plat_gpu_load(l, &s.gpu_pct, &s.vram_used_mb);
         s.vram_total_mb = vram_total;
         nvml_sample(&s);
+        adl_sample(&s);
         plat_mutex_lock(&g_lock);
         machine_copy(&g_stats, &s);
         if (g_smp.want) plat_cond_wait_ns(&g_smp.cv, &g_lock, 500000000ull);
