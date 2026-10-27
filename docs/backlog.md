@@ -71,7 +71,10 @@ machine A runs scripted routes; B and C send logs from the user's play.
 12. **Driver cache re-warm.** The AMD driver keys its pipeline library cache by exe path, so a moved folder stutters
     until `totk.exe --prepare-shaders` runs again. Branch `task/rewarm` (not merged, never run in game) stamps
     `shader-prepared.bin` with device, driver and exe path and re-warms at start on a mismatch. Check whether NVIDIA
-    and older AMD drivers cache the same way. Needed before machines B and C get an installer build.
+    and older AMD drivers cache the same way. Needed before machines B and C get an installer build. 2026-10-27: a
+    relink keeps the cache (`totk.exe --warm-shaders` on a relinked exe: 29,587 variants in 1.8 s), but its size is
+    limited: preparing a new build dir (28,408 cold libraries) left `build143` cold, and a library a draw needed took
+    40-220 ms in user play instead of 0.2 ms. `--warm-shaders` re-warms without translating.
 13. **Shared shader list.** Newer MacNativeGames lists collapse variants that differ only in texture kind into `"*"`
     rows, which our runtime cannot match (it translates for the exact kind); `tools/prepare_shaders.py` reads `"*"` as
     2D. Option: match `"*"` rows at run time, as MacNativeGames' `prepare_shader_seed.py` does.

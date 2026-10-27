@@ -2926,9 +2926,10 @@ int vk_pipeline_prepare_shaders(void) {
     return rc;
 }
 
-// totk.exe --warm-shaders (tools/build_game.py after it relinked a prepared build): the driver's disk cache is keyed to
-// the exe, so a rebuilt totk.exe finds it cold and a new library costs 40-220 ms in play instead of about 2 ms. This
-// builds every variant of shader-prepared.bin into it again from the shader cache, without translating the seed.
+// totk.exe --warm-shaders: every variant of shader-prepared.bin built into the driver's disk cache again from the shader
+// cache, without translating the seed. The AMD cache is keyed to the exe path (a relink keeps it: 29,587 variants in
+// 1.8 s) and holds a limited amount: preparing another build dir evicted this one's libraries, and a library a draw
+// needed then took 40-220 ms in play instead of 0.2 ms. Seconds when the libraries are still there.
 int vk_pipeline_warm_shaders(void) {
     if (!ensure_init()) {
         fprintf(stderr, "warm-shaders: no Vulkan device\n");
