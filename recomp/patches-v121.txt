@@ -7,6 +7,8 @@ set fps60    TOTK_FPS60          1
 set realtime TOTK_REALTIME       1
 set cloth    TOTK_CLOTH_REALTIME 1
 set bounce   TOTK_HIGHFPS_FIX    1
+set output   TOTK_PATCH_OUTPUT   0
+set scene    TOTK_PATCH_SCENE    0
 
 # 60 fps: the adaptive present-interval controller (main+0x8f26c8, 1.0.0 0x8f6bec) gets the minimum interval 1.
 site fps60 main 8f273c 6b08015f 7100055f   # clamp: cmp w10, #1 (was cmp w10, w8 = minimum)
@@ -45,3 +47,19 @@ site cloth main 8222f0 9401d7cf @page:x8 bd400104 1e240842 1e240863 9401d7cf   #
 # Trampolines (upstream 27c3b43): the slow-motion check compares time object +0x28 (30 / (ratio * time scale)) with
 # 100; compare +0x28 * +0x38 (30 / time scale) instead, the same value at 30 Hz and independent of the frame rate.
 site bounce main bda798 bd402900 bd402900 bd403901 1e210800   # ldr s0, [x8, #0x28]; ldr s1, [x8, #0x38]; fmul s0, s0, s1
+
+# Output size (upstream games/totk/runtime/game_patches.c patch_output_res; runtime/resolution.c switches the set on).
+# The swapchain size nnMain writes before NvInitializeGraphics comes from page +48 ({w, h} as one 64-bit value), and
+# the output size the renderer lays out its canvas, crop and UI in (main+0xcc3f00, read from the graphics parameters
+# through main+0xcc4160) from page +32; the renderer itself goes to page +40.
+site output main e7aa3c d280f008 @page:x8   # mov x8, #0x780 -> adrp x8, page
+site output main e7aa40 f2c08708 f9401908   # movk x8, #0x438, lsl #32 -> ldr x8, [x8, #48]
+site output main cc3f50 aa1403e0 @page:x21  # mov x0, x20 -> adrp x21, page
+site output main cc3f54 94000083 f90016b3   # bl 0xcc4160 -> str x19, [x21, #40]
+site output main cc3f58 f9400015 f94012b5   # ldr x21, [x0] -> ldr x21, [x21, #32]
+
+# Scene render size (upstream patch_render_res): the renderer's +0xcc4 / +0xcc8, which size every scene render target,
+# take two floats from page +16 instead of the graphics parameters' docked 1600x900.
+site scene main cc3f68 5e21d900 @page:x9    # scvtf s0, s8 -> adrp x9, page
+site scene main cc3f70 bd0cc660 2d420520    # str s0, [x19, #0xcc4] -> ldp s0, s1, [x9, #16]
+site scene main cc3f74 5e21d921 bd0cc660    # scvtf s1, s9 -> str s0, [x19, #0xcc4]

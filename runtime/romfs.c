@@ -343,6 +343,70 @@ static void added_init(void) {
     rt_log("RomFS overlay: %zu files added to the RomFS", nadded);
 }
 
+// The HeapDef table a bigger game resolution needs (resolution.c): its texture heap and that heap's parent grow. The
+// base is an overlay that replaces the table (a mod's heap sizes stay), else the RomFS original; the grown table is
+// written to <profile>/resolution/ and served in the base's place.
+#define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
+static void heapdef_overlay(void) {
+    if (!res_heap_extra_kib()) return;
+    uint64_t i = lower(HEAPDEF);
+    if (i >= file_count || strcmp(entry_name(entry(i)), HEAPDEF)) {
+        rt_log("RomFS: %s missing; the game keeps its own resolution", HEAPDEF);
+        return;
+    }
+    Overlay *base = NULL;
+    for (size_t k = 0; k < noverlay; k++)
+        if (overlays[k].index == i) base = &overlays[k];
+    HANDLE f = base ? open_read(base->path, 1) : image;
+    uint64_t off = base ? 0 : entry(i).offset, n = base ? base->size : entry(i).size;
+    void *in = n && n < (16u << 20) && f != INVALID_HANDLE_VALUE ? malloc((size_t)n) : NULL;
+    int ok = in && read_at(f, in, (uint32_t)n, off) == (int64_t)n;
+    if (base && f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    void *out = NULL;
+    size_t out_n = 0;
+    ok = ok && res_heapdef_build(in, (size_t)n, &out, &out_n);
+    free(in);
+    if (!ok) return;
+    char dir[2100], file[2200];
+    need(snprintf(dir, sizeof dir, "%s/resolution", rt_config()->profile) < (int)sizeof dir, "resolution path");
+    need(snprintf(file, sizeof file, "%s/Product.Nin_NX_NVN.HeapDef.byml.zs", dir) < (int)sizeof file, "resolution path");
+    wchar_t *wd = fs_wide(dir), *wf = fs_wide(file);
+    CreateDirectoryW(wd, NULL);
+    HANDLE w = CreateFileW(wf, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD put = 0;
+    ok = w != INVALID_HANDLE_VALUE && WriteFile(w, out, (DWORD)out_n, &put, NULL) && put == out_n;
+    if (w != INVALID_HANDLE_VALUE) CloseHandle(w);
+    free(wd);
+    free(wf);
+    free(out);
+    HANDLE r = ok ? open_read(file, 1) : INVALID_HANDLE_VALUE;
+    if (r == INVALID_HANDLE_VALUE) {
+        rt_log("RomFS: cannot write %s (error %lu); the game keeps its own resolution", file, GetLastError());
+        return;
+    }
+    Identity id = identity_of(r);
+    CloseHandle(r);
+    char *copy = _strdup(file);
+    need(copy != NULL, "overlay path copy");
+    if (base) {
+        free(base->path);
+        base->path = copy;
+        base->size = out_n;
+        base->id = id;
+    } else {
+        if (noverlay == overlay_cap) {
+            overlay_cap = overlay_cap ? overlay_cap * 2 : 16;
+            overlays = realloc(overlays, overlay_cap * sizeof *overlays);
+            need(overlays != NULL, "overlay table");
+        }
+        char *rel = _strdup(HEAPDEF);
+        need(rel != NULL, "overlay path copy");
+        overlays[noverlay++] = (Overlay){i, out_n, copy, rel, id};
+    }
+    rt_log("RomFS overlay: %s (%zu bytes, grown heaps) replaces %s", file, out_n, base ? "the mod's table" : "the original");
+    res_heapdef_served();
+}
+
 static void overlay_init(void) {
     // TOTK_ROMFS_PATCHES unset: romfs-patches next to romfs-index.bin if it has a manifest (tools/make_romfs_patches.py)
     char def[2100];
@@ -355,6 +419,7 @@ static void overlay_init(void) {
     const char *dirs[2] = {patches, cfg_get("TOTK_ROMFS_MODS")};
     for (int i = 0; i < 2; i++)
         if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i]);
+    heapdef_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
     for (size_t k = 1; k < noverlay; k++)

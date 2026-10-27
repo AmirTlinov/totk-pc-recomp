@@ -62,7 +62,7 @@ static DWORD WINAPI present_main(void *arg) {
         WakeAllConditionVariable(&pcv);
         ReleaseSRWLockExclusive(&pl);
         if (flight_on) vk_thumbs_frame(j.frame);
-        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.w, j.h, j.has_crop ? j.crop : NULL);
+        vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h, j.has_crop ? j.crop : NULL);
         uint64_t f = vk_sync_submit(NULL, 0);   // a timeline value after the blit: deferred destruction waits for the blit too
         if (j.value && f != j.value)
             rt_fatal("vk: the present of frame %llu signalled %llu, queued as %llu", (unsigned long long)j.frame,

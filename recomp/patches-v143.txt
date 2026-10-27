@@ -8,6 +8,8 @@ set fps60    TOTK_FPS60          1
 set realtime TOTK_REALTIME       1
 set cloth    TOTK_CLOTH_REALTIME 1
 set bounce   TOTK_HIGHFPS_FIX    1
+set output   TOTK_PATCH_OUTPUT   0
+set scene    TOTK_PATCH_SCENE    0
 
 # 60 fps: the adaptive present-interval controller (main+0x2db174, 1.2.1 0x8f26c8) gets the minimum interval 1.
 site fps60 main 2db204 6b08015f 7100055f   # clamp: cmp w10, #1 (was cmp w10, w8 = minimum)
@@ -44,3 +46,17 @@ site cloth main 28bc98 9400546a @page:x8 bd400104 1e240842 1e240863 9400546a   #
 # over 100; compare +0x28 * +0x38 (30 / time scale) instead, the same value at 30 Hz and independent of the frame rate.
 # s1 is set again by the fmov two instructions on.
 site bounce main 562a64 bd402920 bd402920 bd403921 1e210800   # ldr s0, [x9, #0x28]; ldr s1, [x9, #0x38]; fmul s0, s0, s1
+
+# Output size (upstream game_patches_v143.c patch_output_res; runtime/resolution.c switches the set on). The swapchain
+# size nnMain writes comes from page +48; the display configuration's canvas (+0x10) and active output (+0x508) from
+# page +32, and the configuration goes to page +40. x9 is dead at the publication point.
+site output main bdb578 d280f008 @page:x8   # mov x8, #0x780 -> adrp x8, page (x9 is built in between)
+site output main bdb584 f2c08708 f9401908   # movk x8, #0x438, lsl #32 -> ldr x8, [x8, #48]
+site output main 3dcb28 d360fc64 @page:x9 f9001533 f9401123 f9000a63 d360fc64   # lsr x4, x3, #32: x3 = [page+32] first
+
+# Scene render size (upstream patch_render_res): every path that picks the size meets at main+0x585e48; the renderer's
+# +0xcc4 / +0xcc8 take two floats from page +16. x3 is scratch in this function; w9 still holds the output size.
+site scene main 585e48 1e220160 @page:x3    # scvtf s0, w11 -> adrp x3, page
+site scene main 585e50 bd0cc660 2d420460    # str s0, [x19, #0xcc4] -> ldp s0, s1, [x3, #16]
+site scene main 585e54 1e220140 bd0cc660    # scvtf s0, w10 -> str s0, [x19, #0xcc4]
+site scene main 585e60 bd0cca60 bd0cca61    # str s0, [x19, #0xcc8] -> str s1, [x19, #0xcc8]
