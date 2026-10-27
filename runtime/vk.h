@@ -198,6 +198,7 @@ uint64_t vk_upload_flush(int wait);
 // Deferred destruction: freed once the upload batches recorded so far and the timeline value last noted have completed.
 void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
 void vk_defer_view(VkImageView view);
+void vk_exec_image_gone(VkImage image);   // destroy_tex, texture lock held: the replay's views of image go with it
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
 // ---- ASTC (vk_astc.c). TOTK_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
@@ -263,6 +264,10 @@ VkSampler vk_sampler_by_id_locked(int id);
 // on the Switch although the game binds a linear sampler (MacNativeGames 6283599). VK_NULL_HANDLE for an empty slot.
 VkSampler vk_sampler_point_by_id_locked(int id);
 uint32_t vk_texture_slots_gen(void);
+// What vk_texture_by_id(id) returns can change only when this does: the slot is registered again, or a texture entry at
+// its storage address is created, dropped, released or taken back into use. Unlocked; read it before the lookup it
+// guards (a lookup may create an entry). 0 when the slot was never registered: nothing is kept under 0.
+uint64_t vk_texture_slot_token(int id);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
 void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission

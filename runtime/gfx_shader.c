@@ -1418,6 +1418,10 @@ int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res)
     return s->nres[kind];
 }
 
+// The slots of the use mask: answers outside it select the same translation (mask_answers), so a caller may leave
+// their texture and image types zero. Parses the reflection: callers keep the result.
+uint32_t gfx_shader_slot_mask(const GfxShader *s) { return use_of(s).slots; }
+
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]) {
     if (io) memcpy(io, s->in, sizeof s->in);
     return s->in_mask;

@@ -59,11 +59,12 @@ typedef struct Tex {
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
-// entry (ce), valid while tex_gen is still cgen, the view and has_view handed out with it, and the submit_epoch of the
-// last freshness check through the slot (cepoch). Hot fields first: a lookup that hits touches one or two cache lines.
+// entry (ce), valid while the generation of its address (agen) is still cgen, the view and has_view handed out with it,
+// and the submit_epoch of the last freshness check through the slot (cepoch). Hot fields first: a lookup that hits
+// touches one or two cache lines.
 typedef struct {
-    struct Tex *ce;
-    uint32_t cgen;                // tex_gen when ce was resolved; 0: nothing cached (registered since, or never resolved)
+    struct Tex *ce;               // NULL: nothing cached (registered since, or never resolved)
+    uint32_t cgen;                // agen of the slot's address when ce was resolved
     uint32_t cepoch;
     view_t cview;
     uint8_t chas_view, used, has_view;
@@ -105,10 +106,25 @@ static uint32_t tex_gen = 1;
 static uint32_t slots_gen = 1;
 static uint32_t samp_gen = 1;   // bumped whenever a sampler slot is registered: vk_sampler_by_id may answer otherwise
 static uint64_t n_checks;    // draw-binding storage checks (make_fresh_snap) since the last perf line
+// tex_gen per storage address (hashed): a slot resolves through the entries at its own address only (slot_resolve), so
+// a slot's resolution stays valid while its address's generation does. TotK finalizes and initializes transient
+// textures every frame: about 90 tex_gen and 160 slots_gen bumps per frame in the monsters fight, one every 16 draws,
+// which emptied every cache keyed on the global generations.
+#define AGEN_N 4096
+static uint32_t agen[AGEN_N];
+// Per slot id, for vk_texture_slot_token without the lock: the registration serial (bits 16-47; 0: never registered)
+// and the address generation index (bits 0-15), one word so a reader gets a consistent pair. Fixed-size (slot ids are
+// 20 bits), unlike tslots, which moves when it grows.
+static uint64_t *sinfo;
+static uint32_t reg_serial;
 
-static void tex_gen_bump(void) {
+static uint32_t agen_idx(uint64_t addr) { return (uint32_t)(addr * 0x9E3779B97F4A7C15ull >> 52); }
+
+static void tex_gen_bump(uint64_t addr) {
     if (!++tex_gen) tex_gen = 1;
     slots_gen++;
+    uint32_t *g = &agen[agen_idx(addr)];
+    __atomic_store_n(g, *g + 1, __ATOMIC_RELEASE);
 }
 
 static volatile long tex_ready;
@@ -415,7 +431,7 @@ static void own_remove(Tex *e) {
 
 static void destroy_tex(Tex *e) {
     own_remove(e);
-    tex_gen_bump();
+    tex_gen_bump(e->key.addr);
     nvn_hm_del(&by_key, &e->key);
     Tex *head = nvn_hm_get(&by_addr, &e->key.addr);
     if (head == e) {
@@ -426,6 +442,7 @@ static void destroy_tex(Tex *e) {
             if (p->next_at == e) { p->next_at = e->next_at; break; }
     }
     if (e->released) nreleased--;
+    vk_exec_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
     free(e);
 }
@@ -781,9 +798,9 @@ static Tex *entry_of(const tex_t *t) {
         e->next_at = nvn_hm_get(&by_addr, &k.addr);
         nvn_hm_put(&by_addr, &k.addr, e);
         nvn_hm_put(&by_key, &k, e);
-        tex_gen_bump();
+        tex_gen_bump(k.addr);
     }
-    if (e->released) e->released = 0, nreleased--, tex_gen_bump();
+    if (e->released) e->released = 0, nreleased--, tex_gen_bump(k.addr);
     e->t = *t;
     return e;
 }
@@ -845,7 +862,7 @@ void vk_texture_release(const tex_t *t) {
     if (e && !e->released) {
         e->released = 1;
         nreleased++;
-        tex_gen_bump();
+        tex_gen_bump(k.addr);
         sweep_released();
     }
     unlock();
@@ -876,11 +893,18 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
         memset(s + ntslots, 0, sizeof *s * (size_t)(n - ntslots));
         tslots = s, ntslots = n;
     }
+    if (!sinfo) {
+        uint64_t *p = calloc(1 << 20, sizeof *p);
+        if (!p) rt_fatal("vk: out of memory for texture slot tokens");
+        __atomic_store_n(&sinfo, p, __ATOMIC_RELEASE);
+    }
     TexSlot *s = &tslots[id];
     s->t = *t;
     s->used = 1;
-    s->cgen = 0;
+    s->ce = NULL;
     slots_gen++;
+    if (!++reg_serial) reg_serial = 1;
+    __atomic_store_n(&sinfo[id], (uint64_t)reg_serial << 16 | agen_idx((uintptr_t)t->mem), __ATOMIC_RELEASE);
     s->has_view = v != NULL;
     if (v) s->v = *v;
     else memset(&s->v, 0, sizeof s->v);
@@ -931,6 +955,13 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
+
+uint64_t vk_texture_slot_token(int id) {
+    const uint64_t *si = __atomic_load_n(&sinfo, __ATOMIC_ACQUIRE);
+    if (!si || id < 0 || id >= (1 << 20)) return 0;
+    uint64_t v = __atomic_load_n(&si[id], __ATOMIC_ACQUIRE);
+    return v ? (v >> 16) << 32 | __atomic_load_n(&agen[v & 0xffff], __ATOMIC_ACQUIRE) : 0;
+}
 uint32_t vk_sampler_gen(void) { return __atomic_load_n(&samp_gen, __ATOMIC_RELAXED); }
 
 const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
@@ -943,12 +974,13 @@ const VkTexImage *vk_texture_by_id(int id, view_t *view, int *has_view) {
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     if (id < 0 || id >= ntslots || !tslots[id].used) return NULL;
     TexSlot *s = &tslots[id];
-    if (s->cgen != tex_gen) {   // resolved again: an entry was created, dropped or released, or the slot registered
-        view_t v;
-        int hv;
-        s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry: tex_gen is read after it
+    uint32_t g = agen[sinfo[id] & 0xffff];
+    if (!s->ce || s->cgen != g) {   // resolved again: an entry at its address was created, dropped or released, or the
+        view_t v;                   // slot registered (s->ce cleared); an empty result is not kept: image creation may
+        int hv;                     // succeed later
+        s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry and bump g: g read before it
         s->cview = v, s->chas_view = (uint8_t)hv;
-        s->cgen = s->ce ? tex_gen : 0;      // an empty result is not kept: image creation may succeed later
+        s->cgen = g;
         s->cepoch = 0;
     }
     Tex *e = s->ce;
@@ -1561,5 +1593,6 @@ void vk_texture_shutdown(void) {
     samplers = (nvn_hmap){.klen = sizeof(samp_par)};
     free(tslots), free(sslots);
     tslots = NULL, sslots = NULL, ntslots = nsslots = 0, nreleased = 0;
+    if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
     unlock();
 }

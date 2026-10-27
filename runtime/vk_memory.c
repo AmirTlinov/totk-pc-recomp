@@ -467,8 +467,12 @@ int vk_mem_class_of(uint64_t addr) {
 // ---------------------------------------------------------------- census
 static volatile LONG64 traffic[VK_MCLS_N][VK_MUSE_N];
 
+// Every caller is the replay (vk_exec*, under vk_sync_submit's lock), about ten adds per draw: one writer at a time, so
+// a plain add, not a locked one. An add racing the census's reset may be lost.
 void vk_mem_count(int cls, int use, uint64_t bytes) {
-    if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N) InterlockedAdd64(&traffic[cls][use], (LONG64)bytes);
+    if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N)
+        __atomic_store_n(&traffic[cls][use], __atomic_load_n(&traffic[cls][use], __ATOMIC_RELAXED) + (LONG64)bytes,
+                         __ATOMIC_RELAXED);
 }
 
 static void flag_names(uint32_t f, char *buf, size_t n) {
@@ -724,9 +728,15 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     }
     int untracked = 0, changed = 0;
     for (uint64_t r = r0; r <= r1; r++) untracked |= snap_untracked[r];
-    for (uint64_t a = lo; !untracked && a < hi && !changed; a += 1ull << GEN_PAGE_SHIFT) {
-        uint32_t *s = gen_slot(a, 0);
-        if (s && *s > since) changed = 1;
+    // Pages only in regions stamped after since (reg_max; REG_SHIFT is SNAP_SHIFT): an unchanged texture of 4 MiB was
+    // 1,024 page reads, at about 1,100 texture checks a frame.
+    for (uint64_t r = r0; !untracked && r <= r1 && !changed; r++) {
+        if (reg_max[r] <= since) continue;
+        uint64_t a = r << REG_SHIFT > lo ? r << REG_SHIFT : lo, b = (r + 1) << REG_SHIFT < hi ? (r + 1) << REG_SHIFT : hi;
+        for (; a < b && !changed; a += 1ull << GEN_PAGE_SHIFT) {
+            uint32_t *s = gen_slot(a, 0);
+            if (s && *s > since) changed = 1;
+        }
     }
     *now = gen_now;   // every observation so far is in the table
     __atomic_add_fetch(&n_snap_checks, 1, __ATOMIC_RELAXED);

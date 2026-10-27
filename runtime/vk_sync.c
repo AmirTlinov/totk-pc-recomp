@@ -381,7 +381,9 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
         }
     }
     queue[qhead + qn++] = (Pending){fence, fn, arg};
-    WakeAllConditionVariable(&cv_work);
+    // The completion thread sleeps only while nothing is issued beyond done: a callback for a later value (the replay's,
+    // for the submission it records: counter reports, freed resources) becomes due through the submit, which wakes it.
+    if (fence <= done) WakeAllConditionVariable(&cv_work);
     ReleaseSRWLockExclusive(&st_lock);
 }
 
