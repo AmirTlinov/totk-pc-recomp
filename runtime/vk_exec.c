@@ -618,20 +618,29 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // queries are not: a barrier's first scope is everything earlier in submission order, image layouts belong to the image,
 // and occlusion queries end with their pass. Fences, completion callbacks and reports stay per submission: only the last
 // part signals the value. nxnative commits every 64 draws between passes; MacNativeGames after 30, then every 40.
+// A part also spans at least TOTK_SPLIT_US (1000) of replay time: a split costs about 40 us of the render thread
+// (vkQueueSubmit2, a command buffer, the mirror prologue), and a fight frame of 2,000 draws made 15 parts on the 7900X;
+// a millisecond of recording is a fraction of a millisecond of GPU work, so the GPU still starts early.
 static int split_n = -1, split_draws, part_start;
+static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs;
 
 static void maybe_split(VkExec *ex) {
     if (split_n < 0) {
         split_n = cfg_int("TOTK_SPLIT_DRAWS");
         if (split_n < 0) split_n = 0;
-        rt_log("vk: replay command buffer split every %d draws between passes%s", split_n, split_n ? "" : " (off)");
+        int us = cfg_int("TOTK_SPLIT_US");
+        split_ns = us > 0 ? (uint64_t)us * 1000 : 0;
+        rt_log("vk: replay command buffer split every %d draws between passes, parts of at least %d us%s", split_n,
+               us > 0 ? us : 0, split_n ? "" : " (off)");
     }
     if (!split_n || ex->in_pass || split_draws < split_n) return;
+    if (split_ns && kern_now_ns() - part_t0 < split_ns) return;   // split_draws stays: the next draw asks again
     split_draws = 0;
     if (ex->recorded == part_start) return;
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
+    part_t0 = kern_now_ns();
     ex->dirty = VK_EXEC_DIRTY_ALL;
     vk_exec_draw_new_cb();
     n_parts++;
@@ -734,6 +743,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
     split_draws = part_start = 0;
+    part_t0 = kern_now_ns();
     x_here = 1;
     if (n) vk_mem_mirror_begin();
     for (int i = 0; i < n; i++) {

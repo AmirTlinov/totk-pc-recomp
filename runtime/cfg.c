@@ -45,7 +45,7 @@ static const char *const known[] = {
     "RENDER_SCALE", "REPLAY_ASYNC",
     "REPLAY_CHECK", "RESOLVE_CHECK", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
     "ROMFS_PROOF_DIR", "ROMFS_VERIFY", "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS", "SHADER_CACHE",
-    "SHADER_MEMO", "SHARED_FONTS", "SHARPNESS", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SPEED_PROBE", "SPLIT_DRAWS", "SWKBD_ANSWER",
+    "SHADER_MEMO", "SHARED_FONTS", "SHARPNESS", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SPEED_PROBE", "SPLIT_DRAWS", "SPLIT_US", "SWKBD_ANSWER",
     "SWKBD_TEST", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_MEMO", "TIMER_1MS", "TRACE", "UPSCALER", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOLUME", "VS_OUTS",
     "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_PROCS",
@@ -68,7 +68,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"},
     {"TEX_ALIAS", "performance"}, {"LOD_GUARD", "performance"}, {"FIX_C0", "performance"}, {"FIX_ZERO", "performance"},
     {"BIND_SKIP", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"TEX_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
-    {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"VK_VALIDATION", "performance"},
+    {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
     {"VK_DYN_VERTEX", "performance"}, {"VK_SUBGROUP_PIN", "performance"},
     {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
 };
@@ -111,6 +111,7 @@ static const CfgMeta metas[] = {
     {"BIND_SKIP", "1", "0|1", RESTART}, {"SHADER_MEMO", "1", "0|1", RESTART}, {"PIPE_MEMO", "1", "0|1", RESTART}, {"TEX_MEMO", "1", "0|1", RESTART},
     {"DESC_TEMPLATE", "1", "0|1", RESTART},
     {"PUSH_SKIP", "1", "0|1", RESTART}, {"SPLIT_DRAWS", "64", "0..1000", RESTART},
+    {"SPLIT_US", "1000", "0..20000", RESTART},
     // Vulkan
     {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART},
     {"VK_SUBGROUP_PIN", "1", "0|1", RESTART},
