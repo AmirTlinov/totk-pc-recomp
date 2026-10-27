@@ -487,9 +487,13 @@ static void flag_names(uint32_t f, char *buf, size_t n) {
 static void dirty_frame(uint64_t frame);
 
 static void mirror_log(uint64_t frame);
+static int dead_pending(void);
+
+static void vram_log(uint64_t frame);
 
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800) mirror_log(frame);   // and the
                                                                                                          // write-watch line
@@ -1477,6 +1481,30 @@ static void mirror_log(uint64_t frame) {
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
 }
 
+// With TOTK_TRACE=perf every 600 frames: what holds device-local memory (backlog: GPU memory over long sessions).
+// VMA's blocks and allocations on the device-local heaps, texture entries with their own memory, the VRAM mirrors and
+// the objects waiting for their last submission to retire.
+static void vram_log(uint64_t frame) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(c->vma, vb);
+    uint64_t blocks = 0, block_bytes = 0, allocs = 0, alloc_bytes = 0;
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            blocks += vb[h].statistics.blockCount, block_bytes += vb[h].statistics.blockBytes,
+                allocs += vb[h].statistics.allocationCount, alloc_bytes += vb[h].statistics.allocationBytes;
+    VkTexCensus t;
+    vk_texture_census(&t);
+    const double M = 1048576.0;
+    rt_log("mem: vram frame %llu: vma %llu blocks %.0f MiB, %llu allocations %.0f MiB; textures live %llu (own memory %llu, "
+           "%.0f MiB), released %llu (own memory %llu, %.0f MiB); mirrors %lld %.0f MiB; releases pending %d",
+           (unsigned long long)frame, (unsigned long long)blocks, block_bytes / M, (unsigned long long)allocs,
+           alloc_bytes / M, (unsigned long long)t.live, (unsigned long long)t.own_live, t.bytes_live / M,
+           (unsigned long long)t.released, (unsigned long long)t.own_released, t.bytes_released / M, (long long)m_live_n,
+           m_live_bytes / M, dead_pending());
+}
+
 // Device class: INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a
 // heap that is not device-local (host memory) -> discrete; otherwise uma (import everywhere). Sets the mirror mode.
 void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceMemoryProperties *m) {
@@ -1689,6 +1717,14 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     // The open batch may record into the object: it counts as the newest user.
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl_noted};
     LeaveCriticalSection(&cmd_lock);
+}
+
+static int dead_pending(void) {
+    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
+    EnterCriticalSection(&cmd_lock);
+    int n = ndead;
+    LeaveCriticalSection(&cmd_lock);
+    return n;
 }
 
 void vk_defer_image(VkImage img, VmaAllocation alloc) {

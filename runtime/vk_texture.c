@@ -1544,6 +1544,25 @@ void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads) 
     unlock();
 }
 
+void vk_texture_census(VkTexCensus *s) {
+    VkCtx *c = vk_ctx();
+    memset(s, 0, sizeof *s);
+    lock();
+    for (uint32_t i = 0; i < by_key.cap; i++) {
+        const Tex *e = by_key.vals[i];
+        if (!e) continue;
+        uint64_t bytes = 0;
+        if (e->alloc && c) {
+            VmaAllocationInfo ai;
+            vmaGetAllocationInfo(c->vma, e->alloc, &ai);
+            bytes = ai.size;
+        }
+        if (e->released) s->released++, s->own_released += e->alloc != NULL, s->bytes_released += bytes;
+        else s->live++, s->own_live += e->alloc != NULL, s->bytes_live += bytes;
+    }
+    unlock();
+}
+
 void vk_texture_shutdown(void) {
     VkCtx *c = vk_ctx();
     lock();
