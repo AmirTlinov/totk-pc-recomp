@@ -1,6 +1,5 @@
-// Internal header of the NVN front end, shared by nvn_api_core.c (T3c) and the
-// later slices (textures, samplers, programs, windows, state objects, command buffers). Frozen after M4 T3c: later tasks
-// only append. Adapted from MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c and nvn_impl.h @ b75be8cf
+// Internal header of the NVN front end, shared by nvn_api_core.c and the other
+// slices (textures, samplers, programs, windows, state objects, command buffers). Adapted from MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c and nvn_impl.h @ b75be8cf
 // (MIT, Copyright (c) 2026 jhaizhou; origin d2r-mobile).
 #pragma once
 #include <stdint.h>
@@ -61,7 +60,7 @@ uint64_t gfx_replayed_submits(void);                       // newest submit numb
 extern GfxStats gfx_counters;                              // behind gfx_stats(); add with __atomic_fetch_add. frames:
                                                            // the back end's present; nvn_calls/nvn_distinct: NVN_API
 
-// ---- T3d (nvn_api_obj.c): textures, samplers, programs, windows
+// ---- nvn_api_obj.c: textures, samplers, programs, windows
 #define NVN_TEX_MAGIC MAGIC('T', 'E', 'X', 0)              // tex_t.magic of an initialized texture
 #define NVN_SAMP_MAGIC MAGIC('S', 'M', 'P', 0)             // samp_t.magic
 #define NVN_PROG_MAGIC MAGIC('P', 'R', 'O', 'G')           // prog_t.magic
@@ -72,7 +71,7 @@ int nvn_tex_live_at(const void *mem, tex_t *out);
 // Byte offset of a view's first level and layer inside the texture storage (nvnTextureGetViewOffset); v may be NULL.
 uint64_t nvn_tex_view_offset(const tex_t *t, const view_t *v);
 
-// ---- T3e (nvn_api_cmd.c, nvn_ext.c): command buffers and their replay contract
+// ---- nvn_api_cmd.c, nvn_ext.c: command buffers and their replay contract
 // A command handle (what QueueSubmitCommands receives) points at a host copy of one recording: a flat sequence of
 // 8-byte-aligned records {op_hdr, payload}, OP_BEGIN first and OP_END last. Called recordings are inlined, so a copy
 // holds no OP_CALL or OP_JUMP. Texture pointers in payloads (p_set_rt, p_copy_b2t, p_copy_t2t, p_clear_tex) are

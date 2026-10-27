@@ -23,7 +23,7 @@
 // input id, can be translated again under a new translator without guest memory (gfx_shader_load_input,
 // gfx_shader_prewarm).
 //
-// Reflection (T6b): every shader that enters the cache has its .res.json parsed into GfxShaderRes arrays and its SPIR-V
+// Reflection: every shader that enters the cache has its .res.json parsed into GfxShaderRes arrays and its SPIR-V
 // scanned for interface Locations and the workgroup size (gfx.h accessors at the end of the file).
 //
 // Provenance: the c2 handle ranges of handle_slot are those of MacNativeGames' totk_xlate Service.cs (MIT).

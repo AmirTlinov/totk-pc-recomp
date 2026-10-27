@@ -2,7 +2,7 @@
 // contributors): runtime_frame_step_update (2338bb0: no 1/120 s floor) and the speed survey's player chain
 // (world_survey.c player_actor).
 // Frame rate: the frame limit and the real-time frame step, the host half of the patch sets fps60, realtime and cloth
-// (build tables patches-v121.txt, patches-v143.txt; docs/research/macnativegames.md section 6.2).
+// (build tables patches-v121.txt, patches-v143.txt).
 //
 // TotK's adaptive present-interval controller (main+0x8f26c8) turns the main thread's measured work into a number of
 // 60 Hz ticks clamped to [minimum, maximum]; shipping data sets the minimum to 2 (30 fps), the set fps60 lowers it to

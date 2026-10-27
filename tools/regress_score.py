@@ -1,7 +1,7 @@
 """Score a game log and its TOTK_SHOTS frames for tools/regress.py.
 
 Log metrics come from the TOTK_TRACE=perf lines (runtime/prof_win.c `perf_present`); frame metrics look for the two
-glitches the M5 targets name: near-black blocks inside a lit picture and a far field that lost its detail.
+glitches it targets: near-black blocks inside a lit picture and a far field that lost its detail.
 """
 import re
 import statistics

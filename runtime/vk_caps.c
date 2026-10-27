@@ -7,7 +7,7 @@
 //     storage offsets from the guest address rounded down to that alignment (Ryujinx's unaligned storage path), and
 //     vk_exec_draw.c ssbo_info binds the rounded-down address, so shader writes reach guest memory instead of a copy.
 //   - no graphics pipeline library with fast linking (TOTK_GPL=0 forces it): vk_caps.gpl = 0, the extension stays
-//     disabled, and pipelines are built whole as in M4.
+//     disabled, and pipelines are built whole.
 //   - no 32-lane pin (no subgroupSizeControl, 32 outside min..max, or TOTK_VK_SUBGROUP_PIN=0): stages run at the
 //     device's subgroupSize (SPIR-V 1.3 without a required size) and the translator is told that size.
 //     TOTK_VK_SUBGROUP=<n> pins n instead of 32 where the driver allows it.

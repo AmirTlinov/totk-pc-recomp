@@ -1,4 +1,4 @@
-// Vulkan memory of the M4 graphics layer: NVN memory pools as Vulkan
+// Vulkan memory of the graphics layer: NVN memory pools as Vulkan
 // buffers, the virtual-pool page table, GPU address resolution, page write generations for re-uploads, and the
 // upload batch (command buffer, staging buffers, deferred destruction) that vk_texture.c records into.
 //
@@ -1581,7 +1581,7 @@ static int nspare, cap_spare;
 static uint64_t next_seq, done_seq;   // batches handed out / completed (all batches up to done_seq)
 static Dead *dead;
 static int ndead, cap_dead;
-static uint64_t tl_noted;             // newest timeline value T6 reported submitted
+static uint64_t tl_noted;             // newest timeline value vk_sync.c reported submitted
 
 static BOOL CALLBACK cmd_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     (void)o, (void)p, (void)ctx;

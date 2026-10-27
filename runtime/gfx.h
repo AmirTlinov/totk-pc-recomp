@@ -1,5 +1,4 @@
-// Shared interface of the M4 graphics layer. Owned by T1; frozen after T1, changes by
-// agreement. Every function here has a weak named-fatal stand-in in gfx_stubs.c until its task lands.
+// Interface of the graphics layer: window, shader service, back ends and the NVN front end.
 #pragma once
 #include <stdint.h>
 #include "host.h"
@@ -17,7 +16,7 @@ const OvNvState *ov_nv_state(void);                        // ov_gfx.c
 #define RT_GPU_VA_BASE 0x8000000000ull                     // 2^39, never mapped on the host
 #define RT_GPU_VA_SIZE (64ull << 30)
 
-// ---- window, vsync, focus (gfx_window.c, vk_device.c: T2). Host threads only; never run guest code.
+// ---- window, vsync, focus (gfx_window.c, vk_device.c). Host threads only; never run guest code.
 void gfx_window_start(void);                               // window thread, Vulkan device, swapchain; idempotent
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
@@ -25,7 +24,7 @@ uint64_t gfx_vsync_time_ns(uint64_t tick);                 // kern_now_ns() time
 double gfx_window_refresh_hz(void);                        // refresh rate of the window's monitor; 0 unknown
 int gfx_window_focused(void);
 
-// ---- shader service client (gfx_shader.c: T4)
+// ---- shader service client (gfx_shader.c)
 enum { GFX_STAGE_VS, GFX_STAGE_TCS, GFX_STAGE_TES, GFX_STAGE_GS, GFX_STAGE_FS, GFX_STAGE_CS };
 enum { GFX_TEX_1D = 1, GFX_TEX_1D_ARRAY, GFX_TEX_BUFFER, GFX_TEX_2D, GFX_TEX_2D_ARRAY, GFX_TEX_2D_MS,
        GFX_TEX_2D_MS_ARRAY, GFX_TEX_3D, GFX_TEX_CUBE, GFX_TEX_CUBE_ARRAY };   // gfx_shader.c tex_names order
@@ -59,7 +58,7 @@ const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate);
 // Boot prewarm: out[i] = gfx_shader_load_input(iids[i], 1) on `threads` threads with up to `procs` translators, then
 // every other stored input not cached under this translator is translated. Logs progress and the total.
 void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **out, int threads, int procs);
-// Answers met in play (Task 2.3): from this call on, every (program, answers) a gfx_shader_get* call resolves is appended
+// Answers met in play: from this call on, every (program, answers) a gfx_shader_get* call resolves is appended
 // to shader-answers.bin, and its program to shader-programs.bin, in the directory of `keys_path` (pipeline-keys.bin).
 void gfx_shader_record_at(const char *keys_path);
 void gfx_shader_record_flush(int force);                   // appends pending records; without force at most every 2 s
@@ -75,7 +74,7 @@ const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
 const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
-// Reflection (T6b): parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
+// Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
 typedef struct {
     uint16_t set, binding;      // as the SPIR-V decorates them: set 0, bindings from 1 per shader (0: support buffer)
@@ -98,7 +97,7 @@ uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input 
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);   // Output Locations (VS varyings, FS colour targets)
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]);     // CS: the LocalSize execution mode; 1, 1, 1 otherwise
 
-// ---- back end (gfx_null.c: T3; vk_*.c: T5, T6). Called by nvn_api.c on guest threads.
+// ---- back end (gfx_null.c, vk_*.c). Called by nvn_api.c on guest threads.
 typedef struct {
     const char *name;
     int  (*pool_init)(pool_t *p);                          // 0 fails MemoryPoolInitialize
@@ -126,7 +125,7 @@ typedef struct {
 extern const GfxBackend gfx_null_backend, gfx_vulkan_backend;
 const GfxBackend *gfx_backend(void);                       // TOTK_GPU=null|vulkan (default vulkan)
 
-// ---- NVN front end (nvn_procs.c: T3a)
+// ---- NVN front end (nvn_procs.c)
 void nvn_procs_register(void);                             // hostfn_register every proc; before hostfn_seal (ov_gfx.c)
 uint64_t nvn_proc_address(const char *name);               // synthetic host address of a proc, 0 for an unknown name
 

@@ -1,4 +1,4 @@
-// Vulkan textures of the M4 graphics layer: a VkImage cache keyed by storage
+// Vulkan textures of the graphics layer: a VkImage cache keyed by storage
 // GPU address plus descriptor, uploads through staging buffers with block-linear deswizzle and ASTC decode (vk_astc.c),
 // re-uploads when page write generations (vk_memory.c) show the storage written, ReadTexels / WriteTexels, the texture
 // and sampler descriptor slots, and VkSamplers.

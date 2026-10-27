@@ -2,7 +2,7 @@
 // Ported from MacNativeGames games/totk/tests/texture_auto_layout/probe.c @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou).
 // The 40 size and block-height goldens are original-SDK CPU queries for uncompressed and BC3-sRGB boundary cases; no game bytes.
 // The old rounded-up heuristic mismatches 16 of them, including the 160x160 shrine pad. MNG's nvn_bl_offset address checks
-// belong to the deswizzler (M4 T5) and are not part of this probe.
+// belong to the deswizzler and are not part of this probe.
 #include <stdint.h>
 #include <stdio.h>
 #include "host.h"

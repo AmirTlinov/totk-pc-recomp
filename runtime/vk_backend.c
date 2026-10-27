@@ -352,7 +352,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
     replay_enqueue(&it);
 }
 
-// Pipelines (T6b) drop a released program's pipelines here.
+// vk_pipeline.c drops a released program's pipelines here.
 WEAK void vk_program_release(const prog_t *p) { (void)p; }
 
 static int vk_be_pool_init(pool_t *p) { vk_sync_start(); return vk_pool_init(p); }

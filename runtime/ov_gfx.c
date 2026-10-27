@@ -1,9 +1,9 @@
 // Adapted from MacNativeGames games/totk/runtime/frontend.m (nn::vi, lines 345-359) and gfx_bridge.c (nv, lines
 // 74-86) @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames contributors). The nvnBootstrapLoader stop takes the place
 // of MacNativeGames' NVN entry (third_party/d2r_gfx/gfx/nvn/hle_nvn.c:115-118); no code of it is copied.
-// Graphics bring-up without a GPU:
-//   nv::*        record the game's allocator callbacks and graphics work memory (guest addresses) for M4
-//   nn::vi::*    display, layer and native window identities; the vsync event is bound, nothing signals it in M3
+// Graphics bring-up:
+//   nv::*        record the game's allocator callbacks and graphics work memory (guest addresses) for the NVN layer
+//   nn::vi::*    display, layer and native window identities; the vsync event is bound here
 //   nvnBootstrapLoader   the end of --boot (rt_boot_event "nvn"); otherwise the synthetic address of an NVN proc (nvn_procs.c)
 #include <windows.h>
 #include <stdint.h>
@@ -40,7 +40,7 @@ static void ov_initialize_graphics(Cpu *c) {
     nv.memory_size = size;
     nv.initialized = 1;
     ReleaseSRWLockExclusive(&lock);
-    rt_log("nv: graphics work memory %#llx+%#llx recorded (no GPU in M3)", (unsigned long long)mem,
+    rt_log("nv: graphics work memory %#llx+%#llx recorded", (unsigned long long)mem,
            (unsigned long long)size);
 }
 
@@ -84,7 +84,7 @@ static void ov_create_layer(Cpu *c) {
     ret_x(c, 0);
 }
 
-// Result nn::vi::GetNativeWindow(void **out, Layer *layer): a placeholder the NVN layer of M4 recognises
+// Result nn::vi::GetNativeWindow(void **out, Layer *layer): a placeholder the NVN layer recognises
 static void ov_native_window(Cpu *c) {
     void **out = arg_p(c, 0);
     if (!out || !vi_up() || arg_p(c, 1) != layer) { ret_x(c, VI_R_INVALID); return; }

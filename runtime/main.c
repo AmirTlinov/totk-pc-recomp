@@ -3,13 +3,12 @@
 //   totk.exe [--exefs DIR] [--romfs DIR] [--profile DIR] <mode>
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
-//     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    task probes (T2-T5)
-//     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes (M4 T1); needs no game files
-//     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    M4 probes
+//     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    host probes
+//     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
+//     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
-//                       "not built yet", exit 2, until their task lands
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
-//     --boot            run the game to the first NVN call (T6)
+//     --boot            run the game to the first NVN call
 //     --frames N        run the game (implies --boot's start-up) until the Nth present, then exit 0
 //     --shot PNG        with --frames: save the Nth frame; env TOTK_GPU=null|vulkan selects the back end
 //     (no mode)         run the game
@@ -202,7 +201,7 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     ExitProcess(71);
 }
 
-// ---- self-test (milestone M2): layout, dispatch table, host-function registry, without game files
+// ---- self-test: layout, dispatch table, host-function registry, without game files
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
 

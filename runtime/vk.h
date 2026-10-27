@@ -1,5 +1,4 @@
-// Vulkan-internal header of the M4 graphics layer. Owned by T2; shared with T5 and
-// T6 by agreement. Host code only; the guest never sees it.
+// Vulkan-internal header of the graphics layer. Host code only; the guest never sees it.
 #pragma once
 #ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR 1
@@ -11,8 +10,8 @@
 #pragma clang diagnostic ignored "-Wnullability-completeness"
 #include "vk_mem_alloc.h"
 #pragma clang diagnostic pop
-#include "nvn_obj.h"   // pool_t, tex_t, view_t, samp_par, NVNcopyRegion (memory and textures block, T5)
-#include "gfx.h"       // GfxShader, GfxShaderRes, GfxShaderAnswers (pipelines block, T6b)
+#include "nvn_obj.h"   // pool_t, tex_t, view_t, samp_par, NVNcopyRegion (memory and textures block)
+#include "gfx.h"       // GfxShader, GfxShaderRes, GfxShaderAnswers (pipelines block)
 
 // Required (device choice fails without them): Vulkan 1.3; VK_KHR_swapchain, VK_KHR_push_descriptor,
 // VK_EXT_depth_clip_control, VK_EXT_external_memory_host; features timelineSemaphore, dynamicRendering,
@@ -31,7 +30,7 @@ typedef struct VkCtx {
     VkQueue xfer_queue;                     // equals gfx_queue when xfer_shared
     int xfer_shared;                        // 1: no separate queue; serialise with gfx_queue
     VmaAllocator vma;
-    VkSemaphore timeline;                   // one timeline semaphore; values are issued by T6
+    VkSemaphore timeline;                   // one timeline semaphore; values are issued by vk_sync.c
     VkDebugUtilsMessengerEXT messenger;
     volatile long validation_errors;        // errors seen by the messenger (TOTK_VK_VALIDATION=1)
     int validation;                         // layer active
@@ -71,7 +70,7 @@ int vk_init(void);                          // idempotent; 1 on success, 0 on fa
 void vk_shutdown(void);
 int vk_selftest(void);                      // 0 on success
 
-// ---- window and present (gfx_window.c, T2). Host threads only.
+// ---- window and present (gfx_window.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled
 // to the swapchain extent, into the acquired swapchain image and presents it. src is in layout, which is
 // VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL (its writes made visible to the transfer stage by the caller's barrier) or
@@ -99,8 +98,8 @@ unsigned gfx_window_focus_messages(void);          // OE_MSG_FOCUS_STATE_CHANGED
 void gfx_window_release_vk(void);                  // vk_shutdown calls it first: destroys swapchain, surface, present objects
 long vk_validation_errors_total(void);             // validation errors since the first vk_init, across vk_shutdown
 
-// ---- memory and textures (vk_memory.c, vk_texture.c: T5)
-// Guest or host threads; every call needs vk_init(). The first nine have the GfxBackend signatures of gfx.h; T6 builds
+// ---- memory and textures (vk_memory.c, vk_texture.c)
+// Guest or host threads; every call needs vk_init(). The first nine have the GfxBackend signatures of gfx.h; vk_backend.c builds
 // gfx_vulkan_backend from them.
 int  vk_pool_init(pool_t *p);              // CPU-visible: guest storage imported (VK_EXT_external_memory_host) as one
                                            // VkBuffer; physical: device-local memory; virtual: a 64 KiB page table
@@ -189,7 +188,7 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked); 
 // vk_upload_flush(0) before each submission that may read uploaded images; queue order and the batch's closing
 // barrier make the uploads visible to it. Returns the batch sequence number; wait=1 blocks until it completed.
 // TOTK_FIX_ZERO (default 1): physical pools are zeroed once at creation and GPU-only images with memory of their own
-// are cleared when created; 0 leaves both as the driver hands them out (M4).
+// are cleared when created; 0 leaves both as the driver hands them out.
 int vk_fix_zero(void);
 VkCommandBuffer vk_upload_begin(void);
 void vk_upload_end(void);
@@ -221,11 +220,11 @@ void vk_astc_time_enable(int on);
 int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us);   // totals so far
 void vk_astc_time_summary(void);        // logs the totals
 void vk_astc_release(void);             // vk_device.c, before the device goes: frees the decoder's objects
-void vk_mem_note_submit(uint64_t timeline_value);  // T6: after each submit that signals ctx->timeline with this value
+void vk_mem_note_submit(uint64_t timeline_value);  // vk_sync.c: after each submit that signals ctx->timeline with this value
 void vk_mem_collect(void);                         // frees what has completed
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
 void vk_mem_stats(VkMemStats *s);
-void vk_mem_shutdown(void);                        // before vk_shutdown: waits idle, frees every T5 object
+void vk_mem_shutdown(void);                        // before vk_shutdown: waits idle, frees every memory and texture object
 
 // Textures. Images are keyed by storage GPU address plus descriptor and stay in VK_IMAGE_LAYOUT_GENERAL. A mirrored
 // texture (CPU-written pool storage, MNG tex_mirrored) is uploaded on first use and again when its storage pages were
@@ -298,7 +297,7 @@ int vk_sampler_params(int id, samp_par *out);       // parameters of a sampler s
 // 8-bit RGBA PNG with stored deflate blocks (boot.c); stops with rt_fatal when the file cannot be written.
 void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
 
-// ---- submission, synchronisation, completion (vk_sync.c, vk_backend.c: T6a)
+// ---- submission, synchronisation, completion (vk_sync.c, vk_backend.c)
 // Fence values are ctx->timeline values: each submission signals the next one, in submit order. A value counts as done
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
@@ -309,7 +308,7 @@ uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
-// The op-stream replay (vk_exec.c: T6c): records the command handles of one submission into cb, which the caller has
+// The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has
 // begun and ends. fence is the value this submission will signal. Returns the number of commands recorded into the
 // command buffer it holds at the end (0: that one stays empty and is not submitted). A weak vk_sync.c version accepts
 // empty streams only.
@@ -327,10 +326,10 @@ int rdoc_active(void);
 void rdoc_after_present(uint64_t frame);
 void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
 int vk_replay_async(void);                 // TOTK_REPLAY_ASYNC (default 1): submissions replay on the replay thread
-void vk_program_release(const prog_t *p);  // GfxBackend.program_release: pipelines (T6b); weak no-op in vk_backend.c
+void vk_program_release(const prog_t *p);  // GfxBackend.program_release: vk_pipeline.c; weak no-op in vk_backend.c
 void vk_backend_shutdown(void);            // presents, vk_sync_shutdown, vk_mem_shutdown, vk_shutdown in that order
 
-// ---- pipelines (vk_pipeline.c: T6b)
+// ---- pipelines (vk_pipeline.c)
 // Binding model (comment block at the top of vk_pipeline.c): one descriptor set, set 0, per pipeline. Binding 0 is
 // Ryujinx's support buffer (a uniform buffer every stage shares); the vertex stage keeps its own bindings, the fragment
 // stage's follow them (its SPIR-V is renumbered). Set 0 is a push-descriptor set unless the pipeline needs more than

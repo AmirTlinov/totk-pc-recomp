@@ -1,7 +1,7 @@
 // Transfers of the Vulkan op-stream replay: buffer and texture copies, texture
 // clears, event signals, counter reports and conditional rendering. vk_exec.c (T6c1) calls vk_exec_op_xfer for these ops.
 //
-// Buffers are guest memory: vk_mem_resolve maps an address to the VkBuffer behind its pool, textures are the T5b images
+// Buffers are guest memory: vk_mem_resolve maps an address to the VkBuffer behind its pool, textures are the vk_texture.c images
 // (linear texel layout, GENERAL layout; block-linear storage is only converted when a mirrored texture is uploaded). So a
 // copy is one Vulkan transfer command and the pitch of a buffer side comes from the payload (OP_COPY_STRIDE or the
 // tight row). Every copy ends the open pass and starts with a full barrier. Destinations: an image is marked

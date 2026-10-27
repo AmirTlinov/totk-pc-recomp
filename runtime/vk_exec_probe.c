@@ -1,4 +1,4 @@
-// totk.exe --probe-vkexec: the Vulkan replay of M4 T6, through gfx_vulkan_backend. Sync part (task T6a): empty
+// totk.exe --probe-vkexec: the Vulkan replay, through gfx_vulkan_backend. Sync part: empty
 // submissions get consecutive fence values; fence_wait and fence_done agree; completion callbacks run in submit order on
 // the completion thread; a guest-memory word a callback writes is visible once fence_wait returns; finish drains every
 // submission; a present of a cleared vk_texture.c image (layout GENERAL) reads back exactly through the swapchain
@@ -56,7 +56,7 @@ static int test_sync(const GfxBackend *b, uint8_t *guest, uint64_t *first, uint6
     uint64_t prev = b->fence_done();
     *first = prev + 1;
     for (int i = 0; i < SUBMITS; i++) {
-        vk_completion_add(prev + 1, note, (void *)(uintptr_t)(prev + 1));   // queued before the value exists, as T6c does
+        vk_completion_add(prev + 1, note, (void *)(uintptr_t)(prev + 1));   // queued before the value exists, as vk_exec.c does
         uint64_t f = b->submit(i % 3 ? handles : NULL, i % 3);
         CHECK(f == prev + 1, "submission %d got fence %llu after %llu", i, (unsigned long long)f, (unsigned long long)prev);
         CHECK(b->fence_done() <= f, "fence_done %llu ahead of the newest submission %llu",
@@ -460,7 +460,7 @@ static int test_draw(const GfxBackend *b, uint8_t *guest, int *n_drawn, int *n_t
         int diff = 0;
         for (int k = 0; k < TEX_W * TEX_H; k++) diff += px[k] != clear_v;
         if (diff) drawn = diff, hit = prog;
-        if (diff && vk_caps.gpl) {   // the same draw through the shared set 0 layout: texel-equal (Task 2.2)
+        if (diff && vk_caps.gpl) {   // the same draw through the shared set 0 layout: texel-equal
             static uint32_t px2[TEX_W * TEX_H];
             int was = vk_pipeline_set_indep(0);
             f = b->submit(&handle, 1);

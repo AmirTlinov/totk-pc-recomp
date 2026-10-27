@@ -1,4 +1,4 @@
-// Shared interface of the M3 host runtime. Owned by T1; changes by agreement.
+// Interface of the host runtime: guest memory, modules, kernel, IPC, file system and boot.
 //
 // Guest addresses are host addresses. Every guest-visible region lies below 2^39 (IPC buffer descriptors carry 39
 // address bits). Fixed parts of the guest address map:
@@ -78,7 +78,7 @@ static inline void ret_x(Cpu *c, uint64_t v) { c->x[0] = v; }
 static inline void ret_s(Cpu *c, float f) { uint32_t b; memcpy(&b, &f, 4); c->v[0] = b; }
 static inline void ret_d(Cpu *c, double d) { uint64_t b; memcpy(&b, &d, 8); c->v[0] = b; }
 
-// ---- host functions (hostfn.c, T1)
+// ---- host functions (hostfn.c)
 // Every host function is a GuestFn at a synthetic address RT_HOSTFN_BASE + 16*i. It runs on the calling guest thread,
 // may clobber x0-x18, v0-v7, v16-v31, must preserve x19-x29, sp, v8-v15, tpidr, and returns to the guest BL site with
 // a C return. On entry c->pc holds the function's own synthetic address.
@@ -113,7 +113,7 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...);         // host -> guest, sec
 #define RT_RET_HOST 0x70200ff000ull                        // x30 sentinel inside the host-function window; a jump to
                                                            // it is a named fatal
 
-// ---- guest memory (memory.c, T1)
+// ---- guest memory (memory.c)
 typedef struct { uint64_t base, size; } RtRange;
 typedef struct { RtRange aslr, stack, heap, alias, kernel, hostfn; uint64_t pool; } RtGuestLayout;
 typedef struct { uint64_t base, size; uint32_t state, attr, perm, ipc, device, pad; } RtMemoryInfo;   // Horizon layout
@@ -151,7 +151,7 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
                                                            // regions frozen now; freezes and thaws since the last call
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
 
-// ---- modules (loader.c, T1)
+// ---- modules (loader.c)
 typedef struct {
     const char *name; uint64_t base, size, text_end, data_off;   // text_end, data_off: offsets from base
     uint64_t init, init_array, init_array_size, ctor_flag;  // absolute guest addresses; init_array_size in bytes
@@ -173,7 +173,7 @@ extern const char rt_default_exefs[], rt_default_romfs[], rt_default_profile[];
 extern const int rt_game_version;                          // the game build: 121 (1.2.1) or 143 (1.4.3)
 #define RT_V143 (rt_game_version >= 143)
 
-// ---- kernel (kernel.c, T2)
+// ---- kernel (kernel.c)
 typedef struct RtThread RtThread;
 Cpu *kern_cpu(void);                                       // current guest thread's Cpu, NULL on host threads
 uint32_t kern_main_thread(Cpu **cpu);                      // main thread object and Cpu for the calling host thread
@@ -211,14 +211,14 @@ uint64_t kern_now_ns(void);
 typedef struct { uint64_t svcs, threads, host_calls; } RtStats;
 RtStats rt_stats(void);                                    // host_calls: hostfn_calls()
 
-// ---- IPC (ipc.c, T3)
+// ---- IPC (ipc.c)
 int ipc_svc(Cpu *c, uint32_t imm);                         // 0x15, 0x1F, 0x21, 0x22; 1 if handled
 void ipc_handle_closed(int kind, void *obj);               // CloseHandle on a KERN_SESSION/KERN_TMEM handle
 
-// ---- file system (romfs.c / fs_host.c, T5)
+// ---- file system (romfs.c / fs_host.c)
 void fs_init(void);                                        // idempotent; paths from rt_config()
 
-// ---- account (ov_system.c, T4)
+// ---- account (ov_system.c)
 void account_uid(uint64_t out[2]);                         // the local user's nn::account::Uid {lo, hi}, persistent in
                                                            // <profile>/account.uid; fs_host.c names save data after it
 
@@ -241,26 +241,25 @@ int64_t frame_step_world_us(void);                         // game time since th
                                                            // (TOTK_FPS_LIMIT, live)
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
-// ---- boot (boot.c T6, main.c T1)
+// ---- boot (boot.c, main.c)
 typedef struct { const char *exefs, *romfs, *profile; int boot; int frames; const char *shot, *gpu; } RtConfig;
                                                            // romfs: directory with romfs.bin and index.json;
                                                            // frames: --frames N (0 = no limit); shot: --shot
                                                            // PATH; gpu: TOTK_GPU
 const RtConfig *rt_config(void);
 void rt_boot_event(const char *what, Cpu *c, const char *detail);   // checkpoint log; "nvn" ends --boot
-void rt_boot(void);                                        // T6: steps 9-14 of section 1
+void rt_boot(void);                                        // boot.c
 // Modes of totk.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the
 // modules, registers its host functions, then seals (hostfn_seal, or implicitly at the first rt_call). Return the
 // process exit code.
 int probe_cfg(void);                                       // cfg_probe.c
 int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_services(void), probe_fs(void);
-int probe_gfx_abi(void);                                   // M4 T1: gfx_abi_probe.c
-int probe_vkdevice(void);                                 // M4 T2: vk_device.c
-int probe_nvn(void), probe_nvn_tex(void);                  // M4 T3: nvn_probe.c
-int probe_window(void);                                    // M4 T2
-int probe_shader(void);                                    // M4 T4
-int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // M4 T5, T6
+int probe_gfx_abi(void);                                   // gfx_abi_probe.c
+int probe_vkdevice(void);                                 // vk_device.c
+int probe_nvn(void), probe_nvn_tex(void);                  // nvn_probe.c, nvn_tex_probe.c
+int probe_window(void);                                    // gfx_window.c
+int probe_shader(void);                                    // gfx_shader.c
+int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
-// gfx_stubs.c defines each of these weakly: prints "probe-x: not built yet", returns 2.

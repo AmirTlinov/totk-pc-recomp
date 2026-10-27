@@ -7,8 +7,8 @@
 //
 // Per command buffer the replay keeps transient memory (support buffers, copied uniform ranges, generated indices),
 // descriptor pools, image views and the storage-buffer ranges the GPU may write; all of it is freed, and the ranges are
-// reported with vk_guest_written, from one completion callback once the submission's fence is done (T5b: the write
-// watch does not see GPU writes). Nothing here locks: it runs on the submitting thread under vk_sync_submit's lock.
+// reported with vk_guest_written, from one completion callback once the submission's fence is done (the write watch
+// does not see GPU writes). Nothing here locks: it runs on the submitting thread under vk_sync_submit's lock.
 //
 // Provenance: the op semantics (bind ops, program and slot conventions, draw and dispatch flow, vertex streams with a
 // zeroed buffer for unbound ones) follow MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m:7409-7460,
@@ -122,7 +122,7 @@ static struct {
 } B;
 
 // Contents of B.ds_last: the set's packed descriptors (VkDescSlot), which with its layout determine every write. A draw
-// whose allocated set would hold the same reuses the set instead of allocating and writing one (Task 2.2's per-draw
+// whose allocated set would hold the same reuses the set instead of allocating and writing one (a per-draw
 // cost). psig: the same for the last push per set number; a push equal to it under the same layout is not recorded
 // again (the descriptors stay bound across pipeline binds of that layout).
 #define DS_SIG_BYTES (MAX_DESC * sizeof(VkDescSlot))
