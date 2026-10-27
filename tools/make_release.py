@@ -79,6 +79,8 @@ PINS = {
                       '065076fe13d39ab97eea4740596426d5ae741b5044e48e1c9495d04835c92dbe'),
     'vma': (MSYS2 + 'mingw-w64-ucrt-x86_64-vulkan-memory-allocator-3.4.0-1-any.pkg.tar.zst',
             '44c81162337915afecda3185f66fd98268a54454580b2717080c9dfef57fe781'),
+    'zstd': (MSYS2 + 'mingw-w64-ucrt-x86_64-zstd-1.5.7-2-any.pkg.tar.zst',   # static libzstd.a (runtime/resolution.c)
+             'dbdb8427280046a2b41697780aa4c52983b708082b0da4755951dc3bea96ca89'),
 }
 # The component MSI inside the python.org installer that carries Tcl/Tk and tkinter (Burn names its payloads a0..a27).
 TCLTK_PAYLOAD = ('a12', 'ac87609db3f715404dd41a989c2f1706ea1512f3d86217f938d11c63af8eb505')
@@ -295,6 +297,10 @@ def build_deps(out):
             copy_tree(root / 'include' / inc, d / 'include' / inc)
         for lib in libs:
             shutil.copy2(root / 'lib' / lib, d / 'lib')
+    zstd = unpack('zstd') / 'ucrt64'
+    for name in ('zstd.h', 'zstd_errors.h'):
+        shutil.copy2(zstd / 'include' / name, d / 'include')
+    shutil.copy2(zstd / 'lib' / 'libzstd.a', d / 'lib')
 
 
 def collect_licenses(out):
@@ -306,6 +312,8 @@ def collect_licenses(out):
         (unpack('vulkan-loader') / 'ucrt64' / 'share' / 'licenses' / 'vulkan-loader' / 'LICENSE', 'vulkan-loader-LICENSE.txt'),
         (unpack('vma') / 'ucrt64' / 'share' / 'licenses' / 'VulkanMemoryAllocator' / 'LICENSE', 'vulkan-memory-allocator-LICENSE.txt'),
         (unpack('sdl3-dll') / 'LICENSE.txt', 'SDL3-LICENSE.txt'),
+        (unpack('zstd') / 'ucrt64' / 'share' / 'licenses' / 'zstd' / 'LICENSE', 'zstd-LICENSE.txt'),
+        (ROOT / 'runtime' / 'shaders' / 'ffx' / 'LICENSE.txt', 'FidelityFX-FSR-LICENSE.txt'),
         (MAIN_ROOT / 'toolchain' / 'hactool' / 'LICENSE', 'hactool-LICENSE.txt'),
         (MAIN_ROOT / 'refs' / 'MacNativeGames' / 'LICENSE', 'MacNativeGames-LICENSE.txt'),
     ]

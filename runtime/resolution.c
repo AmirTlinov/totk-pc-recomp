@@ -12,8 +12,10 @@
 //
 // Patch page: +16 the scene size {w, h} as floats, +32 the output size and +48 the swapchain size as {w, h} in one
 // 64-bit word, +40 the renderer (1.2.1) or display configuration (1.4.3) the patched code stores there.
-// Both versions scale the scene they read by output width / 1920 (MacNativeGames measured it on 1.4.3: 2560x1440 asked
-// on a 2560x1440 canvas rendered 3408x1920), so the page holds the wanted size divided by that factor.
+// 1.4.3 scales the scene it reads by output width / 1920 (a 2560x1440 output renders its 1600x900 scene at 2128x1200;
+// MacNativeGames measured the same), so its page holds the wanted size divided by that factor and the game's 5/6 needs
+// no scene patch. 1.2.1 renders the size it reads (1600x900 on a 2560x1440 output): its page holds the wanted size, and
+// the scene set is on whenever the output differs from 1920x1080.
 //
 // Heap: agl's DynamicTextureAllocator is one fixed heap, "DynamicTextureAllocatorMem" in
 // System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs (113664 KiB, carved from "Graphics", 201728 KiB). At 2560x1440
@@ -199,12 +201,13 @@ void res_init(void) {
         return;
     }
     fs_init();   // romfs.c serves the grown HeapDef from here on (res_heapdef_served)
-    if (!R.heapdef_ok) {
+    if (res_heap_extra_kib() && !R.heapdef_ok) {   // sizes at or below the shipped ones fit the shipped heaps
         rt_log("resolution: no grown HeapDef table; the game keeps its own resolution");
         return;
     }
     uint8_t *page = rt_patch_page();
-    double k = (double)R.ow / BASE_W;   // the game's own scaling of the scene with the output width
+    double k = RT_V143 ? (double)R.ow / BASE_W : 1.0;   // 1.4.3's own scaling of the scene with the output width
+    int scene_on = R.scene_set || (!RT_V143 && (R.ow != BASE_W || R.oh != BASE_H));
     float sc[2] = {(float)(R.sw / k), (float)(R.sh / k)};
     uint64_t out = pack(R.ow, R.oh), none = 0;
     memcpy(page + 16, sc, sizeof sc);
@@ -212,7 +215,7 @@ void res_init(void) {
     memcpy(page + 40, &none, 8);
     memcpy(page + 48, &out, 8);
     rt_patch_switch(output, R.ow != BASE_W || R.oh != BASE_H);
-    rt_patch_switch(scene, R.scene_set);
+    rt_patch_switch(scene, scene_on);
     rt_log("resolution: output %ux%u, scene %ux%u%s; texture heap +%llu KiB", R.ow, R.oh, R.sw, R.sh,
-           R.scene_set ? "" : " (the game's 5/6)", (unsigned long long)res_heap_extra_kib());
+           scene_on ? "" : " (the game's own 5/6 of the output)", (unsigned long long)res_heap_extra_kib());
 }
