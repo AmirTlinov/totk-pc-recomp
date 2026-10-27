@@ -956,7 +956,9 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
     ImGui::Begin("##perf", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
-    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());   // over the menu while it is open
+    // under the menu while it is open (the settings stay readable), else over everything
+    if (g_open.load(std::memory_order_relaxed)) ImGui::BringWindowToDisplayBack(ImGui::GetCurrentWindow());
+    else ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
     ImGui::SetWindowFontScale(0.72f);
     const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
         fps_c(0.95f, 0.95f, 0.95f, 1), wait_c(0.93f, 0.76f, 0.33f, 1), pic_c(0.62f, 0.70f, 0.95f, 1);
@@ -1029,7 +1031,8 @@ static void perf_draw(const MenuTarget *t, float scale) {
     if (g_perf_mode == 2) return perf_full_draw(t, scale);
     float w = (float)t->width;
     if (!g_perf_mode || !g_perf_text[0]) return;
-    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    // with the menu open: under its window, over the dimming layout_menu drew before
+    ImDrawList *dl = g_open.load(std::memory_order_relaxed) ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
     ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
     float pad = 6 * scale;
     ImVec2 p(w - 12 * scale - sz.x - pad * 2, 12 * scale);   // the top right corner: the game's HUD leaves it empty
