@@ -212,44 +212,39 @@ uint64_t nvn_handle_bytes(uint64_t handle) {
     return n;
 }
 
-static void copy_touch(uint64_t handle, uint64_t now, const char *what) {
+// Marks a live copy used by submission now; its size from OP_BEGIN to OP_END inclusive.
+static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
     AcquireSRWLockShared(&copy_lock);
     copy_prefix *pf = copy_find(handle);
-    if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED);
+    uint64_t bytes = 0;
+    if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED), bytes = pf->bytes;
     ReleaseSRWLockShared(&copy_lock);
     if (!pf) rt_fatal("nvn: %s: command handle %#llx is not a live recording (released or never recorded)", what,
                       (unsigned long long)handle);
+    return bytes;
 }
 
-// The recording starting at p (OP_BEGIN), followed across OP_JUMP, copied into one host block.
-static uint8_t *flatten_recording(const uint8_t *p) {
-    size_t n = sizeof(copy_prefix), cap = 4096;
-    uint8_t *out = malloc(cap);
+// The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
+// into one host block of its exact size. One allocation and one copy: growing the copy record by record cost the
+// game's main thread about 1 ms a frame in reallocations and small copies (1.4.3, field).
+static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
+    uint8_t *out = malloc(sizeof(copy_prefix) + n);
     if (!out) rt_fatal("nvn: command copy allocation");
-    for (;;) {
+    memcpy(out + sizeof(copy_prefix), p, n);
+    for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
-        memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
-            rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
-        if (h.op == OP_JUMP) {
-            memcpy(&p, p + 8, 8);
-            continue;
-        }
-        if (n + h.size > cap) {
-            while (n + h.size > cap) cap *= 2;
-            out = realloc(out, cap);
-            if (!out) rt_fatal("nvn: command copy allocation");
-        }
-        memcpy(out + n, p, h.size);
-        n += h.size;
+        memcpy(&h, p + at, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
+            (!at && h.op != OP_BEGIN))
+            rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
+        at += h.size;
         if (h.op == OP_END) {
-            uint8_t *trimmed = realloc(out, n);
-            if (trimmed) out = trimmed;
-            *(copy_prefix *)out = (copy_prefix){COPY_MAGIC, n - sizeof(copy_prefix), 0, 0};
-            return out + sizeof(copy_prefix);
+            if (at != n) rt_fatal("nvn: recording at %p ends at %zu of %zu bytes", (const void *)p, at, n);
+            break;
         }
-        p += h.size;
     }
+    *(copy_prefix *)out = (copy_prefix){COPY_MAGIC, n, 0, 0};
+    return out + sizeof(copy_prefix);
 }
 
 static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
@@ -395,7 +390,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     put_hdr(cmd_alloc(o, 8), OP_END, 8);
     o->hw_used -= 8;
     o->recording = 0;
-    uint8_t *copy = flatten_recording(o->seg);
+    uint8_t *copy = flatten_recording(o->seg, (size_t)(o->cur - o->seg));
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
@@ -407,20 +402,20 @@ NVN_API(nvnCommandBufferEndRecording) {
 NVN_API(nvnCommandBufferIsRecording) { ret_x(c, cmd_of(c)->recording != 0); }
 
 // The called recording is copied into the caller at the call position: the game recycles command memory in small steps,
-// so a handle may be gone by the time the caller is submitted. Deferred binds stay deferred.
+// so a handle may be gone by the time the caller is submitted. Deferred binds stay deferred. A copy is OP_BEGIN, its
+// records and OP_END (flatten_recording checked them), so the records go over as one block; usage grows by the same
+// bytes as record by record.
 static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
     if (!handle) rt_fatal("nvn: %s with a null handle", what);
-    copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
-    const uint8_t *p = (const uint8_t *)(uintptr_t)handle;
-    for (;;) {
-        op_hdr h;
-        memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.size > (64u << 20) || h.op >= OP_COUNT_)
-            rt_fatal("nvn: corrupt recording in handle %#llx (op %u size %u)", (unsigned long long)handle, h.op, h.size);
-        if (h.op == OP_END) return;
-        if (h.op != OP_BEGIN) memcpy(cmd_alloc(o, h.size), p, h.size);
-        p += h.size;
-    }
+    uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
+    if (bytes <= 16) return;
+    size_t body = (size_t)bytes - 16;
+    cmd_reserve(o, body);
+    memcpy(o->cur, (const uint8_t *)(uintptr_t)handle + 8, body);
+    o->cur += body;
+    o->cmd_used += body;
+    o->hw_used += body;
+    o->last_rec = 0;
 }
 // void nvnCommandBuffer{Call,Copy}Commands(NVNcommandBuffer *cmd, int n, const NVNcommandHandle *handles)
 NVN_API(nvnCommandBufferCallCommands) {
