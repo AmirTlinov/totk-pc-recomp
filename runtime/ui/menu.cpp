@@ -902,13 +902,16 @@ static void perf_full_draw(float w, float scale) {
         ImGui::EndTable();
     }
     float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;
-    ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, nullptr, 0, top, ImVec2(330 * scale, 48 * scale));
-    // per frame, averaged over the last half second
+    // as wide as the panel the tables size; the plot does not count toward that width, so the panel can still shrink
+    ImGuiWindow *win = ImGui::GetCurrentWindow();
+    float max_x = win->DC.CursorMaxPos.x;
+    ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, nullptr, 0, top, ImVec2(-FLT_MIN, 48 * scale));
+    win->DC.CursorMaxPos.x = max_x;
+    // per frame, averaged over the last half second; the labels' column stretches, so the numbers end at the panel's
+    // right edge, and the table still asks for no more than its widest label and number
     if (ImGui::BeginTable("##perfw", 2, ImGuiTableFlags_SizingFixedFit)) {
-        static const UiTextId labels[] = {UI_MENU_OV_REPLAY, UI_MENU_OV_GPU_TIME, UI_MENU_OV_PIPE_WAIT,
-                                          UI_MENU_OV_SHADER_WAIT, UI_MENU_OV_TEX_UPLOADS};
         static const PerfCol c1[] = {{UI_MENU_OV_FMT_MS, 888.88f}, {UI_MENU_OV_PER_FRAME, 888.8f}};
-        perf_column("##w0", nullptr, 0, labels, 5);
+        ImGui::TableSetupColumn("##w0", ImGuiTableColumnFlags_WidthStretch);
         perf_column("##w1", c1, 2);
         perf_label(UI_MENU_OV_REPLAY, wait_c);
         perf_cell(UI_MENU_OV_FMT_MS, s.replay_ms);
