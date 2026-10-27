@@ -101,7 +101,7 @@ typedef struct VkExec {
                                          // or the last in-pass barrier
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
-    uint32_t tex_serial, pass_serial;    // bumped by every texture bind and pass begin
+    uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
 } VkExec;
 
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call

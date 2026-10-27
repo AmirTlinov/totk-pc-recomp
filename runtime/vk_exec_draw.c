@@ -1764,27 +1764,33 @@ static int pipe_skip_mode(void) {
 // nothing else, so shader_for would return the same shaders. About 65% of field draws repeat them
 // (TOTK_BIND_STATS). TOTK_SHADER_MEMO=0 turns it off; =check looks the shaders up on every hit too, and every slot's
 // texture type in answers_for, and stops on a difference.
+// tex_serial (bumped by every texture and image bind) equal to the key's means the handles were not rebound since
+// they were compared, so the 1 KiB compare is skipped; a rebind to the same handles still matches by the compare.
 typedef struct {
     const prog_t *prog;
     uint64_t serial;
-    uint32_t gen;
+    uint32_t gen, tex_serial;
     uint64_t tex[2][32], img[2][32];
     VkPipeState pipe;
 } MemoKey;
 static struct { int on, valid, has_fs; MemoKey k; const GfxShader *vs, *fs; } SM = {-1};
 
 static void memo_key(const VkExec *ex, uint32_t gen, MemoKey *k) {
-    k->prog = ex->prog, k->serial = ex->prog->serial, k->gen = gen;
+    k->prog = ex->prog, k->serial = ex->prog->serial, k->gen = gen, k->tex_serial = ex->tex_serial;
     memcpy(k->tex[0], ex->tex[NVN_STAGE_VS], sizeof k->tex[0]), memcpy(k->tex[1], ex->tex[NVN_STAGE_FS], sizeof k->tex[1]);
     memcpy(k->img[0], ex->img[NVN_STAGE_VS], sizeof k->img[0]), memcpy(k->img[1], ex->img[NVN_STAGE_FS], sizeof k->img[1]);
     memcpy(&k->pipe, &ex->pipe, sizeof k->pipe);
 }
 
-static int memo_match(const VkExec *ex, uint32_t gen, const MemoKey *k) {
-    return k->prog == ex->prog && k->serial == ex->prog->serial && k->gen == gen &&
-           !memcmp(k->tex[0], ex->tex[NVN_STAGE_VS], sizeof k->tex[0]) && !memcmp(k->tex[1], ex->tex[NVN_STAGE_FS], sizeof k->tex[1]) &&
-           !memcmp(k->img[0], ex->img[NVN_STAGE_VS], sizeof k->img[0]) && !memcmp(k->img[1], ex->img[NVN_STAGE_FS], sizeof k->img[1]) &&
-           !memcmp(&k->pipe, &ex->pipe, sizeof k->pipe);
+static int memo_match(const VkExec *ex, uint32_t gen, MemoKey *k) {
+    if (k->prog != ex->prog || k->serial != ex->prog->serial || k->gen != gen || memcmp(&k->pipe, &ex->pipe, sizeof k->pipe))
+        return 0;
+    if (k->tex_serial == ex->tex_serial) return 1;
+    if (memcmp(k->tex[0], ex->tex[NVN_STAGE_VS], sizeof k->tex[0]) || memcmp(k->tex[1], ex->tex[NVN_STAGE_FS], sizeof k->tex[1]) ||
+        memcmp(k->img[0], ex->img[NVN_STAGE_VS], sizeof k->img[0]) || memcmp(k->img[1], ex->img[NVN_STAGE_FS], sizeof k->img[1]))
+        return 0;
+    k->tex_serial = ex->tex_serial;
+    return 1;
 }
 
 static int shader_memo_on(void) {
@@ -2204,6 +2210,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_BIND_IMG: {
         const p_bind_handles *b = payload;
         bind_handles(b->stage >= 0 && b->stage < 6 ? ex->img[b->stage] : NULL, 32, b);
+        ex->tex_serial++;   // the shader memo's handle check (feedback_scan reads only textures: a rescan at most)
         bind_gen++;
         break;
     }
