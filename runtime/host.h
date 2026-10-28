@@ -250,6 +250,14 @@ double frame_step_limit_hz(void);                         // the frame rate the 
 int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
                                                            // (TOTK_FPS_LIMIT, live)
 uint64_t frame_step_ticks(void);                           // game time since the first present in 60 Hz ticks (input scripts)
+// In-launch A/B measurement: TOTK_AB=<presents> splits the run into blocks of that many presents in the order A B B A
+// (repeated); rt_ab() is 1 in the B blocks, 0 in A blocks and without TOTK_AB. rt_knob(name, def) reads the switch
+// TOTK_<name> once per call (def when unset): 0 off, 2 for "ab" (on in the B blocks only), 1 for anything else;
+// callers keep it and test it with RT_KNOB_ON. The perf line counts the B frames of its window (tools/ab_summary.py
+// compares the windows that are wholly A or wholly B).
+int rt_ab(void);
+int rt_knob(const char *name, const char *def);
+#define RT_KNOB_ON(mode) ((mode) == 2 ? rt_ab() : (mode))
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
 // ---- boot (boot.c, main.c)

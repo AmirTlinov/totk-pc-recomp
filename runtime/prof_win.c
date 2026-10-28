@@ -527,8 +527,61 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
            (unsigned long long)frame, gs, rw, ow, vs, ws, priv, bound);
 }
 
+int rt_ab(void) {
+    static uint64_t period = UINT64_MAX;   // 0: off
+    if (period == UINT64_MAX) {
+        const char *e = cfg_get("TOTK_AB");
+        period = e && *e ? strtoull(e, NULL, 10) : 0;
+    }
+    if (!period) return 0;
+    uint64_t k = cur_frame / period % 4;
+    return k == 1 || k == 2;
+}
+
+int rt_knob(const char *name, const char *def) {
+    char key[64];
+    snprintf(key, sizeof key, "TOTK_%s", name);
+    const char *e = cfg_get(key);
+    if (!e || !*e) e = def;
+    return !strcmp(e, "ab") ? 2 : strcmp(e, "0") != 0;
+}
+
+// TOTK_ONE_PER_CORE=1: the process keeps the first logical processor of each physical core, so busy threads (the
+// render thread, the guest cores, the job workers) never share a core's execution units with another; "ab" switches
+// it with the A/B blocks. Off by default until measured (Savage Wind Recomp #200: +4-10% on an 8-core SMT CPU).
+static void cpu_placement(void) {
+    static int mode = -1, applied = -1;
+    static DWORD_PTR all, one;
+    if (mode < 0) {
+        mode = rt_knob("ONE_PER_CORE", "0");
+        DWORD_PTR sys;
+        GetProcessAffinityMask(GetCurrentProcess(), &all, &sys);
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf = len ? malloc(len) : NULL;
+        int cores = 0;
+        if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, buf, &len))
+            for (DWORD off = 0; off < len;) {
+                SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (void *)((char *)buf + off);
+                KAFFINITY m = e->Processor.GroupMask[0].Mask & all;
+                if (e->Processor.GroupMask[0].Group == 0 && m) one |= m & -m, cores++;   // the lowest of the core's
+                off += e->Size;
+            }
+        free(buf);
+        if (mode && one && one != all)
+            rt_log("cpu: %d cores, %d logical processors: one per core%s", cores, __builtin_popcountll(all),
+                   mode == 2 ? " in the B blocks" : "");
+        else
+            mode = 0;
+    }
+    int on = RT_KNOB_ON(mode);
+    if (on == applied) return;
+    applied = on;
+    SetProcessAffinityMask(GetCurrentProcess(), on ? one : all);
+}
+
 void perf_present(uint64_t frame) {
-    static uint64_t last, sum, max, n, win_start;
+    static uint64_t last, sum, max, n, win_start, ab_b;
     static LONG64 win_prev[PERF_CNT_N];
     render_tid = GetCurrentThreadId();
     cur_frame = frame;
@@ -540,6 +593,8 @@ void perf_present(uint64_t frame) {
         InterlockedExchange64(&dump_hi, (LONG64)now);
     }
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
+    ab_b += rt_ab();
+    cpu_placement();
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
@@ -581,7 +636,7 @@ void perf_present(uint64_t frame) {
     uint64_t shader_keys, shader_xlated;
     gfx_shader_counts(&shader_keys, &shader_xlated);
     if (n && span)
-        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms",
+        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu",
                (unsigned long long)frame, sum / 1e6 / n, max / 1e6, n * 1e9 / sum, 100.0 * wait_ns[PERF_PACE] / span,
                100.0 * wait_ns[PERF_FENCE] / span, 100.0 * wait_ns[PERF_DRAIN] / span,
                100.0 * wait_ns[PERF_PIPE] / span, 100.0 * wait_ns[PERF_XLATE] / span,
@@ -590,9 +645,9 @@ void perf_present(uint64_t frame) {
                worst_ns[PERF_ASTC] / 1e6, worst_ns[PERF_PIPE] / 1e6, worst_ns[PERF_FENCE] / 1e6,
                (unsigned long long)shader_keys, (unsigned long long)shader_xlated,
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
-               InterlockedExchange64(&replay_ns, 0) / 1e6 / n);
+               InterlockedExchange64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
-    sum = max = n = 0;
+    sum = max = n = ab_b = 0;
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;
 }
