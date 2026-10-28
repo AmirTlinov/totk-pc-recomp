@@ -2979,11 +2979,11 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     if (P.dyn_vi && s->vs) {
         VtxInput v;
         vertex_input(s, &v);
-        P.set_vi(cb, v.n_bind, v.b, v.n_attr, v.a);
+        rec_vertex_input(P.set_vi, cb, v.n_bind, v.b, v.n_attr, v.a);
     }
-    if (P.dyn_clamp) P.set_clamp(cb, s->depth_clamp != 0);
-    if (P.dyn_poly) P.set_poly(cb, polygon_mode(pl->mode));
-    if (P.dyn_a2c) P.set_a2c(cb, s->ms.a2c != 0);
+    if (P.dyn_clamp) rec_bool(P.set_clamp, cb, s->depth_clamp != 0);
+    if (P.dyn_poly) rec_polygon_mode(P.set_poly, cb, polygon_mode(pl->mode));
+    if (P.dyn_a2c) rec_bool((PFN_vkCmdSetDepthClampEnableEXT)P.set_a2c, cb, s->ms.a2c != 0);   // the same signature
     int n = target_count(s);
     if (!n) return;
     VkBool32 en[8];
@@ -2996,9 +2996,9 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
                                           blend_factor(b->src_a), blend_factor(b->dst_a), blend_op(b->eq_a)};
         wm[i] = target_wmask(s, i);
     }
-    if (P.dyn_blend_en) P.set_blend_en(cb, 0, (uint32_t)n, en);
-    if (P.dyn_blend_eq) P.set_blend_eq(cb, 0, (uint32_t)n, eq);
-    if (P.dyn_wmask) P.set_wmask(cb, 0, (uint32_t)n, wm);
+    if (P.dyn_blend_en) rec_blend_enable(P.set_blend_en, cb, 0, (uint32_t)n, en);
+    if (P.dyn_blend_eq) rec_blend_equation(P.set_blend_eq, cb, 0, (uint32_t)n, eq);
+    if (P.dyn_wmask) rec_write_mask(P.set_wmask, cb, 0, (uint32_t)n, wm);
 }
 
 // ---- statistics, persistence, teardown

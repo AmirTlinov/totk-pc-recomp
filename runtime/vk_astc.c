@@ -466,7 +466,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         }
         if (slot >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)slot);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        G.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.layout, 0, 3, w);
+        rec_push(G.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.layout, 0, 3, w);
         VkDeviceSize ib = 0, ob = 0;
         for (int i = i0; i < i1; i++) {
             const VkAstcRegion *r = &rg[i];

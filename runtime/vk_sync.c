@@ -290,6 +290,7 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    rec_end();   // every command of the part is in cb
     ts_end(cb, cur_fence);
     vkEndCommandBuffer(cb);
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
@@ -308,6 +309,7 @@ VkCommandBuffer vk_sync_split(void) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(s->cb, &bi);
     ts_begin(s->cb);
+    rec_begin(s->cb);
     return s->cb;
 }
 
@@ -335,8 +337,10 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     uint64_t t0 = perf_begin();
     vkBeginCommandBuffer(s->cb, &bi);
     ts_begin(s->cb);
+    rec_begin(s->cb);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
+    rec_end();
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
     vkEndCommandBuffer(s->cb);
@@ -363,6 +367,8 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     __atomic_store_n(&issued, fence, __ATOMIC_RELEASE);
     WakeAllConditionVariable(&cv_work);
     ReleaseSRWLockExclusive(&st_lock);
+    static unsigned subs;
+    if (++subs % 4096 == 0) rec_stats_log();
     ReleaseSRWLockExclusive(&sub_lock);
     return fence;
 }

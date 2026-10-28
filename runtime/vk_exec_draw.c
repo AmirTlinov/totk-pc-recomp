@@ -1594,8 +1594,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 BS.push_skip++;
                 continue;
             }
-            if (info->tpl[s]) vk_pipeline_push_tpl_fn()(ex->cb, info->tpl[s], info->layout, s, ds);
-            else vk_pipeline_push_fn()(ex->cb, info->bind_point, info->layout, s, i1 - i0, w + i0);
+            if (info->tpl[s]) rec_push_tpl(vk_pipeline_push_tpl_fn(), ex->cb, info->tpl[s], info->layout, s, ds, dbytes);
+            else rec_push(vk_pipeline_push_fn(), ex->cb, info->bind_point, info->layout, s, i1 - i0, w + i0);
             BS.push++;
             RS.cmds++;
             if (gfx) {
