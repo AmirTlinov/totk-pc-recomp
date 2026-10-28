@@ -34,6 +34,7 @@ static const InitCount inits_143[] = {{"main", 10717}, {"subsdk0", 45}, {"sdk", 
 #define expected_inits (RT_V143 ? inits_143 : inits_121)
 
 static volatile LONG inits_done, checkpoint_seen;
+uint64_t rt_guest_start_ns;
 
 static const RtLoaded *module_named(const char *name) {
     for (int i = 0; i < ldr_count(); i++)
@@ -354,6 +355,7 @@ void rt_boot(void) {
                    n = {.LowPart = now.dwLowDateTime, .HighPart = now.dwHighDateTime};
     rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm)",
            (unsigned long long)((n.QuadPart - c.QuadPart) / 10000), (unsigned long long)held);
+    rt_guest_start_ns = kern_now_ns();
     kern_run_on_guest_main(guest_main);
     rt_fatal("boot: the guest main thread ended");
 }

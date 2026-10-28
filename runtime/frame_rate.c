@@ -231,8 +231,9 @@ static void world_clock(double dt, double step) {
     if (w < 0) {
         float p[3];
         if (!player_pos(p) || fabsf(p[0]) + fabsf(p[2]) < 1.0f) return;   // a few guest reads, until the load ends
-        rt_log("frame step: world clock starts at present %llu (the player at %.1f %.1f %.1f)",
-               (unsigned long long)presents, p[0], p[1], p[2]);
+        rt_log("frame step: world clock starts at present %llu, %.2f s after the guest started (the player at %.1f %.1f %.1f)",
+               (unsigned long long)presents, rt_guest_start_ns ? (kern_now_ns() - rt_guest_start_ns) / 1e9 : 0.0, p[0],
+               p[1], p[2]);
         atomic_store_explicit(&world_us, 0, memory_order_relaxed);
         return;
     }
