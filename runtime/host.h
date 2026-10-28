@@ -249,6 +249,7 @@ uint64_t frame_step_cap_ns(void);                          // with the real-time
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
 int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
                                                            // (TOTK_FPS_LIMIT, live)
+uint64_t frame_step_ticks(void);                           // game time since the first present in 60 Hz ticks (input scripts)
 void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
                                                            // present interval (60 Hz ticks)
 // ---- boot (boot.c, main.c)

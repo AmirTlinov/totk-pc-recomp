@@ -41,10 +41,13 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 };
 
 // TOTK_INPUT_SCRIPT=<file>: lines "<frame> <button> [hold]" or "<frame> LSTICK|RSTICK <x> <y> [hold]", ORed into the real input.
-// A line "@<ms> ..." is timed instead: <ms> and its hold are milliseconds of the world clock (frame_step_world_us, game
-// time since the loaded save's first frame), so it lands at the same game time at any frame rate and load length. A
-// timed event shorter than a frame is applied once.
-// at, hold: presents, or microseconds of the world clock when timed.
+// <frame> and its hold are 60 Hz ticks of game time since the first present (frame_step_ticks: presents at 60 fps), so
+// the title menus get the presses at the same game time at any frame limit. A line "@<ms> ..." is timed instead: <ms>
+// and its hold are milliseconds of the world clock (frame_step_world_us, game time since the loaded save's first
+// frame), so it lands at the same game time at any frame rate and load length. A timed event shorter than a frame is
+// applied once. In a script with timed lines (a recording) the untimed ones belong before the world clock: they stop
+// when it starts, as the load ends at another tick in each run.
+// at, hold: ticks, or microseconds of the world clock when timed.
 typedef struct { uint64_t at, hold; int bit, stick, timed; int32_t x, y; int logged; char text[48]; } ScriptEv;
 static const struct { const char *name; int bit; } script_buttons[] = {
     {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
@@ -52,6 +55,7 @@ static const struct { const char *name; int bit; } script_buttons[] = {
 };
 static ScriptEv *script_ev;
 static int script_n, script_state;   // 0 not loaded, 1 loaded
+static int script_mixed;             // the script has timed lines: its untimed ones end where the world clock starts
 
 static void script_load(void) {
     script_state = 1;
@@ -93,6 +97,7 @@ static void script_load(void) {
             if (!script_ev) { script_n = 0; fclose(f); return; }
         }
         script_ev[script_n++] = e;
+        script_mixed |= timed;
     }
     fclose(f);
     rt_log("input: script %s, %d events", path, script_n);
@@ -101,17 +106,17 @@ static void script_load(void) {
 static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     if (!script_state) script_load();
     if (!script_n) return;
-    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), tick = frame_step_ticks();
     int64_t w = frame_step_world_us();
     for (int i = 0; i < script_n; i++) {
         ScriptEv *e = &script_ev[i];
-        if (e->timed && w < 0) continue;
-        uint64_t now = e->timed ? (uint64_t)w : fr;
+        if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
+        uint64_t now = e->timed ? (uint64_t)w : tick;
         if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
         if (!e->logged) {
             e->logged = 1;
             if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
-            else rt_log("input: script frame %llu: %s", (unsigned long long)fr, e->text);
+            else rt_log("input: script frame %llu tick %llu: %s", (unsigned long long)fr, (unsigned long long)tick, e->text);
         }
         if (e->stick) { int32_t *s = e->stick == 1 ? sl : sr; s[0] = e->x; s[1] = e->y; }
         else *b |= 1ull << e->bit;
@@ -120,17 +125,19 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
 
 // TOTK_INPUT_RECORD=<file>: writes the merged input as TOTK_INPUT_SCRIPT lines, one per button press and per stick
 // segment, so a played session replays as a script. A stick segment ends when an axis moves by more than REC_STICK_STEP.
-// An event that begins on the world clock is written timed ("@<ms>", hold in ms), one before it in presents.
+// An event that begins on the world clock is written timed ("@<ms>", hold in ms), one before it in ticks
+// (frame_step_ticks). When the world clock starts, held buttons and sticks are cut there and go on as timed events.
 enum { REC_STICK_STEP = 2048 };
 static FILE *rec;
 static int rec_state;                // 0 not opened, 1 recording, -1 off
-static uint64_t rec_down[16];        // frame + 1 at which each button went down, 0 while up
+static uint64_t rec_down[16];        // tick + 1 at which each button went down, 0 while up
 static int64_t rec_down_w[16];       // the world clock then, -1 before it started
-static uint64_t rec_stick_from[2];   // frame + 1 at which the current non-zero stick segment began
+static uint64_t rec_stick_from[2];   // tick + 1 at which the current non-zero stick segment began
 static int64_t rec_stick_w[2];
 static int32_t rec_stick[2][2];
+static int64_t rec_last_w = -1;      // the world clock at the previous apply
 
-// "<frame> <what> <hold>" or "@<ms> <what> <hold ms>": from frame from and world clock from_w to now.
+// "<tick> <what> <hold>" or "@<ms> <what> <hold ms>": from tick from and world clock from_w to now.
 static void rec_line(uint64_t from, int64_t from_w, uint64_t fr, int64_t w, const char *what) {
     if (from_w >= 0 && w >= from_w)
         fprintf(rec, "@%.1f %s %.1f\n", from_w / 1000.0, what, (w > from_w ? w - from_w : 1000) / 1000.0);
@@ -148,7 +155,7 @@ static void rec_close_stick(int s, uint64_t fr, int64_t w) {
 
 static void rec_flush_all(void) {
     if (rec_state != 1) return;
-    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    uint64_t fr = frame_step_ticks() + 1;
     int64_t w = frame_step_world_us();
     for (int i = 0; i < 16; i++)
         if (rec_down[i]) { rec_line(rec_down[i] - 1, rec_down_w[i], fr, w, script_buttons[i].name); rec_down[i] = 0; }
@@ -163,13 +170,28 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
         rec = path && *path ? fopen(path, "w") : NULL;
         rec_state = rec ? 1 : -1;
         if (path && *path && !rec) rt_log("input: cannot open TOTK_INPUT_RECORD %s", path);
-        if (rec) { fprintf(rec, "# Recorded input (TOTK_INPUT_RECORD); frame = presents, @ms = world clock.\n"); atexit(rec_flush_all);
+        if (rec) { fprintf(rec, "# Recorded input (TOTK_INPUT_RECORD); frame = 60 Hz ticks of game time, @ms = world clock.\n"); atexit(rec_flush_all);
                    rt_log("input: recording to %s", path); }
     }
     if (rec_state != 1) return;
-    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    uint64_t fr = frame_step_ticks();
     int64_t w = frame_step_world_us();
     int wrote = 0;
+    if (w >= 0 && rec_last_w < 0) {   // the world clock starts: what is held goes on as timed events from @0
+        for (int i = 0; i < 16; i++)
+            if (rec_down[i]) {
+                rec_line(rec_down[i] - 1, -1, fr, -1, script_buttons[i].name);
+                rec_down[i] = fr + 1, rec_down_w[i] = w;
+                wrote = 1;
+            }
+        for (int s = 0; s < 2; s++)
+            if (rec_stick_from[s]) {
+                rec_close_stick(s, fr, -1);
+                rec_stick_from[s] = fr + 1, rec_stick_w[s] = w;
+                wrote = 1;
+            }
+    }
+    rec_last_w = w;
     for (int i = 0; i < 16; i++) {
         int bit = script_buttons[i].bit, down = (b >> bit & 1) != 0;
         if (down && !rec_down[i]) rec_down[i] = fr + 1, rec_down_w[i] = w;
