@@ -45,7 +45,7 @@ keeps `profile/`. Saves carry over both ways: 1.4.3 converts a 1.2.1 save on loa
 2. **Extract** ExeFS and RomFS into the install folder and verify the hashes.
 3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt` or `patches-v143.txt`) into a temp folder next
    to the installer.
-4. **Compile** the generated C, `modules.c`, `romfs.c` and `patches.c` (they bake the per-install layout, RomFS
+4. **Compile** the generated C, `modules.c`, `romfs.c`, `patches.c` and `ov_zstd.c` (they bake the per-install layout, RomFS
    hashes and the game version's patch page) and link
    them with the prebuilt runtime library into `totk.exe` (`build_game.py --runtime-lib`; about 3 min on 24 cores).
 5. **Prepare** the RomFS patches and the shaders (`tools/make_romfs_patches.py`, `tools/prepare_shaders.py`,
