@@ -91,6 +91,7 @@ struct RtThread {
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
+    uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
     // TOTK_ASYNC_PREEMPT (holding G)
     HANDLE hthr;               // the host thread, for SuspendThread / Get/SetThreadContext; open while it may own a core
@@ -953,6 +954,50 @@ void kern_core_back(int *away) {
     *away = 0;
 }
 
+// ---- spin waits (recomp/patches.py `spin` lines, found by tools/spin_waits.py)
+// Adapted from MacNativeGames games/totk/runtime/threads.c runtime_spin_wait @ a038e6b and nxnative dm/host/hle_thread.c
+// dm_spin_wait @ 6d34984 (MIT, Copyright (c) 2026 MacNativeGames contributors, Copyright (c) 2026 seedds).
+// A pass of a guest loop that polls memory until another thread changes it. On the Switch it fills only its own core,
+// where a better thread pinned there preempts it; here it holds a virtual core and a host core, and pollers that take a
+// lock on every pass hand its cache line between their host cores so the thread whose item it is rarely gets it
+// (nxnative 6d34984, Breath of the Wild's job queue). Every pass pauses the host core once. A wait is a run of passes
+// through the same loop at most SPIN_GAP_NS apart; once one has lasted TOTK_SPIN_HANDOFF_US (default 50) and a thread
+// waits for a virtual core, each pass gives the core to the waiter, whatever its priority, yields the host CPU and
+// takes a core again. Shorter waits keep the core: a lock held for a moment would otherwise make the next pass wait
+// for another thread's next SVC (MacNativeGames). TOTK_SPIN=0 keeps the core always (the gate's own cost only).
+#define SPIN_GAP_NS 20000ull
+static int g_spin_on = -1;
+static uint64_t g_spin_handoff_ns;
+static _Thread_local uint64_t sw_head, sw_t0, sw_last;
+
+void rt_spin_gate(Cpu *c, uint64_t head) {
+    (void)c;
+    YieldProcessor();
+    RtThread *t = tcur;
+    if (!t) return;
+    if (g_spin_on < 0) {
+        const char *e = cfg_get("TOTK_SPIN_HANDOFF_US");
+        g_spin_handoff_ns = (uint64_t)(e && *e ? atoll(e) : 50) * 1000;
+        g_spin_on = !(cfg_get("TOTK_SPIN") && !cfg_bool("TOTK_SPIN"));
+    }
+    t->sp_n++;
+    t->sp_site = head;
+    uint64_t now = kern_now_ns();
+    if (head != sw_head || now - sw_last > SPIN_GAP_NS) {   // a new wait
+        sw_head = head;
+        sw_t0 = now;
+    }
+    sw_last = now;
+    if (!g_spin_on || t->cur_core < 0 || now - sw_t0 < g_spin_handoff_ns ||
+        !__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED))   // a racy look: a waiter missed now is seen at the next pass
+        return;
+    t->sp_ho++;
+    int away = kern_core_away();
+    SwitchToThread();
+    kern_core_back(&away);
+    sw_last = kern_now_ns();
+}
+
 // A pending preempt request, at an SVC or an indirect call. The core goes over only if a better thread still waits
 // for it, so core_put grants it to a waiter better than t; a stale request (that waiter got another core) is dropped.
 void kern_checkpoint(void) {
@@ -1077,6 +1122,7 @@ void kern_sched_report(uint64_t frame) {
         uint32_t h;
         int prio, render;
         uint64_t mask, entry, ns[S_N], nblk, npre, cpu, lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;
+        uint64_t sp_n, sp_ho, sp_site;
     } Row;
     Row rows[REP_N + 1];
     WaitRec rw[2][4] = {0};   // the render and the main thread's longest waits
@@ -1129,6 +1175,7 @@ void kern_sched_report(uint64_t frame) {
         r->lw_ns = t->lw_ns, r->lw_n = t->lw_n, r->lw_max = t->lw_max;
         r->lg_ns = t->lg_ns, r->lg_n = t->lg_n, r->lg_max = t->lg_max;
         r->sl_n = t->sl_n, r->sl_req = t->sl_req, r->sl_act = t->sl_act;
+        r->sp_n = t->sp_n, r->sp_ho = t->sp_ho, r->sp_site = t->sp_site;
         r->cpu = 0;
         HANDLE th = t->tid ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, t->tid) : NULL;
         FILETIME a, b, k, u;
@@ -1156,6 +1203,7 @@ void kern_sched_report(uint64_t frame) {
         memset(t->st_ns, 0, sizeof t->st_ns);
         t->nblk = t->npre = 0;
         t->lw_ns = t->lw_n = t->lw_max = t->lg_ns = t->lg_n = t->lg_max = t->sl_n = t->sl_req = t->sl_act = 0;
+        t->sp_n = t->sp_ho = 0;   // racy against the thread's own increments: a few passes may be lost
     }
     memset(g_rw, 0, sizeof g_rw);
     memset(g_mw, 0, sizeof g_mw);
@@ -1183,6 +1231,11 @@ void kern_sched_report(uint64_t frame) {
                r->lw_max / 1e3, (unsigned long long)r->lw_n, r->lg_n ? r->lg_ns / 1e3 / r->lg_n : 0.0, r->lg_max / 1e3,
                (unsigned long long)r->lg_n, (unsigned long long)r->sl_n, r->sl_n ? r->sl_req / 1e3 / r->sl_n : 0.0,
                r->sl_n ? r->sl_act / 1e3 / r->sl_n : 0.0);
+        if (r->sp_n) {
+            ldr_describe(r->sp_site, d, sizeof d);
+            rt_log("sched:   %#x spin wait passes %llu, core handoffs %llu, last at %s", r->h,
+                   (unsigned long long)r->sp_n, (unsigned long long)r->sp_ho, d);
+        }
     }
     for (int k = 0; k < 2; k++)
         for (int j = 0; j < 4 && rw[k][j].ns; j++) {

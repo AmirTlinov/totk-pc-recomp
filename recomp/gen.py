@@ -207,10 +207,11 @@ def partition(est, max_fns, max_bytes, big_fn):
 class Emitter:
     """C for the functions of one module. starts is the set of every function start of the module."""
 
-    def __init__(self, mod, starts, patched=None, reg_locals=regs.LOCALS, callee_saved=True):
+    def __init__(self, mod, starts, patched=None, reg_locals=regs.LOCALS, callee_saved=True, spins=None):
         self.mod = mod
         self.starts = starts
         self.patched = patched or {}   # {address: (set index, [replacement words])} (recomp/patches.py)
+        self.spins = spins or {}       # {spin wait back-edge: its head} (recomp/patches.py `spin`)
         self.reg_locals = reg_locals   # recomp/regs.py: registers per function in C locals
         self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
         self.uses_patches = False
@@ -418,10 +419,12 @@ class Emitter:
                 emit(i, '    ' + op(i, ins.code))
             elif k == 'trap':
                 emit(i, f'    {spill}{fx(i, ins.code)}')
-            elif k == 'b':
-                emit(i, '    ' + jump(ins.target, i))
-            elif k == 'bcond':
-                emit(i, f'    if ({fx(i, ins.cond)}) {{ {jump(ins.target, i)} }}')
+            elif k in ('b', 'bcond'):
+                j = jump(ins.target, i)
+                if self.spins.get(a) == ins.target and entry <= ins.target < end:
+                    j = f'rt_spin_gate(c, {hx(ins.target)}); {j}'   # a pass of a spin wait
+                    self.stats['spin_gates'] += 1
+                emit(i, '    ' + j if k == 'b' else f'    if ({fx(i, ins.cond)}) {{ {j} }}')
             elif k == 'bl':
                 emit(i, '    ' + call(ins.target, a))
             elif k == 'blr':
@@ -533,7 +536,8 @@ def _emitter(name):
         path, base = _W['mods'][name]
         mod = Module(name, path, base, 'c')
         e = _W['emitters'][name] = Emitter(mod, set(_W['starts'][name].tolist()),
-                                           _W['patches'].for_module(name, base), **_W['opts'])
+                                           _W['patches'].for_module(name, base),
+                                           spins=_W['patches'].spins_for(name, base), **_W['opts'])
     return e
 
 
@@ -694,6 +698,7 @@ def main():
                 'flag_entry_reads': stats['flag_entry_reads'],
                 'flag_reads_after_call': stats['flag_reads_after_call'],
                 'flag_publishing_exits': stats['flag_publishing_exits'],
+                'spin_gates': stats['spin_gates'],
                 'unsupported': stats['unsupported'],
                 'external_branches': stats['external_branches'],
                 'external_calls': stats['external_calls'],

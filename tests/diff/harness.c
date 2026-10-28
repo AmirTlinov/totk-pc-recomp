@@ -62,6 +62,7 @@ void rt_dispatch(Cpu *c) {
     if (g_stubs) rt_stub(c, c->pc);
 }
 void rt_stub_call(Cpu *c, uint64_t target) { rt_stub(c, target); }
+void rt_spin_gate(Cpu *c, uint64_t head) { (void)c; (void)head; }
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; (void)pc; }
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; (void)pc; abort(); }
 void rt_udf(Cpu *c, uint64_t pc) { (void)c; (void)pc; abort(); }
