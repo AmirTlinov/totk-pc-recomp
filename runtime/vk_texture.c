@@ -56,6 +56,7 @@ typedef struct Tex {
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
     uint8_t listed;               // in owned[]
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
+    struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -84,6 +85,7 @@ static SampSlot *sslots;
 static int nsslots;
 static nvn_hmap samplers = {.klen = sizeof(samp_par)};
 static int nreleased;
+static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_released drops from the head)
 static uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
 static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
@@ -429,6 +431,22 @@ static void own_remove(Tex *e) {
     ReleaseSRWLockExclusive(&owned_lock);
 }
 
+static void rel_append(Tex *e) {
+    e->rel_next = NULL;
+    e->rel_prev = rel_tail;
+    if (rel_tail) rel_tail->rel_next = e;
+    else rel_head = e;
+    rel_tail = e;
+}
+
+static void rel_unlink(Tex *e) {
+    if (e->rel_prev) e->rel_prev->rel_next = e->rel_next;
+    else rel_head = e->rel_next;
+    if (e->rel_next) e->rel_next->rel_prev = e->rel_prev;
+    else rel_tail = e->rel_prev;
+    e->rel_prev = e->rel_next = NULL;
+}
+
 static void destroy_tex(Tex *e) {
     own_remove(e);
     tex_gen_bump(e->key.addr);
@@ -441,24 +459,20 @@ static void destroy_tex(Tex *e) {
         for (Tex *p = head; p; p = p->next_at)
             if (p->next_at == e) { p->next_at = e->next_at; break; }
     }
-    if (e->released) nreleased--;
+    if (e->released) nreleased--, rel_unlink(e);
     vk_exec_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
     free(e);
 }
 
-// Released entries with another descriptor at the same address are replaced; too many released entries in all are
-// dropped (they come back on demand, mirrored ones re-uploaded from their storage).
+// Released entries with another descriptor at the same address are replaced; past RELEASED_MAX released entries the
+// oldest one goes at each release (it comes back on demand, a mirrored one re-uploaded from its storage). TotK
+// finalizes and initializes transient textures every frame, so a released entry is mostly taken back within frames.
+// Dropping all of them at once when the count passed 4096 destroyed thousands of images in one frame: 333-422 ms
+// frames every 40-50 s on a GTX 1050 Ti, then the textures still in use were created and uploaded again.
+#define RELEASED_MAX 2048
 static void sweep_released(void) {
-    if (nreleased <= 4096) return;
-    Tex **list = malloc(sizeof *list * (size_t)by_key.n);
-    int n = 0;
-    for (uint32_t i = 0; i < by_key.cap; i++) {
-        Tex *e = by_key.vals[i];
-        if (e && e->released) list[n++] = e;
-    }
-    for (int i = 0; i < n; i++) destroy_tex(list[i]);
-    free(list);
+    while (nreleased > RELEASED_MAX && rel_head) destroy_tex(rel_head);
 }
 
 // ---------------------------------------------------------------- uploads
@@ -800,7 +814,7 @@ static Tex *entry_of(const tex_t *t) {
         nvn_hm_put(&by_key, &k, e);
         tex_gen_bump(k.addr);
     }
-    if (e->released) e->released = 0, nreleased--, tex_gen_bump(k.addr);
+    if (e->released) e->released = 0, nreleased--, rel_unlink(e), tex_gen_bump(k.addr);
     e->t = *t;
     return e;
 }
@@ -862,6 +876,7 @@ void vk_texture_release(const tex_t *t) {
     if (e && !e->released) {
         e->released = 1;
         nreleased++;
+        rel_append(e);
         tex_gen_bump(k.addr);
         sweep_released();
     }
@@ -1612,6 +1627,7 @@ void vk_texture_shutdown(void) {
     samplers = (nvn_hmap){.klen = sizeof(samp_par)};
     free(tslots), free(sslots);
     tslots = NULL, sslots = NULL, ntslots = nsslots = 0, nreleased = 0;
+    rel_head = rel_tail = NULL;
     if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
     unlock();
 }

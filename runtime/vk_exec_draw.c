@@ -1741,10 +1741,13 @@ static void bind_vertex_buffers(VkExec *ex) {
 // TOTK_PIPE_SKIP: which draws are skipped, rather than waited for, while their shaders or pipeline build.
 // strict (0): only draws whose pass targets were all rendered in the previous presented frame; a pass with a target
 //   that was not counts as one-shot and waits.
-// any (1, default): also draws in a pass with at least one target rendered in the previous frame (a per-frame depth
+// any (1): also draws in a pass with at least one target rendered in the previous frame (a per-frame depth
 //   buffer or g-buffer with a colour target the frame before did not use: half-resolution effect buffers in fights).
 //   Passes with none (volumes, LUTs, shadow layers seen for the first time) still wait.
-// fullscreen (2): as any, and full-screen draws into such passes are skipped instead of waiting from their budget.
+// fullscreen (2, default): as any, and full-screen draws into such passes are skipped instead of waiting from their
+//   budget. A full-screen pass whose stage libraries are cold in the driver cache took 86 ms on average (up to 194 ms)
+//   in a fight on an RX 9070: three frames in a row each spent the 50 ms budget, and some of the draws were skipped
+//   after all. Skipping costs the pass for the frames until the pipeline is ready.
 static int pipe_skip_mode(void) {
     static int mode = -1;
     if (mode < 0) {

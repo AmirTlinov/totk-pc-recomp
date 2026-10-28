@@ -49,12 +49,14 @@
 #define STEP_FIRST_S (1.0 / 60.0)
 
 static _Atomic uint64_t *step_word;   // patch page +0: ratio (low float), seconds (high float)
+static double step_now = STEP_FIRST_S;   // the step the patch page holds: what the game steps each frame
 static _Atomic uint32_t *step_interval;   // patch page +8: seconds * 60 (patches-v143.txt realtime)
 static uint64_t last_ns;
 static double samples[STEP_SAMPLES];
 static unsigned sample_count, sample_next;
 
 static void step_store(float seconds) {
+    step_now = seconds;
     float ratio = seconds * 30.0f, interval = seconds * 60.0f;
     uint32_t lo, hi, iv;
     memcpy(&lo, &ratio, 4);
@@ -217,9 +219,11 @@ static void speed_report(uint64_t now, double step, int interval) {
 }
 
 static _Atomic int64_t world_us = -1;
+static _Atomic uint64_t game_us;   // game time stepped since the first present (frame_step_ticks)
 static uint64_t presents;
 
 int64_t frame_step_world_us(void) { return atomic_load_explicit(&world_us, memory_order_relaxed); }
+uint64_t frame_step_ticks(void) { return atomic_load_explicit(&game_us, memory_order_relaxed) * 60 / 1000000; }
 
 static void world_clock(double dt, double step) {
     presents++;
@@ -253,6 +257,11 @@ void frame_step_present(uint64_t display_ns, int interval) {
         }
     }
     last_ns = display_ns;
+    // The game clock of untimed script lines: what the game stepped this frame, the patch page's step with the
+    // real-time step (kept through a reset), whole vsyncs without it.
+    double game = step_word ? step_now : (interval > 0 ? interval : 1) / 60.0;
+    atomic_store_explicit(&game_us, atomic_load_explicit(&game_us, memory_order_relaxed) + (uint64_t)(game * 1e6 + 0.5),
+                          memory_order_relaxed);
     world_clock(dt, step);
     if (rt_trace & RT_TRACE_PERF) speed_report(display_ns, step, interval);
 }
