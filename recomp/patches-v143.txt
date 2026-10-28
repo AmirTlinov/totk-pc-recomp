@@ -60,3 +60,19 @@ site scene main 585e48 1e220160 @page:x3    # scvtf s0, w11 -> adrp x3, page
 site scene main 585e50 bd0cc660 2d420460    # str s0, [x19, #0xcc4] -> ldp s0, s1, [x3, #16]
 site scene main 585e54 1e220140 bd0cc660    # scvtf s0, w10 -> str s0, [x19, #0xcc4]
 site scene main 585e60 bd0cca60 bd0cca61    # str s0, [x19, #0xcc8] -> str s1, [x19, #0xcc8]
+
+# The game's zstd decoder (BSD zstd, statically linked into main) through the host's libzstd (runtime/ov_zstd.c):
+# every call of ZSTD_decompressMultiFrame (main+0x3a1f0: dctx, dst, capacity, src, size, dict, dict size, ddict) and of
+# its wrapper ZSTD_decompress_usingDDict (main+0x3a1e0, which tail-branches to it) goes to a host function on the patch
+# page (+0xff0 and +0xfe0). The lifted decoder runs its copy loops as chains of small functions; the host decodes the
+# same frames several times faster and gives the virtual core up for large inputs. Not main+0x547a04: that caller
+# (main+0x547964) resets a static DCtx of its own with which the game's zstd rejects some valid frames
+# (corruption_detected on a 473 KB frame the host decodes), and the game relies on that result.
+set zstd     TOTK_ZSTD_NATIVE    1
+site zstd   main 5f5358 97e913a6 94d3ab26   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd   main 6d7788 97e58a9a 94d0221a   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd   main bdc8e8 97d17642 94bc0dc2   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd   main 27ce4dc 9761af45 944c46c5  # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd   main 5f574c 97e912a5 94d3aa25   # bl ZSTD_decompress_usingDDict -> page+0xfe0
+site zstd   main bdc910 97d17634 94bc0db4   # bl ZSTD_decompress_usingDDict -> page+0xfe0
+site zstd   main 1852314 979f9fb3 948a3733  # bl ZSTD_decompress_usingDDict -> page+0xfe0
