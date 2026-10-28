@@ -1672,12 +1672,39 @@ VkCommandBuffer vk_upload_begin(void) {
 
 void vk_upload_end(void) { LeaveCriticalSection(&cmd_lock); }
 
+// Staging memory comes from a pool of its own that keeps STG_MIN_BLOCKS blocks from its first use (at boot). In the
+// default pools VMA creates a block under the lock of its memory type (VmaBlockVector::Allocate), so a block made by
+// the headroom thread (vk_headroom.c) or a burst of uploads held every staging allocation of the render thread: one
+// took 47-50 ms, for a few bytes, in the first frame after a save load. Larger buffers than a block go to the default
+// pool.
+#define STG_BLOCK (64ull << 20)
+#define STG_MIN_BLOCKS 2
+static VmaPool stg_pool;
+static int stg_pool_tried;
+
 void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VkCtx *c = vk_ctx();
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size ? size : 16,
                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                    .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (!__atomic_load_n(&stg_pool_tried, __ATOMIC_ACQUIRE)) {
+        InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
+        EnterCriticalSection(&cmd_lock);
+        if (!stg_pool_tried) {
+            uint32_t type;
+            VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = STG_MIN_BLOCKS};
+            if (vmaFindMemoryTypeIndexForBufferInfo(c->vma, &bi, &aci, &type) == VK_SUCCESS) {
+                pi.memoryTypeIndex = type;
+                if (vmaCreatePool(c->vma, &pi, &stg_pool) != VK_SUCCESS) stg_pool = NULL;
+            }
+            rt_log("vk: staging pool %s (%d blocks of %llu MiB kept)", stg_pool ? "created" : "unavailable: default pool",
+                   STG_MIN_BLOCKS, (unsigned long long)(STG_BLOCK >> 20));
+            __atomic_store_n(&stg_pool_tried, 1, __ATOMIC_RELEASE);
+        }
+        LeaveCriticalSection(&cmd_lock);
+    }
+    if (stg_pool && bi.size <= STG_BLOCK / 2) aci.pool = stg_pool;
     VmaAllocationInfo info;
     VkBuffer b;
     VmaAllocation a;
@@ -1797,6 +1824,9 @@ void vk_mem_shutdown(void) {
     nspare = 0;
     if (cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
     cmd_pool = VK_NULL_HANDLE;
+    if (stg_pool) vmaDestroyPool(c->vma, stg_pool);   // after retire: no staging buffer is left in it
+    stg_pool = NULL;
+    stg_pool_tried = 0;
     LeaveCriticalSection(&cmd_lock);
     AcquireSRWLockExclusive(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);
