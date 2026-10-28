@@ -59,7 +59,6 @@ class App:
         icon = layout.runtime / 'totk.ico'
         if os.name == 'nt' and icon.is_file():
             root.iconbitmap(default=str(icon))
-        root.minsize(680, 560)
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         style = ttk.Style(root)
         style.configure('Title.TLabel', font=('Segoe UI', 15, 'bold'))
@@ -114,6 +113,7 @@ class App:
         code = self.selected_lang()
         self.retext()
         self.vars['lang'].set(self.lang_label(code))
+        self.fit()
 
     def lang_label(self, code):
         return self.cat('lang.' + code)
@@ -139,6 +139,19 @@ class App:
             f.pack_forget()
         self.frames[name].pack(fill='both', expand=True)
         self.screen = name
+        self.fit()
+
+    def fit(self):
+        """Size the window to its largest screen (an unpacked frame still reports the size its children ask for), so
+        a screen or language switch neither cuts text nor moves the buttons. The window only grows: opening the log
+        makes it taller, and a size the user dragged it to stays."""
+        self.root.update_idletasks()
+        sizes = [(f.winfo_reqwidth(), f.winfo_reqheight()) for f in self.frames.values()]
+        chrome = self.root.winfo_reqheight() - self.body.winfo_reqheight()   # the title row above the body
+        w = max(self.root.winfo_reqwidth(), max(s[0] for s in sizes) + 2 * PAD)
+        h = chrome + max(s[1] for s in sizes) + 2 * PAD
+        self.root.minsize(w, h)
+        self.root.geometry(f'{max(w, self.root.winfo_width())}x{max(h, self.root.winfo_height())}')
 
     def notice(self, parent):
         w = ttk.Label(parent, style='Notice.TLabel', wraplength=620, justify='left')
@@ -382,6 +395,7 @@ class App:
             self.log_frame.pack_forget()
         self.bound = [b for b in self.bound if b[0] is not self.log_toggle]
         self.bind_text(self.log_toggle, 'text', 'ui.hide_log' if self.log_open else 'ui.show_log')
+        self.fit()
 
     def clear_log(self):
         self.log_entries = []
@@ -499,7 +513,7 @@ def selftest(layout, shots=None):
     """Every screen in both languages; the window closes itself. Returns 0 when nothing raised."""
     fix_tcl_paths()
     root = tk.Tk()
-    root.geometry('720x640+60+40')
+    root.geometry('+60+40')
     app = App(root, 'en', layout)
     steps, mixed = [], []
 
@@ -580,7 +594,6 @@ def main(argv=None):
         return selftest(layout, args.shots)
     fix_tcl_paths()
     root = tk.Tk()
-    root.geometry('720x640')
     App(root, args.lang or windows_ui_language(), layout)
     root.mainloop()
     return 0
