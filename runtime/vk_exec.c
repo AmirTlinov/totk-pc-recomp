@@ -745,7 +745,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     split_draws = part_start = 0;
     part_t0 = kern_now_ns();
     x_here = 1;
-    if (n) vk_mem_mirror_begin();
+    if (n) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
     for (int i = 0; i < n; i++) {
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
         walk(ex, nvn_op_first(handles[i]), 0);
@@ -753,7 +753,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
-    if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");

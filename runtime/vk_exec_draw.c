@@ -386,6 +386,7 @@ void vk_exec_draw_shutdown(void) {
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL);
     for (int i = 0; i < nspare_chunk; i++) vmaDestroyBuffer(c->vma, spare_chunk[i].buf, spare_chunk[i].alloc);
     nspare_pool = nspare_chunk = 0;
+    vk_usnap_shutdown();
     vkDestroyBufferView(c->device, Z.zview, NULL);
     vmaDestroyBuffer(c->vma, Z.zbuf, Z.zalloc);
     memset(&Z, 0, sizeof Z);
@@ -775,7 +776,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     if (sp.offset % align == 0) {
         VK_MEM_USE(sp);
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
-        if (written) vk_mem_gpu_wrote(&sp, n);
+        if (written) vk_mem_gpu_wrote(&sp, n), vk_usnap_drop(addr, n);
         count_use(sp.cls, use, n);
         VK_MEM_BOUND(sp);
         return 1;
@@ -878,6 +879,10 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
         }
     } else if (slot >= 3 && slot - 3 < 18) {
         const p_bind_buf *b = &ex->ubo[st][slot - 3];
+        if (b->size && vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi)) {   // as of the submit call
+            count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
+            return bi;
+        }
         if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, &bi)) return bi;
     }
     return zero_info(max);
@@ -1420,7 +1425,7 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     PUT(ex->prog->serial);
     PUT((uint64_t)vk_texture_slots_gen() << 32 | vk_texture_epoch());
     PUT((uint64_t)vk_sampler_gen() << 32 | (uint32_t)ex->nfbl);
-    PUT(vk_mem_gen());
+    PUT(vk_mem_gen() + vk_usnap_gen());   // both only grow
     for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
     if (l->sup) {
         float in[3];
@@ -2125,6 +2130,7 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     VkBufferCopy cp = {o, sp.offset, u->size};
     vkCmdCopyBuffer(ex->cb, b, sp.buffer, 1, &cp);
     vk_mem_gpu_wrote(&sp, u->size);
+    vk_usnap_drop(u->dst, u->size);
     ex->recorded++;
     vk_mem_count(sp.cls, VK_MUSE_GPU_WRITE, u->size);
     note_written(ex, u->dst, u->size);
