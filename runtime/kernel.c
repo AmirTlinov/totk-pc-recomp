@@ -123,6 +123,21 @@ static void unlock(void) { ReleaseSRWLockExclusive(&G); }
 
 uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
+// ---- TOTK_CRIT=<first>-<last frame> with TOTK_TRACE=sched: every state change and wake of the guest threads and
+// every present over those frames, written to TOTK_CRIT_OUT (default crit.bin) at the last one, for
+// tools/crit_path.py, which walks the chain of waits back from each present (holding G).
+typedef struct { uint64_t ts, obj; uint32_t a, b; uint16_t kind, st; uint32_t pad; } CritEv;
+enum { CRIT_STATE, CRIT_WAKE, CRIT_FRAME };   // a: thread; b: its waker (STATE), the waker (WAKE); st: new S_* state
+#define CRIT_N (1u << 22)                // 128 MiB, about 2000 fight frames
+static CritEv *g_crit;
+static uint32_t g_crit_n;
+static int g_crit_on;
+static uint64_t g_crit_lo, g_crit_hi;
+
+static void crit_add(int kind, uint32_t a, uint32_t b, int st, uint64_t obj, uint64_t ts) {
+    if (g_crit_n < CRIT_N) g_crit[g_crit_n++] = (CritEv){ts, obj, a, b, (uint16_t)kind, (uint16_t)st, 0};
+}
+
 // ---- TOTK_TRACE=sched accounting (holding G)
 #define RW_N 32
 static RtThread *g_render;                               // the thread that presents (sched trace, core diag)
@@ -153,6 +168,7 @@ static void acct(RtThread *t, int st) {
             wait_add(t == g_render ? g_rw : g_mw, t->st, t->wobj, waker, now - t->st_since);
         }
     }
+    if (g_crit_on) crit_add(CRIT_STATE, t->handle, t->waker, st, t->wobj, now);
     t->st = st;
     t->st_since = now;
 }
@@ -218,6 +234,7 @@ static void wake(RtThread *t, uint32_t res) {
     t->wres = res;
     t->waker = tcur ? tcur->handle : 0;
     if (rt_trace & RT_TRACE_SCHED) t->wake_at = kern_now_ns();
+    if (g_crit_on) crit_add(CRIT_WAKE, t->handle, t->waker, 0, 0, t->wake_at);
     WakeConditionVariable(&t->cv);
 }
 
@@ -1013,6 +1030,47 @@ void kern_core_stats_reset(void) {
 // calls) and of the render thread, the render and the main thread's longest waits by object and by the thread whose
 // signal ended them, and the preemption latency.
 #define REP_N 8
+// At each present (holding G): starts recording at TOTK_CRIT's first frame, stops and writes the file at its last.
+// File: "CRIT", thread count, event count (u32 each); per thread handle, priority, flags (1 main, 2 presents), host
+// tid (u32 each); then the CritEv records.
+static void crit_frame(RtThread *self, uint64_t frame) {
+    static int parsed;
+    if (!parsed) {
+        parsed = 1;
+        const char *e = cfg_get("TOTK_CRIT");
+        unsigned long long lo, hi;
+        if (e && sscanf(e, "%llu-%llu", &lo, &hi) == 2 && lo < hi && (g_crit = malloc(CRIT_N * sizeof *g_crit))) {
+            g_crit_lo = lo;
+            g_crit_hi = hi;
+            rt_log("crit: recording frames %llu-%llu", lo, hi);
+        }
+    }
+    if (!g_crit || frame < g_crit_lo || frame > g_crit_hi) return;
+    g_crit_on = 1;
+    crit_add(CRIT_FRAME, self ? self->handle : 0, 0, 0, frame, kern_now_ns());
+    if (frame < g_crit_hi) return;
+    g_crit_on = 0;
+    const char *path = cfg_get("TOTK_CRIT_OUT");
+    FILE *f = fopen(path && *path ? path : "crit.bin", "wb");
+    if (!f) {
+        rt_log("crit: cannot write %s", path && *path ? path : "crit.bin");
+        return;
+    }
+    uint32_t nt = 0;
+    for (RtThread *t = g_all; t; t = t->all) nt++;
+    fwrite("CRIT", 1, 4, f);
+    fwrite(&nt, 4, 1, f);
+    fwrite(&g_crit_n, 4, 1, f);
+    for (RtThread *t = g_all; t; t = t->all) {
+        uint32_t row[4] = {t->handle, (uint32_t)t->prio, (uint32_t)(t->is_main | (t == g_render) << 1), t->tid};
+        fwrite(row, 4, 4, f);
+    }
+    fwrite(g_crit, sizeof *g_crit, g_crit_n, f);
+    fclose(f);
+    rt_log("crit: %u events, %u threads, frames %llu-%llu%s", g_crit_n, nt, (unsigned long long)g_crit_lo,
+           (unsigned long long)g_crit_hi, g_crit_n >= CRIT_N ? " (buffer full: the last frames are incomplete)" : "");
+}
+
 void kern_sched_report(uint64_t frame) {
     static uint64_t last;
     typedef struct {
@@ -1029,6 +1087,7 @@ void kern_sched_report(uint64_t frame) {
         g_render = self;
         memset(g_rw, 0, sizeof g_rw);
     }
+    crit_frame(self, frame);
     if (frame % 120) {
         unlock();
         return;
