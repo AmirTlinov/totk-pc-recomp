@@ -427,10 +427,9 @@ static void portable_paths(RtConfig *c) {
 }
 
 int main(int argc, char **argv) {
-    mem_init();   // first: claim the guest address space before anything else can land there
+    mem_init();   // first: claim the guest address space before anything else can land there; reads totk.ini
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    cfg_init();   // before any setting is read
     AddVectoredExceptionHandler(0, crash_handler);
     parse_trace();
     prof_start();
