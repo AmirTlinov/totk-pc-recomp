@@ -18,8 +18,7 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
     uint64_t excl_val_hi;    // 336: upper half of a 128-bit exclusive pair (LDXP/LDAXP of two X registers)
-    uint64_t fpcr_host;      // 344: ~fpcr while this host thread's MXCSR mirrors it (simd.h simd_fast); 0 = not synced
-    uint8_t _pad[512 - 352];
+    uint8_t _pad[512 - 344];
     __uint128_t v[32];       // 512
 } Cpu;
 
@@ -28,7 +27,6 @@ _Static_assert(offsetof(Cpu, pc) == 264, "pc");
 _Static_assert(offsetof(Cpu, nzcv) == 272, "nzcv");
 _Static_assert(offsetof(Cpu, fpcr) == 320, "fpcr");
 _Static_assert(offsetof(Cpu, fpsr) == 328, "fpsr");
-_Static_assert(offsetof(Cpu, fpcr_host) == 344, "fpcr_host");
 _Static_assert(offsetof(Cpu, v) == 512, "v");
 
 typedef void (*GuestFn)(Cpu *);
@@ -45,6 +43,7 @@ static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0,
 static inline uint64_t rt_get_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
 static inline void rt_set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
 static inline void rt_set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v)); }
+static inline void rt_fpcr_sync(const Cpu *c) { (void)c; }
 #else
 // Host FP state is not the guest's here: code lifted with --simd=c keeps FPCR/FPSR in Cpu (c->fpcr, zeroed
 // with the Cpu), so the host-side reset in thread start-up has nothing to do.
@@ -52,6 +51,15 @@ static inline uint64_t rt_get_fpcr(void) { return 0; }
 static inline uint64_t rt_get_fpsr(void) { return 0; }
 static inline void rt_set_fpcr(uint64_t v) { (void)v; }
 static inline void rt_set_fpsr(uint64_t v) { (void)v; }
+// The MXCSR of a host thread running guest code mirrors c->fpcr: FTZ|DAZ = FPCR.FZ, RC = nearest (FPCR.RMode takes
+// the slow paths of runtime/simd.h, which switch RC around one operation). The FP helpers rely on it without checking,
+// so it is set wherever FPCR or the host FP context changes: MSR FPCR (recomp/lifter.py), rt_call (thread and fiber
+// entry, host code calling guest code), fiber resume (runtime/kernel.c fiber_resumed; fibers keep their own MXCSR).
+static inline void rt_fpcr_sync(const Cpu *c) {
+    unsigned cur = __builtin_ia32_stmxcsr();
+    unsigned want = (cur & ~0xE040u) | (c->fpcr & (1u << 24) ? 0x8040u : 0);   // FTZ 0x8000, DAZ 0x40, RC 0x6000
+    if (cur != want) __builtin_ia32_ldmxcsr(want);
+}
 #endif
 
 // ---- memory: guest addresses are host addresses

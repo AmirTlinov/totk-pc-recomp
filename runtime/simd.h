@@ -6,7 +6,7 @@
 // for arithmetic / conversions / FRINTX/I, saturating FP->int conversions, fused multiply-add, ARM estimate
 // tables. Not modelled: FPSR cumulative exception bits and QC, FPCR trap enables, FP16 arithmetic (ARMv8.2).
 // FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, MXCSR in
-// round-to-nearest outside the slow paths, with FTZ|DAZ equal to FPCR.FZ (simd_fast keeps it so); fma must be
+// round-to-nearest outside the slow paths, with FTZ|DAZ equal to FPCR.FZ (cpu.h rt_fpcr_sync keeps it so); fma must be
 // correctly rounded (build x86 with -mfma).
 #pragma once
 #include <fenv.h>
@@ -230,22 +230,9 @@ SI void simd_rm_leave(unsigned old) {
     if ((cur & SIMD_RC_MASK) != (old & SIMD_RC_MASK)) _mm_setcsr((cur & ~SIMD_RC_MASK) | (old & SIMD_RC_MASK));
 }
 
-// The thread's MXCSR mirrors the guest FPCR: FTZ|DAZ = FPCR.FZ, RC = nearest (the slow paths switch RC and
-// restore it). MSR FPCR is lowered inline (c->fpcr = v), so every helper that runs host FP checks the mirror
-// lazily: c->fpcr_host holds ~fpcr once this thread's MXCSR matches it. A zeroed Cpu (0) never matches, and code
-// that hands a Cpu to another host context (fiber switch, runtime/kernel.c) clears it.
-#define SIMD_FTZ_DAZ 0x8040u
-SN int simd_fpcr_sync(Cpu *c) {
-    uint64_t fpcr = c->fpcr;
-    unsigned cur = _mm_getcsr();
-    unsigned want = (cur & ~(SIMD_FTZ_DAZ | SIMD_RC_MASK)) | (fpcr & FPCR_FZ ? SIMD_FTZ_DAZ : 0);
-    if (cur != want) _mm_setcsr(want);
-    if (fpcr & FPCR_RM) return 0;   // directed rounding: slow paths only, so not recorded
-    c->fpcr_host = ~fpcr;
-    return 1;
-}
-// Nonzero when plain host FP gives the ARM result (MXCSR in sync, RMode = nearest). Always leaves FTZ|DAZ = FPCR.FZ.
-SI int simd_fast(Cpu *c) { return __builtin_expect(c->fpcr == ~c->fpcr_host, 1) || simd_fpcr_sync(c); }
+// The thread's MXCSR mirrors the guest FPCR.FZ with RC = nearest whenever guest code runs (cpu.h rt_fpcr_sync), so
+// plain host FP gives the ARM result unless FPCR.RMode asks for directed rounding, which the slow paths handle.
+SI int simd_directed(const Cpu *c) { return __builtin_expect((c->fpcr & FPCR_RM) != 0, 0); }
 
 #define F s
 #define T float

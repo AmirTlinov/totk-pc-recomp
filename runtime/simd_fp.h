@@ -26,8 +26,8 @@ SI T FN(flush)(T x) {
     __asm__("" : "+r"(u));
     return FN(fv)(FN(isden)(u) ? u & SGN : u);
 }
-// FPCR.FZ input flush for helpers that run host FP; also brings the thread's MXCSR in line with FPCR.
-SI T FN(fz)(Cpu *c, T x) { (void)simd_fast(c); return c->fpcr & FPCR_FZ ? FN(flush)(x) : x; }
+// FPCR.FZ input flush for helpers that run host FP.
+SI T FN(fz)(Cpu *c, T x) { return c->fpcr & FPCR_FZ ? FN(flush)(x) : x; }
 SI T FN(neg)(T x) { return FN(fv)(FN(fb)(x) ^ SGN); }
 
 // FPProcessNaN(s): first signalling NaN (quietened), else first quiet NaN, else (invalid op) default NaN
@@ -157,6 +157,9 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
 // an exact result just below the smallest normal that rounds up to it is flushed on ARM only. The slow path
 // decides both cases with the operands flushed.
 #define FREDO(op, r) (FBAD(op, r) | (__builtin_elementwise_abs(r) == FN(fv)(MINN)))
+// The complement of FREDO for every op but RSQRTS, as one compare: |r| ordered and not the smallest normal (LLVM folds
+// it to fcmp one, a single ucomiss + jne for scalars and one vcmpps for vectors).
+#define FOK(r) ((__builtin_elementwise_abs(r) < FN(fv)(MINN)) | (__builtin_elementwise_abs(r) > FN(fv)(MINN)))
 SN T FN(redo)(Cpu *c, int op, T a, T b, T d, T r) {
     if (c->fpcr & FPCR_FZ) return FN(slow)(c, op, a, b, d);
     return FBAD(op, r) ? FN(fix)(c, op, a, b, d) : r;
@@ -164,13 +167,13 @@ SN T FN(redo)(Cpu *c, int op, T a, T b, T d, T r) {
 
 // Scalar FP op (constant op folds the selection). RMode = nearest runs on the host, with or without FZ.
 SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
-    if (__builtin_expect(!simd_fast(c), 0)) return FN(slow)(c, op, a, b, d);
+    if (simd_directed(c)) return FN(slow)(c, op, a, b, d);
     if (FMINMAX(op)) {
         if (c->fpcr & FPCR_FZ) a = FN(flush)(a), b = FN(flush)(b);
         return FN(minmax)(c, op, a, b);
     }
     T r = FCALC(op, a, b, d, K);
-    if (__builtin_expect(FREDO(op, r), 0)) r = FN(redo)(c, op, a, b, d, r);
+    if (__builtin_expect(op == FOP_RSQRTS ? FREDO(op, r) : !FOK(r), 0)) r = FN(redo)(c, op, a, b, d, r);
     return r;
 }
 
@@ -192,7 +195,7 @@ SI VT FN(vflush)(VT a) {
 
 // Vector FP op: native lanes; any lane FREDO flags (or FPCR.RMode) reruns all lanes through the scalar path.
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
-    if (__builtin_expect(!simd_fast(c), 0)) return FN(vslow)(c, op, a, b, d);
+    if (simd_directed(c)) return FN(vslow)(c, op, a, b, d);
     VT r;
     if (FMINMAX(op)) {
         if (c->fpcr & FPCR_FZ) a = FN(vflush)(a), b = FN(vflush)(b);
@@ -205,11 +208,12 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
         return r;
     }
     r = FCALC(op, a, b, d, VK);
-    if (__builtin_expect(__builtin_reduce_or(FREDO(op, r)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
+    if (__builtin_expect(op == FOP_RSQRTS ? __builtin_reduce_or(FREDO(op, r)) != 0 : __builtin_reduce_and(FOK(r)) == 0, 0))
+        return FN(vslow)(c, op, a, b, d);
     return r;
 }
 
-SI VT FN(vfz)(Cpu *c, VT a) { (void)simd_fast(c); return c->fpcr & FPCR_FZ ? FN(vflush)(a) : a; }
+SI VT FN(vfz)(Cpu *c, VT a) { return c->fpcr & FPCR_FZ ? FN(vflush)(a) : a; }
 
 // ---- compares
 SI uint64_t FN(cmp)(Cpu *c, T a, T b) { // FCMP NZCV

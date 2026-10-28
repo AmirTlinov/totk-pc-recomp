@@ -197,6 +197,7 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     uint64_t lr = c->x[30], pc = c->pc;
     c->x[30] = RT_RET_HOST;
     c->pc = fn;
+    rt_fpcr_sync(c);   // guest code may start here on a host thread or fiber that has not run it
     rt_dispatch(c);
     c->x[30] = lr;
     c->pc = pc;
