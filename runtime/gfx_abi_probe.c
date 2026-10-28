@@ -84,6 +84,17 @@ static void check_write_watch(void) {
     n = mem_written_pages(a, 0x4000, pages, 8);
     CHECK(n == 1 && pages[0] == a + 0x1000, "alias write: %llu pages reported (want 1)", (unsigned long long)n);
     CHECK(mem_written_pages(a, 0x4000, pages, 8) == 0, "alias: second call reported pages");
+
+    // A region with reserved holes freezes its committed pages only, and a write thaws them without committing a hole.
+    uint64_t ra = a & ~0x1fffffull;
+    CHECK(mem_freeze(ra) == 1 && mem_frozen(ra), "freeze of a 2 MiB region with reserved holes");
+    CHECK(VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY, "its committed pages are not read-only");
+    *(volatile uint8_t *)(uintptr_t)(a + 0x2000) = 9;
+    CHECK(!mem_frozen(ra) && *(volatile uint8_t *)(uintptr_t)(a + 0x2000) == 9, "a write did not thaw the region with holes");
+    CHECK(VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE && mbi.RegionSize == 0x4000,
+          "the thawed pages are not read-write");
+    CHECK(VirtualQuery((void *)(uintptr_t)(a + 0x4000), &mbi, sizeof mbi) && mbi.State == MEM_RESERVE, "a hole got committed");
+    printf("write-watch: region with reserved holes frozen and thawed by a write\n");
     CHECK(mem_unmap_physical(a, 0x4000) == 0, "UnmapPhysicalMemory");
     CHECK(mem_written_pages(RT_KERNEL_BASE, 0x1000, pages, 8) == UINT64_MAX, "kernel region is not write-watched");
     CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0");

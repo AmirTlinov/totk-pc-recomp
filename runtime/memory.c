@@ -96,7 +96,8 @@ static void thaw_locked(uint64_t r, int why) {
     DWORD old;
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE;
     if (!VirtualProtect((void *)(uintptr_t)a, FRZ_SIZE, PAGE_READWRITE, &old)) {
-        // Not all committed (cannot happen while mapping changes thaw under frz_lock): the read-only runs only.
+        // Not all committed (freeze_locked left reserved holes): the read-only runs only. Every committed page of a
+        // frozen region was read-write at the freeze, and mapping changes thaw before they run, so these are all ours.
         MEMORY_BASIC_INFORMATION mbi;
         while (a < end && VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) {
             uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
@@ -126,18 +127,39 @@ void mem_thaw(uint64_t a, uint64_t n) {
     ReleaseSRWLockExclusive(&frz_lock);
 }
 
+// frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
+// reserved holes (heap pages given back) stay as they are, and thaw_locked finds the read-only runs again.
+static int freeze_locked(uint64_t r) {
+    uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
+    int n = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uint64_t x = a; x < end; ) {
+        if (!VirtualQuery((void *)(uintptr_t)x, &mbi, sizeof mbi)) return 0;
+        uint64_t y = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (y > end) y = end;
+        if (mbi.State == MEM_COMMIT) {
+            if (mbi.Protect != PAGE_READWRITE || n == 16) return 0;
+            run[n][0] = x, run[n][1] = y, n++;
+        } else if (mbi.State != MEM_RESERVE) return 0;
+        x = y;
+    }
+    DWORD old;
+    for (int i = 0; i < n; i++)
+        if (!VirtualProtect((void *)(uintptr_t)run[i][0], run[i][1] - run[i][0], PAGE_READONLY, &old)) {
+            while (i--) VirtualProtect((void *)(uintptr_t)run[i][0], run[i][1] - run[i][0], PAGE_READWRITE, &old);
+            return 0;
+        }
+    return n > 0;
+}
+
 int mem_freeze(uint64_t a) {
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
-    MEMORY_BASIC_INFORMATION mbi;
-    DWORD old;
     int ok = 0;
     AcquireSRWLockExclusive(&frz_lock);
     if (frz[r]) ok = 1;
     else if (thaw_ms[r] && (int32_t)((uint32_t)GetTickCount64() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
-    else if (VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
-             mbi.Protect == PAGE_READWRITE && (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize >= a + FRZ_SIZE &&
-             VirtualProtect((void *)(uintptr_t)a, FRZ_SIZE, PAGE_READONLY, &old)) {
+    else if (freeze_locked(r)) {
         __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
         InterlockedIncrement(&nfrz);
         InterlockedIncrement64(&frz_count[0]);

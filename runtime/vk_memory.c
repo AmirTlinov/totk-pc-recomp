@@ -599,10 +599,14 @@ static uint64_t ww_query(uint64_t addr, uint64_t size) {
     return n;
 }
 
-// Frozen regions (mirror mode): a 2 MiB region whose pages nothing wrote for freeze_idle submissions, and which lies
-// wholly in imported pools, is made read-only (memory.c mem_freeze), and write-watch queries skip it until a write or a
-// file read thaws it. Most of the pool memory the mirror and the texture checks cover is static (meshes, textures), and
-// a query costs about 1 us per MiB, so this keeps the queries to the regions the CPU writes.
+// Frozen regions: a 2 MiB region whose pages nothing wrote for freeze_idle submissions is made read-only
+// (memory.c mem_freeze), and write-watch queries skip it until a write or a file read thaws it. Most of the pool memory
+// the mirror and the texture checks cover is static (meshes, textures), and a query costs about 1 us per MiB (4-5 on an
+// 8th-gen i7), so this keeps the queries to the regions the CPU writes. The region need not lie wholly in pools: NVN
+// pools are small and not 2 MiB aligned, so most regions also hold other guest memory, and a rule that refused those
+// left 340 of 436 queried MiB a frame unfrozen in town although nothing had written them for 300 submissions. The
+// other memory is safe to freeze for the same reason pools are: the only kernel writes into guest memory are file
+// reads, which thaw their buffer first (fs_host.c, romfs.c), and every user-mode write faults and thaws.
 #define FREEZE_PER_SUB 32
 static int freeze_idle;                       // 0: off
 static uint32_t ww_ep = 1;                    // gen_lock: the submission being recorded (vk_mem_mirror_begin)
@@ -610,7 +614,7 @@ static uint32_t reg_last[RT_ADDRESS_LIMIT >> REG_SHIFT];    // gen_lock: ww_ep o
 static uint32_t reg_tried[RT_ADDRESS_LIMIT >> REG_SHIFT];   // gen_lock: ww_ep of its last freeze candidacy
 static uint32_t *fcand;                       // gen_lock: regions to try at the next freeze pass
 static int nfcand, cfcand;
-static uint64_t n_frz_nopool, n_frz_refused;  // gen_lock: candidates not wholly in pools, refused by mem_freeze
+static uint64_t n_frz_refused;                // gen_lock: candidates mem_freeze refused
 
 static uint32_t *gen_slot(uint64_t page_addr, int create) {
     uint64_t ci = page_addr >> GEN_CHUNK_SHIFT;
@@ -998,8 +1002,10 @@ static void mirror_mode(int discrete) {
     const char *g = cfg_get("TOTK_MIRROR_GAP");
     mirror_gap = g && *g ? atoi(g) : 2;
     if (mirror_gap < 0) mirror_gap = 0;
-    const char *fi = cfg_get("TOTK_FREEZE_IDLE");   // submissions a region stays unwritten before it is frozen
-    freeze_idle = !vk_mirror_on ? 0 : fi && *fi ? atoi(fi) : 300;
+    // Submissions a region stays unwritten before it is frozen. 60 rather than 300: in a fight 100 of the 257 MiB
+    // queried a frame lay in regions idle for 30-299 submissions, and a thaw by a write costs about 60 us.
+    const char *fi = cfg_get("TOTK_FREEZE_IDLE");
+    freeze_idle = fi && *fi ? atoi(fi) : 60;
     if (freeze_idle < 0) freeze_idle = 0;
     rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
            mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
@@ -1254,41 +1260,27 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     ReleaseSRWLockShared(&pool_lock);
 }
 
-// pool_lock shared: [a, b) lies wholly in the host ranges of imported pools with a GPU buffer.
-static int pools_cover(uint64_t a, uint64_t b) {
-    uint64_t lo[64], hi[64];
-    int n = 0;
-    for (int i = pidx_upper(&pool_index, b - 1) - 1; i >= 0 && pool_index.maxhi[i] > a; i--) {
-        const PoolRec *r = pool_index.e[i].buf;
-        if (r->kind != POOL_IMPORT || !r->buf || r->import_hi <= a || r->import_lo >= b) continue;
-        if (n == 64) return 0;
-        int at = n++;
-        for (; at > 0 && lo[at - 1] > r->import_lo; at--) lo[at] = lo[at - 1], hi[at] = hi[at - 1];
-        lo[at] = r->import_lo, hi[at] = r->import_hi;
-    }
-    uint64_t end = a;
-    for (int i = 0; i < n && end < b; i++) {
-        if (lo[i] > end) return 0;
-        if (hi[i] > end) end = hi[i];
-    }
-    return end >= b;
-}
-
-// pool_lock shared, gen_lock exclusive: freezes up to FREEZE_PER_SUB candidate regions still idle. The query after the
+// gen_lock exclusive: freezes up to FREEZE_PER_SUB candidate regions still idle. The query after the
 // protection collects the writes made before it took effect.
 static void freeze_pass(void) {
     for (int done = 0; nfcand && done < FREEZE_PER_SUB;) {
-        uint64_t j = fcand[--nfcand], a = j << REG_SHIFT, b = a + (1ull << REG_SHIFT);
+        uint64_t j = fcand[--nfcand], a = j << REG_SHIFT;
         if (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a)) continue;
-        if (!pools_cover(a, b)) { n_frz_nopool++; continue; }
         done++;
         if (!mem_freeze(a)) { n_frz_refused++; continue; }
-        query_stamp(a, b, ++gen_now);
+        query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
     }
 }
 
 void vk_mem_mirror_begin(void) {
-    if (!vk_mirror_on) return;
+    if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
+        if (!freeze_idle) return;
+        AcquireSRWLockExclusive(&gen_lock);
+        ww_ep++;
+        freeze_pass();
+        ReleaseSRWLockExclusive(&gen_lock);
+        return;
+    }
     uint64_t t0 = qpc();
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
@@ -1452,8 +1444,8 @@ static void mirror_log(uint64_t frame) {
     AcquireSRWLockExclusive(&gen_lock);
     uint64_t wc = ww_calls, wb = ww_bytes, wt = ww_ticks, dc = ww_dirty_calls, dt = ww_dirty_ticks, wp = ww_pages;
     ww_pages = 0;
-    uint64_t np = n_frz_nopool, nr = n_frz_refused;
-    ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_nopool = n_frz_refused = 0;
+    uint64_t nr = n_frz_refused;
+    ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_refused = 0;
     ReleaseSRWLockExclusive(&gen_lock);
     double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
     ww_last = frame;
@@ -1462,10 +1454,9 @@ static void mirror_log(uint64_t frame) {
     if (rt_trace & RT_TRACE_PERF)
         rt_log("mem: write-watch frame %llu: per frame, every consumer: %.1f queries over %.1f MiB, %.3f ms (%.1f found "
                "%.0f written pages, %.3f ms); frozen %.0f MiB; since the last line: freezes %llu, thaws by a write %llu, by a file read "
-               "or mapping change %llu, candidates not wholly in pools %llu, refused %llu",
+               "or mapping change %llu, refused %llu",
                (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
-               fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)np,
-               (unsigned long long)nr);
+               fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr);
     if (!vk_mirror_on) return;
     AcquireSRWLockExclusive(&mirror_stat_lock);
     MirrorAcc a = macc;
