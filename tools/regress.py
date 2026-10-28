@@ -14,6 +14,7 @@ own files stay as they are (TOTK_SHADER_CACHE still points at the build's direct
 import argparse
 import datetime
 import json
+import re
 import shutil
 import statistics
 import subprocess
@@ -28,18 +29,20 @@ from regress_score import far_gradient, is_scored, parse_perf, score_frames, vui
 ROOT = Path(__file__).resolve().parent.parent
 SAVES = ROOT / 'build' / 'save-backup'
 SLOW_MS = 50
-SHOT_STEP = 5
+SHOT_STEP = 1 / 12      # seconds of world clock between shots
 TAIL_FRAMES = 30        # shots examined for a dead or stuck ending
 TAIL_BLACK = 0.9
 BLACK_LUMA = 12
-END_SLACK = 120         # frames the log may stop short of the requested count
+END_SLACK = 2           # seconds of world clock the log may stop short of the requested run
 
-# name: (save, script, frames, scored window)
+# name: (save, script, seconds of world clock to run, scored window in world seconds)
+WORLD = re.compile(r'perf: frame (\d+): interval avg .*; world (-?[0-9.]+) s')
+
 ROUTES = {
-    'fight': ('user-save-2026-10-21-monsters', 'tools/input/fight.txt', 2600, (1560, 2600)),
-    'rock': ('user-save-2026-10-21-monsters', 'build/recordings/rock-2026-10-22.txt', 3300, (1500, 3300)),
-    'island': ('user-save-2026-10-22-island', 'tools/input/island.txt', 3600, (1500, 3600)),
-    'field': ('user-save-2026-10-21-field', 'tools/input/load_save.txt', 2400, (1560, 2400)),
+    'fight': ('user-save-2026-10-21-monsters', 'tools/input/fight.txt', 18, (1, 18)),
+    'rock': ('user-save-2026-10-21-monsters', 'build/recordings/rock-2026-10-22.txt', 30, (0, 30)),
+    'island': ('user-save-2026-10-22-island', 'tools/input/island.txt', 35, (0, 35)),
+    'field': ('user-save-2026-10-21-field', 'tools/input/load_save.txt', 14, (1, 14)),
 }
 
 # metric: (label, lower is better, absolute tolerance, relative tolerance)
@@ -74,7 +77,7 @@ def seed_caches(build, base):
 
 
 def run_route(build, route, i, out, cold, validation):
-    save, script, frames, (lo, hi) = ROUTES[route]
+    save, script, seconds, (lo, hi) = ROUTES[route]
     run = out / build.name / f'{route}-{i}'
     shutil.rmtree(run, ignore_errors=True)
     shots = run / 'shots'
@@ -87,7 +90,7 @@ def run_route(build, route, i, out, cold, validation):
                 shutil.copy2(build / name, cache / name)
     env = {
         'TOTK_TRACE': 'perf,sched',
-        'TOTK_SHOTS': f'{lo}-{hi}:{SHOT_STEP}',
+        'TOTK_SHOTS': f'w{lo}-{hi}:{SHOT_STEP:.4f}',
         'TOTK_SHOTS_DIR': str(shots),
         'TOTK_PIPELINE_CACHE': str(cache / 'pipeline-cache.bin'),
     }
@@ -97,12 +100,12 @@ def run_route(build, route, i, out, cold, validation):
         env['TOTK_VK_VALIDATION'] = '1'
     log = run / 'log.txt'
     cmd = [sys.executable, str(ROOT / 'tools' / 'run_game.py'), str(build), '--save', save,
-           '--script', str(ROOT / script), '--frames', str(frames), '--quiet', '--tag', f'rg-{route}-{i}',
+           '--script', str(ROOT / script), '--seconds', str(seconds), '--quiet', '--tag', f'rg-{route}-{i}',
            '--log', str(log)]
     for k, v in env.items():
         cmd += ['--env', f'{k}={v}']
     rc = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-    score = score_run(log, shots, lo, hi, frames, rc)
+    score = score_run(log, shots, lo, hi, seconds, rc)
     score['run'] = str(run)
     (run / 'score.json').write_text(json.dumps(score, indent=1))
     return score
@@ -113,9 +116,25 @@ def black_fraction(img):
     return sum(grey.histogram()[:BLACK_LUMA]) / (grey.width * grey.height)
 
 
-def score_run(log, shots, lo, hi, frames, rc):
-    perf = parse_perf(log, lo, hi)
+def world_frames(text, lo, hi):
+    """The presents of the world-clock window [lo, hi] seconds, from the perf lines (one per 60 presents), and the
+    world clock of the last one."""
+    lo_n = hi_n = None
+    last = -1.0
+    for m in WORLD.finditer(text):
+        n, w = int(m[1]), float(m[2])
+        last = w
+        if w >= lo and lo_n is None:
+            lo_n = n - 60
+        if w <= hi:
+            hi_n = n
+    return (lo_n or 0), (hi_n or 0), last
+
+
+def score_run(log, shots, lo, hi, seconds, rc):
     text = log.read_text(encoding='utf-8', errors='replace') if log.exists() else ''
+    lo, hi, last_world = world_frames(text, lo, hi)
+    perf = parse_perf(log, lo, hi)
     paths = {int(p.stem[1:]): p for p in shots.glob('f*.png')}
     fr = score_frames(paths) if paths else {'black_counts': {}, 'flat_frames': [], 'scored': 0, 'total': 0}
     vuids = vuid_counts(text)
@@ -127,10 +146,6 @@ def score_run(log, shots, lo, hi, frames, rc):
             with Image.open(paths[n]) as im:
                 fractions.append(black_fraction(im.convert('RGB')))
         tail_black = statistics.mean(fractions)
-    last_frame = 0
-    for line in text.splitlines():
-        if 'perf: frame ' in line:
-            last_frame = int(line.split('perf: frame ')[1].split(':')[0])
     reasons = []
     if tail_black > TAIL_BLACK:
         reasons.append(f'last {len(last)} shots {tail_black:.0%} black (game over?)')
@@ -138,8 +153,8 @@ def score_run(log, shots, lo, hi, frames, rc):
         reasons.append('crashed or no perf lines')
     if rc != 0:
         reasons.append(f'exit code {rc}')
-    if last_frame < frames - END_SLACK:
-        reasons.append(f'log stops at frame {last_frame} of {frames}')
+    if last_world < seconds - END_SLACK:
+        reasons.append(f'log stops at {last_world:.1f} s of world clock of {seconds}')
     return {
         'rc': rc, 'fps_mean': perf['fps_mean'], 'max_frame_ms': perf['max_frame_ms'],
         'slow_count': sum(1 for _, ms, _ in perf['slow_frames'] if ms >= SLOW_MS),

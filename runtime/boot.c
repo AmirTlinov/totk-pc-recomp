@@ -8,7 +8,7 @@
 //                          reads 2
 //   nvnBootstrapLoader     called from main+0xe7eb2c (1.4.3: +0xbe0360) in the graphics bring-up; logs the run
 //                          statistics, exits 0
-// With --frames N the run continues past that call; rt_frame_presented ends it at the Nth present.
+// With --seconds S the run continues past that call; rt_frame_presented ends it once the world clock passed S.
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,7 +124,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
             rt_fatal("boot: first NVN call before the SetFocusHandlingMode checkpoint");
         printf("boot: first NVN call nvnBootstrapLoader(\"%s\") from main+%#llx\n", detail,
                (unsigned long long)(ret - main_mod->base));
-        if (rt_config()->frames) return;   // --frames: the run goes on to the Nth present
+        if (rt_config()->seconds) return;   // --seconds: the run goes on into the world
         if (rt_trace & RT_TRACE_HOSTCALL) hostfn_report();
         stats_line();
         fflush(stdout);
@@ -134,7 +134,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
     rt_fatal("boot: unknown boot event %s (%s) from %s", what, detail ? detail : "", at);
 }
 
-// ---- --frames N
+// ---- --seconds S
 // A PNG with stored (uncompressed) deflate blocks: no compression library, and the shot is only read by tools.
 // rt_write_png (declared in vk.h) is shared with the TOTK_DUMP frame dump (vk_dump.c).
 static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
@@ -221,23 +221,34 @@ static void save_shot(const tex_t *t, const char *path) {
     printf("boot: shot %s (%ux%u)\n", path, w, h);
 }
 
-// TOTK_SHOTS=lo-hi:step [TOTK_SHOTS_DIR=dir]: every step-th present in [lo, hi] saved as <dir>/f<n>.png, box-filtered
-// to 480x270 (full size with TOTK_SHOTS_FULL=1), for finding short glitches. Pipeline builds stay asynchronous, so the
+// TOTK_SHOTS=lo-hi:step [TOTK_SHOTS_DIR=dir]: every step-th present in [lo, hi] saved as <dir>/f<n>.png (n the
+// present), box-filtered to 480x270; TOTK_SHOTS=w<lo>-<hi>:<step> takes them by world-clock seconds instead, the first
+// present at or after each step (full size with TOTK_SHOTS_FULL=1), for finding short glitches. Pipeline builds stay asynchronous, so the
 // pictures show what a player sees.
 static void series_shot(const tex_t *t, uint64_t n) {
     static int parsed;
-    static unsigned long long lo, hi, step;
+    static unsigned long long lo, hi, step, next;
     static const char *dir;
-    static int full;
+    static int full, world;
     if (!parsed) {
         full = cfg_get("TOTK_SHOTS_FULL") != NULL;
         const char *e = cfg_get("TOTK_SHOTS");
-        if (!e || sscanf(e, "%llu-%llu:%llu", &lo, &hi, &step) != 3 || !step) hi = 0;
+        double wl, wh, ws;
+        if (e && e[0] == 'w' && sscanf(e + 1, "%lf-%lf:%lf", &wl, &wh, &ws) == 3 && ws > 0)   // world-clock seconds
+            world = 1, lo = (unsigned long long)(wl * 1e6), hi = (unsigned long long)(wh * 1e6),
+            step = (unsigned long long)(ws * 1e6), next = lo;
+        else if (!e || sscanf(e, "%llu-%llu:%llu", &lo, &hi, &step) != 3 || !step) hi = 0;
         dir = cfg_get("TOTK_SHOTS_DIR") ? cfg_get("TOTK_SHOTS_DIR") : ".";
         if (hi) CreateDirectoryA(dir, NULL);
         parsed = 1;
     }
-    if (n < lo || n > hi || (n - lo) % step) return;
+    if (world) {   // the first present at or after each step of the world clock
+        int64_t w = frame_step_world_us();
+        if (w < 0 || (unsigned long long)w < next || next > hi) return;
+        while (next <= (unsigned long long)w) next += step;
+    } else if (n < lo || n > hi || (n - lo) % step) {
+        return;
+    }
     int fmt = t->d.format;
     int bgra = fmt == NVN_FORMAT_BGRA8 || fmt == NVN_FORMAT_BGRA8_SRGB;
     if (!bgra && fmt != NVN_FORMAT_RGBA8 && fmt != NVN_FORMAT_RGBA8_SRGB) return;
@@ -269,11 +280,14 @@ static void series_shot(const tex_t *t, uint64_t n) {
     free(px);
 }
 
-// The Nth present ends a --frames run; any other frame is counted by the back end only.
+// A --seconds run ends at the first present after the world clock (game time since the save's first frame,
+// frame_step_world_us) passed S seconds, so a run covers the same game time at any frame rate; any other frame is
+// counted by the back end only.
 void rt_frame_presented(const tex_t *t, uint64_t n) {
     const RtConfig *cfg = rt_config();
     series_shot(t, n);
-    if (!cfg->frames || n != (uint64_t)cfg->frames) return;
+    int64_t w = cfg->seconds ? frame_step_world_us() : -1;
+    if (w < 0 || (double)w < cfg->seconds * 1e6) return;
     if (cfg->shot) save_shot(t, cfg->shot);
     GfxStats g = gfx_stats();
     printf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "

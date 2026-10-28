@@ -369,7 +369,7 @@ void prof_start(void) {
         out_path = NULL;
         return;
     }
-    atexit(prof_write);   // a --frames run ends in _exit: boot.c calls prof_write itself first
+    atexit(prof_write);   // a --seconds run ends in _exit: boot.c calls prof_write itself first
 }
 
 // ---- TOTK_TRACE=perf: frame interval and the time the render thread spends waiting, logged every 60 presents. The
@@ -528,13 +528,14 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
 }
 
 int rt_ab(void) {
-    static uint64_t period = UINT64_MAX;   // 0: off
-    if (period == UINT64_MAX) {
+    static int64_t period = -1;   // us of world clock; 0: off
+    if (period < 0) {
         const char *e = cfg_get("TOTK_AB");
-        period = e && *e ? strtoull(e, NULL, 10) : 0;
+        period = e && *e ? (int64_t)(atof(e) * 1e6) : 0;
     }
-    if (!period) return 0;
-    uint64_t k = cur_frame / period % 4;
+    int64_t w = period ? frame_step_world_us() : -1;
+    if (w < 0) return 0;   // before the world clock: A
+    int64_t k = w / period % 4;
     return k == 1 || k == 2;
 }
 
@@ -636,7 +637,7 @@ void perf_present(uint64_t frame) {
     uint64_t shader_keys, shader_xlated;
     gfx_shader_counts(&shader_keys, &shader_xlated);
     if (n && span)
-        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu",
+        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu; world %.1f s",
                (unsigned long long)frame, sum / 1e6 / n, max / 1e6, n * 1e9 / sum, 100.0 * wait_ns[PERF_PACE] / span,
                100.0 * wait_ns[PERF_FENCE] / span, 100.0 * wait_ns[PERF_DRAIN] / span,
                100.0 * wait_ns[PERF_PIPE] / span, 100.0 * wait_ns[PERF_XLATE] / span,
@@ -645,7 +646,7 @@ void perf_present(uint64_t frame) {
                worst_ns[PERF_ASTC] / 1e6, worst_ns[PERF_PIPE] / 1e6, worst_ns[PERF_FENCE] / 1e6,
                (unsigned long long)shader_keys, (unsigned long long)shader_xlated,
                (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
-               InterlockedExchange64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n);
+               InterlockedExchange64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
     sum = max = n = ab_b = 0;
     memset(wait_ns, 0, sizeof wait_ns);

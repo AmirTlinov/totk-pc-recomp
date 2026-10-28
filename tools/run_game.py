@@ -4,9 +4,9 @@ The user's profile (build/profile) is never written: each run copies it to <exe 
 backup, and deletes the copy afterwards. The log records how many other totk.exe and ninja.exe processes ran, because
 timings taken next to them are not comparable.
 
-    python tools/run_game.py build/v121 --save user-save-2026-10-21-field --frames 2401 --tag idle --env TOTK_TRACE=perf
+    python tools/run_game.py build/v121 --save user-save-2026-10-21-field --seconds 15 --tag idle --env TOTK_TRACE=perf
     python tools/run_game.py build/v121-pf --save user-save-2026-10-21-monsters --script tools/input/fight.txt \
-        --frames 2601 --tag fight --quiet --env TOTK_TRACE=perf,sched
+        --seconds 18 --tag fight --quiet --env TOTK_TRACE=perf,sched
 """
 import argparse
 import ctypes
@@ -151,7 +151,9 @@ def main():
     ap.add_argument('exe_dir', type=Path, help='build directory holding totk.exe')
     ap.add_argument('--save', help='directory name under build/save-backup; default: the profile as it is')
     ap.add_argument('--script', type=Path, default=ROOT / 'tools' / 'input' / 'load_save.txt', help='TOTK_INPUT_SCRIPT')
-    ap.add_argument('--frames', type=int, required=True, help='frames to run (shot is taken of the last)')
+    ap.add_argument('--seconds', type=float, required=True,
+                    help='game time to run: the run ends once the world clock (game time since the save loaded) passed '
+                         'this many seconds (shot is taken of that frame)')
     ap.add_argument('--tag', default='run', help='names the profile copy and the log')
     ap.add_argument('--shot', type=Path, help='PNG of the last frame; turns async pipeline builds off (boot.c)')
     ap.add_argument('--log', type=Path, help='default: <exe dir>/logs/<tag>.log')
@@ -178,7 +180,7 @@ def main():
         for kv in a.env:
             k, _, v = kv.partition('=')
             env[k] = v
-        args = [str(exe_dir / 'totk.exe'), '--profile', str(prof), '--frames', str(a.frames)]
+        args = [str(exe_dir / 'totk.exe'), '--profile', str(prof), '--seconds', str(a.seconds)]
         if a.shot:
             args += ['--shot', str(a.shot.resolve())]
         try:

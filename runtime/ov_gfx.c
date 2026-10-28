@@ -107,7 +107,7 @@ static void ov_nvn_bootstrap(Cpu *c) {
     if (!name) name = "(null)";
     static LONG first = 1;
     if (rt_config()->boot && InterlockedExchange(&first, 0)) rt_boot_event("nvn", c, name);   // ends --boot; returns
-                                                                                                // when --frames goes on
+                                                                                                // when --seconds goes on
     ret_x(c, nvn_proc_address(name));
 }
 

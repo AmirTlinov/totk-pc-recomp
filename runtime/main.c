@@ -9,8 +9,9 @@
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
 //     --boot            run the game to the first NVN call
-//     --frames N        run the game (implies --boot's start-up) until the Nth present, then exit 0
-//     --shot PNG        with --frames: save the Nth frame; env TOTK_GPU=null|vulkan selects the back end
+//     --seconds S       run the game (implies --boot's start-up) until the world clock (game time since the loaded
+//                       save's first frame) passed S seconds, then exit 0 at that present
+//     --shot PNG        with --seconds: save that frame; env TOTK_GPU=null|vulkan selects the back end
 //     (no mode)         run the game
 //
 // Also here: the runtime services the generated code calls besides rt_dispatch and rt_svc (rt_brk, rt_udf,
@@ -390,7 +391,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--frames N [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -450,12 +451,12 @@ int main(int argc, char **argv) {
         if (path) {
             if (++i == argc) return usage(argv[0]);
             *path = argv[i];
-        } else if (!strcmp(argv[i], "--frames")) {
+        } else if (!strcmp(argv[i], "--seconds")) {
             char *end;
             if (++i == argc) return usage(argv[0]);
-            long n = strtol(argv[i], &end, 10);
-            if (*end || n < 1 || n > INT_MAX) return usage(argv[0]);
-            cfg.frames = (int)n;
+            double s = strtod(argv[i], &end);
+            if (*end || !(s > 0) || s > 1e6) return usage(argv[0]);
+            cfg.seconds = s;
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
             cfg.shot = argv[i];
@@ -465,10 +466,10 @@ int main(int argc, char **argv) {
             return usage(argv[0]);
         }
     }
-    if (cfg.shot && !cfg.frames) return usage(argv[0]);
-    if (cfg.frames && mode) return usage(argv[0]);
+    if (cfg.shot && !cfg.seconds) return usage(argv[0]);
+    if (cfg.seconds && mode) return usage(argv[0]);
     if (!mode) {
-        cfg.boot = cfg.frames > 0;   // --frames starts the game like --boot, with its checkpoints
+        cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         rt_boot();
         return 0;
     }
