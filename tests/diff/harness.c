@@ -136,6 +136,7 @@ int main(int argc, char **argv) {
         c.sp = in.sp;
         c.nzcv = in.nzcv;
         c.fpcr = in.fpcr;
+        rt_fpcr_sync(&c);
         memcpy(c.v, in.v, sizeof c.v);
         c.excl_addr = ~0ull;
         g_stubs = (int)in.stubs;

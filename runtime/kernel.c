@@ -1940,6 +1940,7 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to);
 // After a host fiber switch: release the context left behind, and finish an ExitThread issued on a fiber.
 static void fiber_resumed(void) {
     RtThread *t = tcur;
+    rt_fpcr_sync(t->cur);   // the host fiber resumes with its own MXCSR (FIBER_FLAG_FLOAT_SWITCH)
     if (t->leaving) {
         __atomic_store_n(&t->leaving->running, 0, __ATOMIC_RELEASE);
         t->leaving = NULL;
@@ -1981,7 +1982,6 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     dst->tpidr = from->tpidr;
     dst->tpidrro = from->tpidrro;
     dst->fpcr = from->fpcr;
-    dst->fpcr_host = 0;   // the target host fiber resumes with its own MXCSR; simd_fast resyncs it
     dst->fpsr = from->fpsr;
     dst->excl_addr = ~0ull;
     dst->thread = t;
