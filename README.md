@@ -9,7 +9,7 @@
 
 ## Status
 
-Early development. The game is playable on Windows; visual bugs and crashes are still expected. Linux and the Steam Deck are planned.
+Early development. The game is playable on Windows; visual bugs and crashes are still expected.
 
 Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -22,6 +22,13 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - In-game settings menu (F1) and performance overlay (F10)
 - Keyboard, mouse and gamepad with remapping, rumble and gyro
 - Shaders prepared at install instead of during play
+
+## Planned
+
+- Linux and the Steam Deck
+- Mods made for emulators: unpack a mod into a `mods` folder
+- Custom aspect ratios, including ultrawide
+- VRR
 
 ## Installing
 
@@ -48,8 +55,6 @@ TotK Recomp builds on the projects below. What was taken from each, with its lic
 - [SDL 3](https://libsdl.org), [Dear ImGui](https://github.com/ocornut/imgui), [AMD FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [libopus](https://opus-codec.org), [libvpx](https://chromium.googlesource.com/webm/libvpx), [Zstandard](https://github.com/facebook/zstd)
 - [Switchbrew](https://switchbrew.org) and the Switch homebrew community
 
-Most of the code and documentation is written by AI coding agents (Claude Code) under the maintainer's direction; the maintainer plays every build and decides what is merged. [AGENTS.md](AGENTS.md) holds the rules they work under.
-
 ## License
 
 The project's own code is under the [MIT License](LICENSE); third-party code keeps its own license ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). The license grants nothing for Nintendo's game.
@@ -59,3 +64,5 @@ TotK Recomp is an independent, non-commercial fan project, not affiliated with o
 ## Building from source
 
 [docs/building.md](docs/building.md) lists the toolchain and the steps. Everything the build writes stays under `build\` and `generated\`, which git ignores; run `tools/check_content.py` before a commit. Testers: [docs/tester-guide.md](docs/tester-guide.md).
+
+Most of the code and documentation is written by AI coding agents (Claude Code) under the maintainer's direction; the maintainer plays every build and decides what is merged. [AGENTS.md](AGENTS.md) holds the rules they work under.
