@@ -4,9 +4,12 @@ The user's profile (build/profile) is never written: each run copies it to <exe 
 backup, and deletes the copy afterwards. The log records how many other totk.exe and ninja.exe processes ran, because
 timings taken next to them are not comparable.
 
-    python tools/run_game.py build/v121 --save user-save-2026-10-21-field --seconds 15 --tag idle --env TOTK_TRACE=perf
-    python tools/run_game.py build/v121 --save user-save-2026-10-21-monsters --script tools/input/fight.txt \
-        --seconds 18 --tag fight --quiet --env TOTK_TRACE=perf,sched
+    python tools/run_game.py build/v143 --save <backup> --seconds 15 --tag idle --env TOTK_TRACE=perf
+    python tools/run_game.py build/v143 --save <backup> --script <input.txt> --seconds 18 --tag fight --quiet \
+        --env TOTK_TRACE=perf,sched
+
+<backup> is a folder of build/save-backup; --script defaults to tools/input/load_save.txt (title screen to the first
+save slot), and a recording made with TOTK_INPUT_RECORD replays the same way.
 """
 import argparse
 import ctypes
