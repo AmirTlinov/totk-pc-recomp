@@ -143,6 +143,10 @@
 # rumble_strength = 130
 # rumble_curve = 0.6
 # rumble_triggers = 0
+# Which gamepad button is Switch A: nintendo (by position: east A, south B, west Y, north X), xbox (south A, east B,
+# west X, north Y, as an Xbox pad labels them; cross A on a PlayStation pad) or auto (nintendo for a pad with Nintendo
+# labels, xbox for the others). The bind_ lines below apply on top. Changes while the game runs take effect at once.
+# pad_layout = auto
 # Mouse camera sensitivity (0 to 10; 0 = no mouse camera and no cursor capture).
 # mouse_sens = 1
 # Write the input of this run to a file that replays as a script (docs/controls.md, "Scripted input"). Default: off.
@@ -152,8 +156,9 @@
 # buttons without a line keep them. Invalid entries are logged and skipped.
 #   pad names: south east west north l r zl zr start back lstick rstick dpad_left dpad_up dpad_right dpad_down
 #   key names: a-z 0-9 space tab lshift lctrl up down left right mouse_l mouse_r mouse_m
-# Defaults: A = pad:east, key:E. B = pad:south, key:lshift. X = pad:north, key:space. Y = pad:west, key:mouse_l.
-# A pad that reports A/B and X/Y swapped (some GuliKit models): swap them back, keyboard keys stay.
+# Defaults (pad_layout = nintendo): A = pad:east, key:E. B = pad:south, key:lshift. X = pad:north, key:space.
+# Y = pad:west, key:mouse_l. A pad that reports A/B and X/Y swapped (some GuliKit models): set pad_layout = xbox, or
+# swap them back here (keyboard keys stay):
 # bind_A = pad:south, key:E
 # bind_B = pad:east, key:lshift
 # bind_X = pad:west, key:space

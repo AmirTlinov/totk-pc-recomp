@@ -22,18 +22,19 @@
     {KEY_1, B_LEFT}, {KEY_2, B_UP}, {KEY_3, B_RIGHT}, {KEY_4, B_DOWN}, \
     {KEY_TAB, B_PLUS}, {KEY_M, B_MINUS}
 
-// By position: south is Switch B, east A, west Y, north X (Nintendo layout); the triggers are ZL and ZR.
-#define DEFAULT_PADS \
-    {PAD_SOUTH, B_B}, {PAD_EAST, B_A}, {PAD_WEST, B_Y}, {PAD_NORTH, B_X}, {PAD_LSTICK, B_STICK_L}, {PAD_RSTICK, B_STICK_R}, \
-    {PAD_L, B_L}, {PAD_R, B_R}, {PAD_START, B_PLUS}, {PAD_BACK, B_MINUS}, {PAD_DPAD_LEFT, B_LEFT}, {PAD_DPAD_UP, B_UP}, \
-    {PAD_DPAD_RIGHT, B_RIGHT}, {PAD_DPAD_DOWN, B_DOWN}, {PAD_ZL, B_ZL}, {PAD_ZR, B_ZR}
+// By position: south is Switch B, east A, west Y, north X (Nintendo layout); the Xbox layout swaps A with B and X with Y
+// (south A, as the Xbox labels; cross A on a PlayStation pad). The triggers are ZL and ZR.
+#define DEFAULT_PADS(south, east, west, north)     {PAD_SOUTH, south}, {PAD_EAST, east}, {PAD_WEST, west}, {PAD_NORTH, north}, {PAD_LSTICK, B_STICK_L},     {PAD_RSTICK, B_STICK_R}, {PAD_L, B_L}, {PAD_R, B_R}, {PAD_START, B_PLUS}, {PAD_BACK, B_MINUS},     {PAD_DPAD_LEFT, B_LEFT}, {PAD_DPAD_UP, B_UP}, {PAD_DPAD_RIGHT, B_RIGHT}, {PAD_DPAD_DOWN, B_DOWN}, {PAD_ZL, B_ZL},     {PAD_ZR, B_ZR}
+#define NINTENDO_PADS DEFAULT_PADS(B_B, B_A, B_Y, B_X)
+#define XBOX_PADS DEFAULT_PADS(B_A, B_B, B_X, B_Y)
+enum { DEFAULT_PAD_COUNT = 16 };
 
 static const Binding default_keys[] = {DEFAULT_KEYS};
-static const PadBinding default_pads[] = {DEFAULT_PADS};
+static const PadBinding default_pads[PAD_LAYOUT_COUNT][DEFAULT_PAD_COUNT] = {{NINTENDO_PADS}, {XBOX_PADS}};
 Binding input_bindings[INPUT_BINDING_MAX] = {DEFAULT_KEYS};
 int input_binding_count = (int)(sizeof default_keys / sizeof *default_keys);
-PadBinding input_pad_bindings[INPUT_PAD_BINDING_MAX] = {DEFAULT_PADS};
-int input_pad_binding_count = (int)(sizeof default_pads / sizeof *default_pads);
+PadBinding input_pad_bindings[PAD_LAYOUT_COUNT][INPUT_PAD_BINDING_MAX] = {{NINTENDO_PADS}, {XBOX_PADS}};
+int input_pad_binding_count[PAD_LAYOUT_COUNT] = {DEFAULT_PAD_COUNT, DEFAULT_PAD_COUNT};
 
 static const char *const button_names[16] = {"A", "B", "X", "Y", "LCLICK", "RCLICK", "L", "R", "ZL", "ZR", "PLUS", "MINUS",
                                              "LEFT", "UP", "RIGHT", "DOWN"};   // indexed by action
@@ -48,8 +49,10 @@ static const char *const key_names[KEY_COUNT] = {   // letters and digits are ha
 void input_map_reset(void) {
     memcpy(input_bindings, default_keys, sizeof default_keys);
     input_binding_count = (int)(sizeof default_keys / sizeof *default_keys);
-    memcpy(input_pad_bindings, default_pads, sizeof default_pads);
-    input_pad_binding_count = (int)(sizeof default_pads / sizeof *default_pads);
+    for (int l = 0; l < PAD_LAYOUT_COUNT; l++) {
+        memcpy(input_pad_bindings[l], default_pads[l], sizeof default_pads[l]);
+        input_pad_binding_count[l] = DEFAULT_PAD_COUNT;
+    }
 }
 
 static int key_id(const char *name) {
@@ -105,12 +108,15 @@ int input_map_bind(const char *button, const char *list) {
         if (input_bindings[i].action != action) input_bindings[w++] = input_bindings[i];
     input_binding_count = w;
     for (int i = 0; i < nk && input_binding_count < INPUT_BINDING_MAX; i++) input_bindings[input_binding_count++] = keys[i];
-    w = 0;
-    for (int i = 0; i < input_pad_binding_count; i++)
-        if (input_pad_bindings[i].action != action) input_pad_bindings[w++] = input_pad_bindings[i];
-    input_pad_binding_count = w;
-    for (int i = 0; i < np && input_pad_binding_count < INPUT_PAD_BINDING_MAX; i++)
-        input_pad_bindings[input_pad_binding_count++] = pads[i];
+    for (int l = 0; l < PAD_LAYOUT_COUNT; l++) {   // a bind line names physical buttons: the same in every layout
+        PadBinding *t = input_pad_bindings[l];
+        int *n = &input_pad_binding_count[l];
+        w = 0;
+        for (int i = 0; i < *n; i++)
+            if (t[i].action != action) t[w++] = t[i];
+        *n = w;
+        for (int i = 0; i < np && *n < INPUT_PAD_BINDING_MAX; i++) t[(*n)++] = pads[i];
+    }
     return 1;
 }
 
@@ -124,10 +130,17 @@ void input_map_configure(void) {
     }
 }
 
-uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT]) {
+int input_pad_layout_pick(const char *setting, int east_labelled_a) {
+    if (setting && !_stricmp(setting, "nintendo")) return PAD_LAYOUT_NINTENDO;
+    if (setting && !_stricmp(setting, "xbox")) return PAD_LAYOUT_XBOX;
+    return east_labelled_a ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
+}
+
+uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT], int layout) {
+    const PadBinding *t = input_pad_bindings[layout];
     uint64_t b = 0;
-    for (int i = 0; i < input_pad_binding_count; i++)
-        if (down[input_pad_bindings[i].pad]) b |= 1ull << input_pad_bindings[i].action;
+    for (int i = 0; i < input_pad_binding_count[layout]; i++)
+        if (down[t[i].pad]) b |= 1ull << t[i].action;
     return b;
 }
 

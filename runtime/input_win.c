@@ -26,6 +26,10 @@ static int state;                    // 0 not started, 1 running, -1 disabled or
 static SDL_Gamepad *pad;
 static uint64_t next_scan;
 static int pad_rumble;               // the open gamepad has rumble motors
+static int pad_east_a;               // ... and labels its east face button A (Nintendo layout under TOTK_PAD_LAYOUT=auto)
+static int pad_layout = -1;          // PAD_LAYOUT_* in effect for the open gamepad, -1 to pick again; live (cfg_version)
+static unsigned pad_layout_seen;
+static volatile LONG pad_layout_shown = -1;   // pad_layout for the menu (any thread), -1 without a gamepad
 static SDL_JoystickID sensor_pad;    // the gamepad whose sensors the motion thread set up, 0 none
 static int sensor_ok;                // ... and it has both sensors, enabled
 static int motion_thread;            // 0 not started, 1 running, -1 off (TOTK_MOTION=0, no SDL)
@@ -384,16 +388,36 @@ static int32_t axis(int16_t v) {
 // Open the first gamepad when none is open or the open one went away; logs once per change.
 static void scan_pads(void) {
     if (pad && SDL_GamepadConnected(pad)) return;
-    if (pad) { SDL_CloseGamepad(pad); pad = NULL; sensor_pad = 0; sensor_ok = 0; rt_log("input: gamepad disconnected"); }
+    if (pad) {
+        SDL_CloseGamepad(pad); pad = NULL; sensor_pad = 0; sensor_ok = 0;
+        InterlockedExchange(&pad_layout_shown, -1);
+        rt_log("input: gamepad disconnected");
+    }
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     for (int i = 0; ids && i < n && !pad; i++) pad = SDL_OpenGamepad(ids[i]);
     SDL_free(ids);
     if (!pad) return;
     pad_rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+    pad_east_a = SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_EAST) == SDL_GAMEPAD_BUTTON_LABEL_A;
+    pad_layout = -1;
     int motion = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
-    rt_log("input: gamepad \"%s\" (%s, %s)", SDL_GetGamepadName(pad), pad_rumble ? "rumble" : "no rumble",
-           motion ? "gyro and accelerometer" : "no motion sensors");
+    rt_log("input: gamepad \"%s\" (%s, %s, east button %s)", SDL_GetGamepadName(pad), pad_rumble ? "rumble" : "no rumble",
+           motion ? "gyro and accelerometer" : "no motion sensors", pad_east_a ? "labelled A" : "not labelled A");
+}
+
+// Under lock: the layout of the open gamepad, picked again when a setting or the gamepad changed; logs each change.
+static int pad_layout_get(void) {
+    unsigned ver = cfg_version();
+    if (pad_layout >= 0 && ver == pad_layout_seen) return pad_layout;
+    pad_layout_seen = ver;
+    int was = pad_layout;
+    const char *set = cfg_value("TOTK_PAD_LAYOUT");
+    pad_layout = input_pad_layout_pick(set, pad_east_a);
+    if (pad_layout != was)
+        rt_log("input: gamepad layout %s (pad_layout = %s)", pad_layout == PAD_LAYOUT_XBOX ? "xbox" : "nintendo", set);
+    InterlockedExchange(&pad_layout_shown, pad_layout);
+    return pad_layout;
 }
 
 static void start(void) {
@@ -421,8 +445,8 @@ static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     if (b > a) { *x = kx; *y = ky; }
 }
 
-// Under lock, state 1: the open gamepad's buttons (Switch bits after the TOTK_BIND_* layout) and sticks; 0 without a
-// connected gamepad.
+// Under lock, state 1: the open gamepad's buttons (Switch bits after TOTK_PAD_LAYOUT and the TOTK_BIND_* lines) and
+// sticks; 0 without a connected gamepad.
 static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
     SDL_UpdateGamepads();
@@ -431,7 +455,7 @@ static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
     pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
     pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
-    *b |= input_map_pad_buttons(pd);
+    *b |= input_map_pad_buttons(pd, pad_layout_get());
     sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
     sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
     sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
@@ -537,6 +561,10 @@ uint16_t rumble_motor(float a, float curve, float strength) {
     if (!(a > 0) || !(strength > 0)) return 0;
     float v = powf(a > 1 ? 1 : a, curve) * strength * 65535.0f + 0.5f;
     return v >= 65535.0f ? 65535 : (uint16_t)v;
+}
+
+int input_pad_layout(void) {
+    return (int)InterlockedCompareExchange(&pad_layout_shown, 0, 0);
 }
 
 int input_rumble_triggers_enabled(void) {

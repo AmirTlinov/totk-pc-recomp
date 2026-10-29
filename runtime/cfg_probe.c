@@ -261,6 +261,25 @@ int probe_cfg(void) {
     CHECK((int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768, "mouse: clamped to the unit circle");
     input_mouse_stick(30, 0, 1.0 / 60, 0, st);
     CHECK(st[0] == 0 && st[1] == 0, "mouse: sensitivity 0 is off");
+    // Gamepad layouts (input_map.c)
+    CHECK(input_pad_layout_pick("auto", 1) == PAD_LAYOUT_NINTENDO && input_pad_layout_pick(NULL, 0) == PAD_LAYOUT_XBOX,
+          "pad layout: automatic is Nintendo for an east button labelled A, Xbox otherwise");
+    CHECK(input_pad_layout_pick("Xbox", 1) == PAD_LAYOUT_XBOX && input_pad_layout_pick("nintendo", 0) == PAD_LAYOUT_NINTENDO,
+          "pad layout: a set layout wins over the labels");
+    uint8_t pd[PAD_COUNT] = {0};
+    pd[PAD_SOUTH] = pd[PAD_NORTH] = 1;
+    CHECK(input_map_pad_buttons(pd, PAD_LAYOUT_NINTENDO) == (1ull << B_B | 1ull << B_X) &&
+          input_map_pad_buttons(pd, PAD_LAYOUT_XBOX) == (1ull << B_A | 1ull << B_Y),
+          "pad layout: south and north are B and X by position, A and Y on Xbox");
+    pd[PAD_SOUTH] = pd[PAD_NORTH] = 0;
+    pd[PAD_START] = pd[PAD_ZR] = 1;
+    CHECK(input_map_pad_buttons(pd, PAD_LAYOUT_XBOX) == (1ull << B_PLUS | 1ull << B_ZR), "pad layout: Xbox keeps the other buttons");
+    CHECK(input_map_bind("A", "pad:west") && input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_WEST] = 1}, PAD_LAYOUT_XBOX) ==
+                                                 (1ull << B_A | 1ull << B_X),
+          "pad layout: a bind line adds its physical button in every layout");
+    CHECK(input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_SOUTH] = 1}, PAD_LAYOUT_XBOX) == 0,
+          "pad layout: a bind line replaces the layout's own button");
+    input_map_reset();
     // defaults live in the CfgMeta table: cfg_value and the typed accessors fall back to it
     cfg_load("cfg-probe-missing.ini");
     _putenv_s("TOTK_FPS60", "");

@@ -33,23 +33,32 @@ enum {
 
 enum { INPUT_BINDING_MAX = 96, INPUT_PAD_BINDING_MAX = 48 };
 
-// The tables a remapping page edits. Defaults are the layout in docs/controls.md; input_map_reset restores them.
+// Gamepad layouts (TOTK_PAD_LAYOUT): which face button is Switch A. Nintendo: by position, east A, south B, west Y,
+// north X. Xbox: south A, east B, west X, north Y, as an Xbox pad labels them (cross A, circle B on a PlayStation pad).
+enum { PAD_LAYOUT_NINTENDO, PAD_LAYOUT_XBOX, PAD_LAYOUT_COUNT };
+
+// The tables a remapping page edits, one gamepad table per layout. Defaults are the layout in docs/controls.md;
+// input_map_reset restores them.
 typedef struct { uint8_t key; uint8_t action; } Binding;
 typedef struct { uint8_t pad; uint8_t action; } PadBinding;
 extern Binding input_bindings[INPUT_BINDING_MAX];
 extern int input_binding_count;
-extern PadBinding input_pad_bindings[INPUT_PAD_BINDING_MAX];
-extern int input_pad_binding_count;
+extern PadBinding input_pad_bindings[PAD_LAYOUT_COUNT][INPUT_PAD_BINDING_MAX];
+extern int input_pad_binding_count[PAD_LAYOUT_COUNT];
 
 void input_map_reset(void);
 // Replaces every binding of the Switch button `button` (script name: A B X Y LCLICK RCLICK L R ZL ZR PLUS MINUS LEFT UP
 // RIGHT DOWN, any case) with `list`: comma separated "pad:<name>" and "key:<name>" entries, or "none" for no input.
-// Invalid entries are logged and skipped; when none is valid the button keeps its bindings. 1 when applied.
+// Pad names are physical buttons, so the entries go into the gamepad table of every layout. Invalid entries are logged
+// and skipped; when none is valid the button keeps its bindings. 1 when applied.
 int input_map_bind(const char *button, const char *list);
 // Applies the TOTK_BIND_<button> settings (cfg_get) over the defaults. Once, at start.
 void input_map_configure(void);
-// down[pad] != 0 for the gamepad inputs held. Returns the Switch button bits (0..15) the pad table presses.
-uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT]);
+// The layout for a TOTK_PAD_LAYOUT value: "nintendo" or "xbox" (any case); anything else ("auto", NULL) picks Nintendo
+// when the pad's east button is labelled A (a Switch Pro Controller, a GuliKit) and Xbox otherwise.
+int input_pad_layout_pick(const char *setting, int east_labelled_a);
+// down[pad] != 0 for the gamepad inputs held. Returns the Switch button bits (0..15) the layout's pad table presses.
+uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT], int layout);
 
 // down[key] != 0 for the keys held. Returns the Switch button bits (0..15) the table presses.
 uint64_t input_map_buttons(const uint8_t down[KEY_COUNT]);

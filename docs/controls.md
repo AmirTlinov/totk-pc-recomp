@@ -2,7 +2,15 @@
 
 Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into one Switch controller (`runtime/input_win.c`). Buttons are ORed; each stick takes the source with the larger deflection. Keys and mouse buttons count only while the game window is in the foreground. `TOTK_INPUT=none` disables both (automated runs). `TOTK_*` settings can also be set in `totk.ini` next to `totk.exe` (`input = none`, `motion = 0`, `rumble = 0`); the environment overrides the file. `TOTK_RUMBLE_STRENGTH` is the rumble strength in percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `TOTK_RUMBLE_CURVE` is the exponent applied to the amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear). `TOTK_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
 
-| Switch | Gamepad (by position) | Keyboard and mouse | Action in the world |
+`TOTK_PAD_LAYOUT` (`pad_layout`, the *Button layout* row on the Controls tab, live) picks which face button is Switch A:
+
+- `nintendo`: by position, as on a Switch (the table below).
+- `xbox`: south A, east B, west X, north Y, as an Xbox pad labels them; on a PlayStation pad cross is A, circle B, square X, triangle Y.
+- `auto` (default): `nintendo` for a pad whose east button SDL reports labelled A (Switch Pro Controller, Nintendo-layout pads), `xbox` for the others.
+
+The log names the layout in effect (`input: gamepad layout ...`); the menu shows it under *Automatic*. The game's button prompts stay Switch letters either way.
+
+| Switch | Gamepad (by position, Nintendo layout) | Keyboard and mouse | Action in the world |
 |---|---|---|---|
 | Left stick | left stick | W A S D | move |
 | Right stick | right stick | mouse; arrow keys as a second source | camera |
@@ -40,7 +48,7 @@ The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-p
 - key names: `a` to `z`, `0` to `9`, `space tab lshift lctrl up down left right mouse_l mouse_r mouse_m`
 - `none` leaves the button unbound.
 
-A line replaces every default of that button, pad and keyboard, so list the keys you still want. Buttons without a line keep the table above. Names are case-insensitive. An invalid entry logs one `input: bind ...` line and is skipped; a line without a valid entry changes nothing. The sticks and the mouse camera are not remappable. The `TOTK_BIND_<button>` environment variables work like any other setting. Bindings are read once at start.
+A line replaces every default of that button, pad and keyboard, so list the keys you still want. Pad names are physical positions, so a line means the same in both layouts and replaces the layout's own button for that Switch button. Buttons without a line keep the table above. Names are case-insensitive. An invalid entry logs one `input: bind ...` line and is skipped; a line without a valid entry changes nothing. The sticks and the mouse camera are not remappable. The `TOTK_BIND_<button>` environment variables work like any other setting. Bindings are read once at start.
 
 A pad that reports its face buttons swapped (A/B and X/Y, as some GuliKit models do) is fixed with:
 
