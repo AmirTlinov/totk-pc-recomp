@@ -275,6 +275,9 @@ void mem_init(void) {
     AddVectoredExceptionHandler(1, thaw_handler);   // before the crash handler
     alias_pages = VirtualAlloc(NULL, ALIAS_PAGES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!alias_pages) rt_fatal("memory: cannot allocate the alias page map");
+    // totk.ini is read here, once the address space is claimed and before the first setting: the pool size below
+    // depends on TOTK_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
+    cfg_init();
     const char *pool = cfg_get("TOTK_APP_POOL");
     L = (RtGuestLayout){
         .aslr = {low, RT_ADDRESS_LIMIT - low},
