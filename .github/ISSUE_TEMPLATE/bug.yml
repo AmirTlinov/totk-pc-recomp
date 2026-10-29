@@ -8,14 +8,15 @@ body:
   - type: input
     id: version
     attributes:
-      label: Game version
-      description: As shown in the window title, for example 1.2.1.
+      label: Version
+      description: The title line of the settings menu (F1), for example "TotK Recomp 0.1.0, game 1.4.3".
     validations:
       required: true
   - type: input
     id: system
     attributes:
       label: GPU, driver and Windows version
+      description: Copy system info in the menu's Advanced tab puts them on the clipboard.
     validations:
       required: true
   - type: textarea
@@ -28,4 +29,4 @@ body:
     id: log
     attributes:
       label: Log
-      description: Attach the log file from the run where it happened.
+      description: Attach logs\totk.log from the folder of totk.exe. After a crash, copy it before you start the game again.

@@ -11,7 +11,7 @@ The Switch code is translated from ARM64 to C ahead of time and compiled into a 
 
 ## Status
 
-Early development. The game is playable on Windows, with visual bugs and crashes still expected. macOS, Linux and the Steam Deck are planned.
+Early development. The game is playable on Windows; visual bugs and crashes are still expected. Linux and the Steam Deck are planned.
 
 Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 

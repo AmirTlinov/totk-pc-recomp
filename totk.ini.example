@@ -51,6 +51,9 @@
 # lang = en-US
 # System mode reported to the game: docked or handheld.
 # operation_mode = docked
+# Language of the settings menu and the overlay: en or ru. Default: the Windows display language, English if it is
+# neither.
+# menu_lang = en
 
 [audio]
 # none mixes without opening an audio device.
@@ -71,6 +74,8 @@
 # rumble_triggers = 0
 # Mouse camera sensitivity (0 to 10; 0 = no mouse camera and no cursor capture).
 # mouse_sens = 1
+# Write the input of this run to a file that replays as a script (docs/controls.md, "Scripted input"). Default: off.
+# input_record = input.txt
 # Remap buttons, one line per Switch button: bind_<A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LCLICK RCLICK> =
 # comma separated pad:<name> and key:<name> entries, or none. A line replaces that button's defaults (pad and keyboard);
 # buttons without a line keep them. Invalid entries are logged and skipped.
@@ -86,3 +91,7 @@
 [files]
 # Folder with RomFS mod files that replace or add game files. Default: none.
 # romfs_mods =
+
+# The Advanced tab of the settings menu (F1) has more keys: scheduling, shaders and pipelines, textures and memory,
+# render fixes, Vulkan and diagnostics. They are for troubleshooting; the menu shows each one with its default and
+# writes it here when you change it.
