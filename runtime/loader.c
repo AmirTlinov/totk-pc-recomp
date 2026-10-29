@@ -266,7 +266,7 @@ static void parse_dynamic(Mod *m) {
 }
 
 // The constructor state flag DT_INIT checks: ADRP xN at DT_INIT+16, LDR wM, [xN, #imm] at +20 or +24
-// (MNG scripts/prepare_runtime.py:85-91).
+// (MNG scripts/prepare_runtime.py).
 static uint64_t decode_ctor_flag(const Mod *m) {
     uint64_t init = m->pub.init;
     if (!init) return 0;
@@ -566,7 +566,8 @@ uint64_t ldr_plt_stub(const char *module, const char *name) {
 }
 
 // ---- --probe-loader
-// Expected values, measured on the 1.2.1 and 1.4.3 modules (1.4.3 relocation totals match MNG v1.4.3-port.md:20).
+// Expected values, measured on the 1.2.1 and 1.4.3 modules; the 1.4.3 relocation totals match the ones
+// MacNativeGames' port notes give for that version.
 typedef struct {
     const char *name;
     uint64_t kinds[K_COUNT], total, sym_import, sym_own;

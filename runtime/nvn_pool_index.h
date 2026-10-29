@@ -4,7 +4,7 @@
 /* TOTK: memory pools sorted by guest address.
    The world scene keeps about 3,200 pools alive, and the replay resolves several dozen buffer addresses per draw
    (vertex / index / uniform / storage bindings). A linear scan of all pools for each of them was the largest part of
-   the ~87k instructions per draw. Lookups are now a binary search on the range start plus a backwards walk that is
+   the ~87k instructions per draw. Lookups are a binary search on the range start plus a backwards walk that is
    bounded by a running maximum of the range ends, so a pool nested inside or overlapping another is still found.
    Not thread-safe: the caller holds the pool mutex for every call. */
 #include <stdint.h>

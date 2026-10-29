@@ -1,8 +1,9 @@
 // The op-stream replay core of the Vulkan back end: walks the command handles of
 // one submission into its command buffer, keeps render targets and fixed-function state, opens and closes dynamic
-// rendering passes and records clears and barriers. Draws, binds and dispatches go to vk_exec_op_draw (T6c2); copies,
-// counters, events and conditional rendering to vk_exec_op_xfer (T6c3). Images stay in VK_IMAGE_LAYOUT_GENERAL
-// (vk_texture.c); full memory barriers order passes, clears and whatever T6c2/T6c3 record between them.
+// rendering passes and records clears and barriers. Draws, binds and dispatches go to vk_exec_op_draw
+// (vk_exec_draw.c); copies, counters, events and conditional rendering to vk_exec_op_xfer (vk_exec_xfer.c). Images
+// stay in VK_IMAGE_LAYOUT_GENERAL (vk_texture.c); full memory barriers order passes, clears and whatever those two
+// record between them.
 //
 // The op loop (END / BEGIN / JUMP / CALL, which ops are pure state, the state defaults, render targets kept until they
 // change, clears skipped while rendering is disabled) follows MacNativeGames
@@ -106,7 +107,7 @@ static void warn_once(int key, const char *fmt, ...) {
     rt_log("vk: %s (logged once)", msg);
 }
 
-// NVN defaults of the replay state (nvn_mtl.m:5449-5457).
+// NVN defaults of the replay state (nvn_mtl.m).
 static void state_reset(VkExec *ex) {
     memset(ex, 0, sizeof *ex);
     ex->st_vmask[0] = ex->st_vmask[1] = ex->st_wmask[0] = ex->st_wmask[1] = 0xff;
@@ -205,10 +206,10 @@ static void resolve_target(const tex_t *t, const view_t *v, int has_v, int depth
     if (!o->aspect) o->image = VK_NULL_HANDLE;
 }
 
-/* The size of a pass without attachments: the far corner of viewport 0, else of the scissor, 1..16384 (MacNativeGames
-   62da927, nxnative 7ed061f). TotK draws a fragment shader that only writes a storage buffer into a 1x1 viewport; a
-   pass sized by the viewport's width alone puts an offset viewport outside the scissor, and the cave rock loses its
-   ambient light. */
+/* The size of a pass without attachments: the far corner of viewport 0, else of the scissor, 1..16384, as
+   MacNativeGames and nxnative size it. TotK draws a fragment shader that only writes a storage buffer into a 1x1
+   viewport; a pass sized by the viewport's width alone puts an offset viewport outside the scissor, and the cave rock
+   loses its ambient light. */
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h) {
     double x1 = 0, y1 = 0;
     if (ex->has_vp) {
@@ -553,7 +554,7 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     }
     uint32_t mask = (uint32_t)c->mask & 0xf;
     if (!mask) return;
-    if (mask != 0xf) {   // vkCmdClearAttachments ignores write masks; a masked clear needs a draw (T6c2)
+    if (mask != 0xf) {   // vkCmdClearAttachments ignores write masks; a masked clear needs a draw (vk_exec_draw.c)
         warn_once(W_CLEAR_MASK, "colour clear with channel mask %#x is not replayed: skipped", mask);
         return;
     }
@@ -610,7 +611,7 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
     ex->rt_resolved = 0;
 }
 
-// ---- command buffer parts (port-lessons P1)
+// ---- command buffer parts
 // NVN starts the GPU as soon as commands are submitted; one Vulkan command buffer per submission starts it only after
 // the whole replay. Between passes, once TOTK_SPLIT_DRAWS (64; 0 off) draws and dispatches were recorded since the
 // last part, the part goes to the queue (vk_sync_split) and the replay continues in a new command buffer. Only

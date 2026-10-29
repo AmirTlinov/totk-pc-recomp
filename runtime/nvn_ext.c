@@ -164,7 +164,7 @@ NVN_API(nvnTextureViewSetSwizzle) {
     v->set_swizzle = 1;
 }
 // void nvnTextureViewSetDepthStencilMode(NVNtextureView *v, NVNtextureDepthStencilMode mode): STENCIL makes the replay
-// sample a depth-stencil texture through a stencil-aspect view (vk_exec_draw.c get_view; nxnative hle_nvn.c:1935)
+// sample a depth-stencil texture through a stencil-aspect view (vk_exec_draw.c get_view; nxnative hle_nvn.c)
 NVN_API(nvnTextureViewSetDepthStencilMode) {
     uint32_t m = (uint32_t)arg_x(c, 1);
     if (m > NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL) rt_fatal("nvn: invalid texture view depth-stencil mode %u", m);

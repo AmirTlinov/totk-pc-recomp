@@ -246,7 +246,7 @@ static int block_views_ok(const VkImageCreateInfo *ci) {
            ci->arrayLayers <= q->maxArrayLayers;
 }
 
-// UNDEFINED -> GENERAL; new depth / stencil images start cleared (LAS textures.c:315-327: the game copies depth
+// UNDEFINED -> GENERAL; new depth / stencil images start cleared (LAS textures.c: the game copies depth
 // without stencil, and the stencil of those images must not be whatever the memory held).
 static void init_image(Tex *e, VkCommandBuffer cb) {
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
@@ -314,7 +314,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageCreateFlags flags = ds ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;   // format-reinterpreting views
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && w == h && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-    // NVN renders into a 3D texture slice by slice (a view's min layer is the depth plane, nvn_mtl.m:4158), e.g. the
+    // NVN renders into a 3D texture slice by slice (a view's min layer is the depth plane, nvn_mtl.m), e.g. the
     // grading LUT of the menu background blur. Vulkan needs a 2D view of the slice for that.
     if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = f.vk,
@@ -934,7 +934,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     TexKey k;
     make_key(&s->t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
-    if (!e || e->released) {   // MNG hle_nvn.c:373-393: a finalized slot follows the live texture at its storage
+    if (!e || e->released) {   // MNG hle_nvn.c: a finalized slot follows the live texture at its storage
         // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
         // share storage, and the newest one at the address is usually another size. The map screen samples its
         // 2250x1080 map target through an (R,G,B,1) descriptor and followed a 960x60 target at the same address.
@@ -1075,7 +1075,7 @@ static int region_of(const tex_t *t, const view_t *v, const NVNcopyRegion *r, ui
     return 1;
 }
 
-// Pool bytes <-> caller rows of the region alone (nvn_texels_box). MNG nvn_mtl.m:10121-10132, 10158-10170 go through a
+// Pool bytes <-> caller rows of the region alone (nvn_texels_box). MacNativeGames' nvn_mtl.m goes through a
 // linear copy of the whole level; for a small region of a large texture that cost tens of milliseconds while the guest
 // thread held its virtual core and the caller the texture lock (monsters2 replay, frames 765-790).
 static int storage_texels(const tex_t *t, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
@@ -1406,7 +1406,7 @@ void vk_texture_write_back_small(uint64_t fence) {
     unlock();
 }
 
-// ---------------------------------------------------------------- samplers (LAS textures.c:778-844)
+// ---------------------------------------------------------------- samplers (LAS textures.c)
 static VkCompareOp compare_op(uint32_t f) {
     switch (f) {
     case NVN_COMPARE_FUNC_NEVER: return VK_COMPARE_OP_NEVER;

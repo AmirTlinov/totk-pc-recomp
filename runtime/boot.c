@@ -21,13 +21,14 @@
 #include "vk.h"
 
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
-// main: return addresses of nnMain's SetFocusHandlingMode call (section 0.4; 1.4.3: MNG scripts/verify_boot.py:9) and
-// of the first nvnBootstrapLoader call, per game version.
+// main: return addresses of nnMain's SetFocusHandlingMode call (1.2.1 from this port's analysis of main; 1.4.3 from
+// MacNativeGames' scripts/verify_boot.py) and of the first nvnBootstrapLoader call, per game version.
 #define CHECKPOINT_RET (RT_V143 ? 0xbdb48cull : 0xe7a954ull)
 #define NVN_RET (RT_V143 ? 0xbe0360ull : 0xe7eb2cull)
 #define CTOR_DONE 2                      // a module's constructor flag after its DT_INIT ran the init_array
 
-// The init_array sizes (1.2.1: section 0.1; 1.4.3: DT_INIT_ARRAYSZ); MacNativeGames' boot check expects the same.
+// The init_array sizes (1.2.1: counted in the modules; 1.4.3: DT_INIT_ARRAYSZ); MacNativeGames' boot check expects
+// the same.
 typedef struct { const char *name; uint64_t entries; } InitCount;
 static const InitCount inits_121[] = {{"main", 10673}, {"subsdk0", 45}, {"sdk", 116}};
 static const InitCount inits_143[] = {{"main", 10717}, {"subsdk0", 45}, {"sdk", 83}};

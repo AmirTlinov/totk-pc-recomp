@@ -327,7 +327,7 @@ void vk_pool_fini(pool_t *p) {
     else destroy_rec(c, r);
 }
 
-// Requests were checked by the front end (nvn_api_core.c, MNG totk_vpool.c:54-67); apply them in order.
+// Requests were checked by the front end (nvn_api_core.c, MNG totk_vpool.c); apply them in order.
 int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
     const nvn_mapping_t *rq = requests;
     AcquireSRWLockExclusive(&pool_lock);
@@ -1482,7 +1482,7 @@ static void mirror_log(uint64_t frame) {
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
 }
 
-// With TOTK_TRACE=perf every 600 frames: what holds device-local memory (backlog: GPU memory over long sessions).
+// With TOTK_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.
 // VMA's blocks and allocations on the device-local heaps, texture entries with their own memory, the VRAM mirrors and
 // the objects waiting for their last submission to retire.
 static void vram_log(uint64_t frame) {

@@ -298,7 +298,7 @@ static void ov_show_error(Cpu *c) {
            caller(c, lr, sizeof lr));
 }
 
-// ==== SDK-internal initialisation (services.c:208-218)
+// ==== SDK-internal initialisation (services.c)
 static void ov_diag_startup(Cpu *c) { (void)c; rt_log("diag: host diagnostics"); }
 static void ov_aoc_initialize(Cpu *c) { (void)c; rt_log("aoc: no add-on content"); }
 // 1.4.3's main lists add-on content (MNG services.c host_aoc_list): there is none.
@@ -312,7 +312,7 @@ static void ov_err_context(Cpu *c) { (void)c; rt_log("err: error contexts stay l
 static void ov_pctl_initialize(Cpu *c) { (void)c; rt_log("pctl: no parental controls"); }
 static void ov_abort_observer(Cpu *c) { (void)c; rt_log("diag: the host crash reporter observes aborts"); }
 
-// ==== observers (services.c:273-288): log, then the guest definition
+// ==== observers (services.c): log, then the guest definition
 static void observe(Cpu *c, const char *name) {
     rt_log("ENTER %s", name);
     rt_original(c);
@@ -613,7 +613,7 @@ static void ov_current_time(Cpu *c) {
 }
 
 // time_point StandardSteadyClock::now(): the int64 seconds in x0 only. The SDK caller (sdk+0x3d1d88) reads x0;
-// returning the 0x18-byte struct through x8 would write through a stale pointer (time_host.c:47-49).
+// returning the 0x18-byte struct through x8 would write through a stale pointer (time_host.c).
 static void ov_steady_now(Cpu *c) { ret_x(c, (uint64_t)steady_now().value); }
 
 // Result ToCalendarTime(CalendarTime *out, CalendarAdditionalInfo *info, const PosixTime &t): local time

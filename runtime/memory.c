@@ -604,7 +604,7 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
         r.perm = PERM_RX;
     }
     // Moved stacks: the destination is Stack, the source Normal without access; free and normal regions around them
-    // are clipped (MNG services.c:357-363).
+    // are clipped (MNG services.c).
     for (unsigned i = 0; i < nstack_maps; i++) {
         const StackMap *m = &stack_maps[i];
         uint64_t end = m->dst + m->size, send = m->src + m->size;

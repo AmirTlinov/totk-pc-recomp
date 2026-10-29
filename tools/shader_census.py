@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 XLATE = ROOT / 'build' / 'xlate' / 'totk_xlate.exe'
 SPIRV_VAL = Path(r'C:\msys64\ucrt64\bin\spirv-val.exe')
 ZSTD = b'\x28\xb5\x2f\xfd'
-# NVN program control section magic, u32 0x98761234 (refs/d2r-mobile/dm/gfx/tools/shader_map.py:19)
+# NVN program control section magic, u32 0x98761234 (d2r-mobile dm/gfx/tools/shader_map.py)
 CONTROL_MAGIC = b'\x34\x12\x76\x98'
 STAGE_IDS = {0: 'vs', 1: 'ps', 5: 'cs'}
 MAX_WORKERS = 20

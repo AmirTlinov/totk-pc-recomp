@@ -963,10 +963,10 @@ void kern_core_back(int *away) {
 // A pass of a guest loop that polls memory until another thread changes it. On the Switch it fills only its own core,
 // where a better thread pinned there preempts it; here it holds a virtual core and a host core, and pollers that take a
 // lock on every pass hand its cache line between their host cores so the thread whose item it is rarely gets it
-// (nxnative 6d34984, Breath of the Wild's job queue). Every pass pauses the host core once. A wait is a run of passes
-// through the same loop at most SPIN_GAP_NS apart; once one has lasted TOTK_SPIN_HANDOFF_US (default 50) and a thread
-// waits for a virtual core, each pass gives the core to the waiter, whatever its priority, yields the host CPU and
-// takes a core again. Shorter waits keep the core: a lock held for a moment would otherwise make the next pass wait
+// (nxnative found this in Breath of the Wild's job queue). Every pass pauses the host core once. A wait is a run of
+// passes through the same loop at most SPIN_GAP_NS apart; once one has lasted TOTK_SPIN_HANDOFF_US (default 50) and a
+// thread waits for a virtual core, each pass gives the core to the waiter, whatever its priority, yields the host CPU
+// and takes a core again. Shorter waits keep the core: a lock held for a moment would otherwise make the next pass wait
 // for another thread's next SVC (MacNativeGames). TOTK_SPIN=0 keeps the core always (the gate's own cost only).
 #define SPIN_GAP_NS 20000ull
 static int g_spin_on = -1;

@@ -130,7 +130,7 @@ const pool_t *nvn_pool_find(uint64_t addr, uint64_t len) {
     return p;
 }
 
-// Physical and virtual pools (MacNativeGames totk_vpool.c:32-52 checks). A CPU-invisible one gets a GPU window range.
+// Physical and virtual pools (MacNativeGames totk_vpool.c checks). A CPU-invisible one gets a GPU window range.
 // A CPU-visible physical pool (1.4.3: flags 0x18c, GPU_NO_ACCESS) keeps the game's storage for the CPU; the back end
 // gives it device memory as any physical pool (vk_memory.c vk_pool_init), which the GPU reaches through virtual pools.
 static int pool_place(pool_t *o) {
@@ -344,7 +344,7 @@ NVN_API(nvnMemoryPoolMap) {
     if (o->magic != NVN_POOL_MAGIC || (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) { ret_x(c, 0); return; }
     ret_x(c, (uintptr_t)o->mem);
 }
-// MacNativeGames totk_vpool.c:54-67: every request is checked before any mapping changes.
+// MacNativeGames totk_vpool.c: every request is checked before any mapping changes.
 static int check_request(const pool_t *v, const nvn_mapping_t *r, int i) {
     uint64_t end = (uint64_t)r->virtual_offset + r->size;
     if (r->virtual_offset < 0 || r->physical_offset < 0 || !r->size) {
@@ -617,7 +617,7 @@ NVN_API(nvnQueueSubmitCommands) {
     __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);
 }
 
-// The producer releases the read lock on obj+0x538 at lr 0x70008c70c8 (main_0103.c f_70008c6460); when
+// The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when
 // [obj+0x529] == [obj+0x528] (x19 = obj) it goes on to rewrite the back half. Waits off the core, at most ~400 ms.
 static void obs_release_read(Cpu *c) {
     uint64_t lr = c->x[30], obj = c->x[19];

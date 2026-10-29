@@ -107,7 +107,7 @@ static void probe_device_and_pools(void) {
     CHECK(nvn_pool_find(U(pmem) + 0x100, 0x200) == P() && !nvn_pool_find(U(pmem) + PROBE_POOL_SIZE - 8, 16), "pool index");
     n_objects += 6;
 
-    // refused: no storage, PHYSICAL | VIRTUAL, a size that is not a 64 KiB multiple (MNG totk_vpool.c:32-52)
+    // refused: no storage, PHYSICAL | VIRTUAL, a size that is not a 64 KiB multiple (MNG totk_vpool.c)
     static NVNmemoryPool bad;
     CHECK(make_pool(&bad, NULL, 0x10000, NVN_MEMORY_POOL_FLAGS_CPU_CACHED) == 0, "a pool without storage is refused");
     CHECK(make_pool(&bad, gmem, PROBE_GPOOL_SIZE, NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL) == 0,
