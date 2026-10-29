@@ -217,8 +217,15 @@ def module_glue(layout, linked, hashes, paths, version):
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
     number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
-    out += [f'const int rt_game_version = {number};', '']
+    out += [f'const int rt_game_version = {number};', f'const char rt_port_version[] = {c_string(port_version())};', '']
     return '\n'.join(out)
+
+
+def port_version():
+    """VERSION at the root: the repository's semver, or in a release folder the release string (make_release.py
+    version)."""
+    path = ROOT / 'VERSION'
+    return path.read_text(encoding='utf-8').strip() if path.is_file() else 'unknown'
 
 
 def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=None, make_lib=False):

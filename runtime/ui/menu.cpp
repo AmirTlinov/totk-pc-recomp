@@ -36,6 +36,8 @@ void vk_queue_lock(void);
 void vk_queue_unlock(void);
 void res_sizes(unsigned out[2], unsigned scene[2]);
 double frame_step_limit_hz(void);
+extern const int rt_game_version;
+extern const char rt_port_version[];
 }
 
 // Roboto Medium (Apache-2.0, ui/fonts/LICENSE-Roboto.txt) with Latin and Cyrillic glyphs.
@@ -735,6 +737,12 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                         ImGuiWindowFlags_NoSavedSettings);
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", menu_text(UI_MENU_TITLE));
+    // the port version and the game update, right-aligned on the title line: what a bug report needs first
+    char game[16], version[96];
+    snprintf(game, sizeof game, "%d.%d.%d", rt_game_version / 100, rt_game_version / 10 % 10, rt_game_version % 10);
+    snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, game);
+    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
+    ImGui::TextDisabled("%s", version);
 
     int step = g_modal                                                                                   ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1

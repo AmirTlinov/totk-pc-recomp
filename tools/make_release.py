@@ -14,7 +14,7 @@ cached in toolchain/release-dl/ and checked against the sha256 in PINS; a mismat
                ov_zstd.c (compiled per install), deps/ (headers and import libraries of SDL3, Opus, libvpx, Vulkan and VMA)
     bin/       totk_xlate.exe (+ .id), hactool.exe, SDL3.dll (upstream), libopus-0.dll, ninja.exe
     recomp/, tools/, data/, installer/, licenses/, THIRD_PARTY_NOTICES.md, totk.ini.example
-    VERSION    git describe of the checkout (else the short hash); the installer's release string
+    VERSION    the repository's VERSION plus the commit, 0.1.0+973c626; the installer's release string
     TotK-Setup.exe  installer/launcher/launcher.c built with llvm/ (-mwindows): starts python/pythonw.exe -m installer.gui
 
 --prove compiles generated/v121 and links build/release-check/totk.exe with nothing but the folder's python/, llvm/,
@@ -362,12 +362,12 @@ def build_sources(out):
 
 
 def version():
-    """git describe of the checkout, else its short hash."""
-    for args in (['describe', '--tags', '--always'], ['rev-parse', '--short', 'HEAD']):
-        r = subprocess.run(['git', '-C', ROOT, *args], capture_output=True, text=True)
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    sys.exit('no git version: not a git checkout')
+    """The port version from VERSION with the commit as build metadata: 0.1.0+973c626. The commit keeps two releases of
+    one version apart, so the installer reruns the steps an earlier release made."""
+    r = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
+    if r.returncode or not r.stdout.strip():
+        sys.exit('no git version: not a git checkout')
+    return (ROOT / 'VERSION').read_text(encoding='utf-8').strip() + '+' + r.stdout.strip()
 
 
 # ---- TotK-Setup.exe --------------------------------------------------------------------------------------------------

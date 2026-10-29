@@ -19,7 +19,7 @@ Dev mode, root = a repository checkout (no python/python.exe): build/py314-embed
 Python the release ships, with the same packages), else this Python; toolchain/llvm-mingw-*/ and toolchain/deps-mingw;
 runtime/ as the sources with build/install-rtlib/libtotkrt.a (tools/build_game.py --make-runtime-lib --out
 build/install-rtlib); MSYS2 UCRT64 ninja.exe; toolchain/hactool; build/xlate/totk_xlate.exe; the shader list from
-refs/MacNativeGames; build/install-temp. The version is dev-<commit>.
+refs/MacNativeGames; build/install-temp. The version is VERSION with -dev and the commit: 0.1.0-dev+973c626.
 """
 import os
 import subprocess
@@ -105,8 +105,9 @@ def dev_layout(root):
     embed = root / 'build' / 'py314-embed' / 'py' / ('python' + EXE)
     trees = sorted(p.parent.parent for p in (root / 'toolchain').glob('llvm-mingw-*/llvm-mingw-*/bin/clang' + EXE))
     deps = root / 'toolchain' / 'deps-mingw'
+    semver = (root / 'VERSION').read_text(encoding='utf-8').strip()
     return Layout(
-        root=root, dev=True, release=f'dev-{commit or "unknown"}',
+        root=root, dev=True, release=f'{semver}-dev+{commit or "unknown"}',
         python=embed if embed.is_file() else Path(sys.executable),
         tools=root / 'tools', recomp=root / 'recomp',
         llvm=trees[-1] if trees else root / 'toolchain' / 'llvm-mingw-missing', deps=deps,

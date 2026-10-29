@@ -81,6 +81,7 @@
  "warn.npdm_differs": "main.npdm differs from the reference {version} dump; only the code modules are used.",
 
  "ui.title": "TotK Setup",
+ "ui.version": "version {version}",
  "ui.intro": "Builds a playable Tears of the Kingdom folder from your own game files. This takes a while and runs once.",
  "ui.notice": "The folder this setup builds contains the game. It is for your own use only; do not share or upload it.",
  "ui.keys_private": "The keys file is read in place. Its contents are never shown, copied or stored.",
