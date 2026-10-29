@@ -35,11 +35,11 @@ static int readable(uint64_t a, uint64_t n) {
 
 void kern_backtrace(const Cpu *c) {
     char d[160];
-    fprintf(stderr, "  lr %s\n", ldr_describe(c->x[30], d, sizeof d));
+    rt_logf("  lr %s\n", ldr_describe(c->x[30], d, sizeof d));
     uint64_t fp = c->x[29];
     for (int n = 0; n < 32 && fp && !(fp & 7) && readable(fp, 16); n++) {
         uint64_t next = LD64(fp), lr = LD64(fp + 8);
-        fprintf(stderr, "  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
+        rt_logf("  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
         if (next <= fp || next - fp > (64u << 20)) break;
         fp = next;
     }
@@ -61,7 +61,7 @@ static __attribute__((noreturn)) void svc_fatal(Cpu *c, uint32_t imm, uint64_t p
         if (unimplemented[i].imm == imm) name = unimplemented[i].name;
     char at[160];
     fflush(stdout);
-    fprintf(stderr, "FATAL: svc #%#x %s at %s: %s\n  x0 %#llx x1 %#llx x2 %#llx x3 %#llx\n", imm, name,
+    rt_logf("FATAL: svc #%#x %s at %s: %s\n  x0 %#llx x1 %#llx x2 %#llx x3 %#llx\n", imm, name,
             ldr_describe(pc, at, sizeof at), why, (unsigned long long)c->x[0], (unsigned long long)c->x[1],
             (unsigned long long)c->x[2], (unsigned long long)c->x[3]);
     kern_backtrace(c);
@@ -211,7 +211,7 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
         if (n > 65536) svc_fatal(c, imm, pc, "debug string longer than 64 KiB");
         if (n) {
             fflush(stdout);
-            fwrite((const void *)(uintptr_t)x[0], 1, n, stderr);
+            rt_log_raw((const char *)(uintptr_t)x[0], n);
         }
         x[0] = R_OK;
         return;

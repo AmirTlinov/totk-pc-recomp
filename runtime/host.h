@@ -16,7 +16,13 @@
 #include "dispatch.h"
 
 // ---- logging and results
-void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[host] <msg>\n" to stderr, one write
+void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));   // "[host] <msg>\n" to the log, one write
+// The log is stderr plus, in a game run whose stderr is not a file, logs\totk.log next to totk.exe (main.c log_open).
+// rt_logf and rt_log_raw write to both without the prefix and the newline: crash reports, fatal errors, guest output.
+void rt_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void rt_vlogf(const char *fmt, va_list ap);
+void rt_log_raw(const char *p, size_t n);
+const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
        RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
 extern unsigned rt_trace;                       // from TOTK_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)

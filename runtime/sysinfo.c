@@ -8,6 +8,7 @@
 #endif
 
 #include "cfg.h"
+#include "host.h"
 #include "platform/platform.h"
 #include "sysinfo.h"
 #include "vk.h"
@@ -29,7 +30,9 @@ void sysinfo_cpu_name(char *out, size_t n) {
 }
 
 int sysinfo_log_folder(char *out, size_t n) {
-    if (!plat_stderr_path(out, n) && !plat_exe_path(out, n)) return 0;
+    const char *log = rt_log_path();
+    if (log) snprintf(out, n, "%s", log);
+    else if (!plat_stderr_path(out, n) && !plat_exe_path(out, n)) return 0;
     char *s = strrchr(out, '\\'), *f = strrchr(out, '/');
     if (f > s) s = f;
     if (!s) return 0;
