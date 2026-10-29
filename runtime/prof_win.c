@@ -61,6 +61,7 @@ static int only_main;               // TOTK_PROFILE_MAIN=1: sample the guest mai
 static int chains;                  // call chains are kept: TOTK_PROFILE_RENDER or TOTK_PROFILE_CHAINS
 static volatile uint64_t cur_frame; // last presented frame
 static uint64_t frame_lo, frame_hi; // TOTK_PROFILE_FRAMES=<lo>-<hi>: sample only while presents lo..hi-1 are pending
+static int64_t world_lo, world_hi;  // TOTK_PROFILE_FRAMES=w<lo>-<hi>: only while the world clock is in [lo, hi) s (us)
 
 #define SLOW_RING (1u << 15)        // TOTK_PROFILE_SLOW: about 0.5 s of samples of every thread
 #define SLOW_DUMPS 64
@@ -223,6 +224,10 @@ static DWORD WINAPI sampler_main(void *arg) {
         if (tick % 64 == 0) refresh_threads(self);
         if (dump_hi) slow_dump();
         if (frame_hi && (cur_frame < frame_lo || cur_frame >= frame_hi)) continue;
+        if (world_hi) {   // -1 before the world clock starts
+            int64_t w = frame_step_world_us();
+            if (w < world_lo || w >= world_hi) continue;
+        }
         uint64_t now = slow_ns ? kern_now_ns() : 0;
         for (int i = 0; i < n_threads; i++) {
             ThreadSlot *t = &threads[i];
@@ -357,7 +362,10 @@ void prof_start(void) {
     slow_ns = sl && atoi(sl) > 0 ? (uint64_t)atoi(sl) * 1000000ull : 0;
     chains = only_render || only_main || slow_ns || (ch && *ch && strcmp(ch, "0"));
     const char *fr = cfg_get("TOTK_PROFILE_FRAMES");
-    if (fr && sscanf(fr, "%llu-%llu", (unsigned long long *)&frame_lo, (unsigned long long *)&frame_hi) != 2) frame_hi = 0;
+    double wl, wh;
+    if (fr && fr[0] == 'w' && sscanf(fr + 1, "%lf-%lf", &wl, &wh) == 2 && wl >= 0 && wl < wh)
+        world_lo = (int64_t)(wl * 1e6), world_hi = (int64_t)(wh * 1e6);
+    else if (fr && sscanf(fr, "%llu-%llu", (unsigned long long *)&frame_lo, (unsigned long long *)&frame_hi) != 2) frame_hi = 0;
     MODULEINFO mi;
     if (GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof mi)) {
         exe_lo = (uintptr_t)mi.lpBaseOfDll;

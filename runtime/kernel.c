@@ -126,14 +126,17 @@ uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
 // ---- TOTK_CRIT=<first>-<last frame> with TOTK_TRACE=sched: every state change and wake of the guest threads and
 // every present over those frames, written to TOTK_CRIT_OUT (default crit.bin) at the last one, for
-// tools/crit_path.py, which walks the chain of waits back from each present (holding G).
+// tools/crit_path.py, which walks the chain of waits back from each present (holding G). TOTK_CRIT=w<lo>-<hi> takes
+// world-clock seconds instead (frame_step_world_us): from the first present at or after lo to the first after hi, so a
+// session covers the same game time at any frame rate.
 typedef struct { uint64_t ts, obj; uint32_t a, b; uint16_t kind, st; uint32_t pad; } CritEv;
 enum { CRIT_STATE, CRIT_WAKE, CRIT_FRAME };   // a: thread; b: its waker (STATE), the waker (WAKE); st: new S_* state
 #define CRIT_N (1u << 22)                // 128 MiB, about 2000 fight frames
 static CritEv *g_crit;
 static uint32_t g_crit_n;
 static int g_crit_on;
-static uint64_t g_crit_lo, g_crit_hi;
+static uint64_t g_crit_lo, g_crit_hi;   // frames; UINT64_MAX in world mode until the world clock fixes them
+static int64_t g_crit_wlo, g_crit_whi;  // world mode: the window in microseconds of world clock, else 0
 
 static void crit_add(int kind, uint32_t a, uint32_t b, int st, uint64_t obj, uint64_t ts) {
     if (g_crit_n < CRIT_N) g_crit[g_crit_n++] = (CritEv){ts, obj, a, b, (uint16_t)kind, (uint16_t)st, 0};
@@ -1084,11 +1087,25 @@ static void crit_frame(RtThread *self, uint64_t frame) {
         parsed = 1;
         const char *e = cfg_get("TOTK_CRIT");
         unsigned long long lo, hi;
-        if (e && sscanf(e, "%llu-%llu", &lo, &hi) == 2 && lo < hi && (g_crit = malloc(CRIT_N * sizeof *g_crit))) {
+        double wl, wh;
+        if (e && e[0] == 'w' && sscanf(e + 1, "%lf-%lf", &wl, &wh) == 2 && wl >= 0 && wl < wh &&
+            (g_crit = malloc(CRIT_N * sizeof *g_crit))) {
+            g_crit_wlo = (int64_t)(wl * 1e6), g_crit_whi = (int64_t)(wh * 1e6);
+            g_crit_lo = g_crit_hi = UINT64_MAX;
+            rt_log("crit: recording world seconds %g-%g", wl, wh);
+        } else if (e && sscanf(e, "%llu-%llu", &lo, &hi) == 2 && lo < hi && (g_crit = malloc(CRIT_N * sizeof *g_crit))) {
             g_crit_lo = lo;
             g_crit_hi = hi;
             rt_log("crit: recording frames %llu-%llu", lo, hi);
         }
+    }
+    if (g_crit && g_crit_whi && g_crit_hi == UINT64_MAX) {   // world mode: fix the frames as the clock passes lo and hi
+        int64_t w = frame_step_world_us();
+        if (g_crit_lo == UINT64_MAX) {
+            if (w < g_crit_wlo) return;
+            g_crit_lo = frame;
+        }
+        if (w > g_crit_whi) g_crit_hi = frame;
     }
     if (!g_crit || frame < g_crit_lo || frame > g_crit_hi) return;
     g_crit_on = 1;
