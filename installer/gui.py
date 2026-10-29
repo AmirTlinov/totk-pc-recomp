@@ -54,6 +54,7 @@ class App:
         self.vars['lang'] = tk.StringVar()
         self.lang_code = default_game_language(ui_lang)
         self.screen = None
+        self.fitted = None               # the (width, height) fit last gave the window
 
         root.title(self.cat('ui.title'))
         icon = layout.runtime / 'totk.ico'
@@ -144,12 +145,16 @@ class App:
     def fit(self):
         """Size the window to its largest screen (an unpacked frame still reports the size its children ask for), so
         a screen or language switch neither cuts text nor moves the buttons. The window only grows: opening the log
-        makes it taller, and a size the user dragged it to stays."""
+        makes it taller, and a size the user dragged it to stays. Every text change that can add lines calls it again,
+        or pack takes the missing height from the button bars."""
         self.root.update_idletasks()
         sizes = [(f.winfo_reqwidth(), f.winfo_reqheight()) for f in self.frames.values()]
         chrome = self.root.winfo_reqheight() - self.body.winfo_reqheight()   # the title row above the body
         w = max(self.root.winfo_reqwidth(), max(s[0] for s in sizes) + 2 * PAD)
         h = chrome + max(s[1] for s in sizes) + 2 * PAD
+        if (w, h) == self.fitted:   # refresh_run calls it on every poll: leave the window alone while nothing grew
+            return
+        self.fitted = (w, h)
         self.root.minsize(w, h)
         self.root.geometry(f'{max(w, self.root.winfo_width())}x{max(h, self.root.winfo_height())}')
 
@@ -160,6 +165,10 @@ class App:
 
     def build_form(self):
         f = ttk.Frame(self.body)
+        bar = ttk.Frame(f)   # packed first so pack shrinks the text above it, never the buttons
+        bar.pack(side='bottom', fill='x', pady=(12, 0))
+        self.start_button = self.button(bar, 'ui.start', self.start)
+        self.start_button.pack(side='right')
         self.form_intro = self.label(f, 'ui.intro', wraplength=620, justify='left')
         self.form_intro.pack(anchor='w', pady=(0, 8))
         self.notice(f).pack(fill='x', pady=(0, 10))
@@ -191,14 +200,16 @@ class App:
         self.form_error = ttk.Label(f, style='Err.TLabel', wraplength=620, justify='left')
         self.form_error.pack(anchor='w', pady=(8, 0))
         self.label(f, 'ui.keys_private', wraplength=620, justify='left').pack(anchor='w', pady=(8, 0))
-        bar = ttk.Frame(f)
-        bar.pack(side='bottom', fill='x', pady=(12, 0))
-        self.start_button = self.button(bar, 'ui.start', self.start)
-        self.start_button.pack(side='right')
         return f
 
     def build_run(self):
         f = ttk.Frame(self.body)
+        bar = ttk.Frame(f)
+        bar.pack(side='bottom', fill='x', pady=(8, 0))
+        self.cancel_button = self.button(bar, 'ui.cancel', self.cancel)
+        self.cancel_button.pack(side='right')
+        self.log_toggle = self.button(bar, 'ui.show_log', self.toggle_log)
+        self.log_toggle.pack(side='left')
         self.run_header = ttk.Label(f, font=('Segoe UI', 11, 'bold'))
         self.run_header.pack(anchor='w')
         self.step_rows = {}
@@ -212,12 +223,6 @@ class App:
         self.space_label.pack(anchor='w')
         self.warn_label = ttk.Label(f, wraplength=620, justify='left', foreground='#9a6700')
         self.warn_label.pack(anchor='w')
-        bar = ttk.Frame(f)
-        bar.pack(side='bottom', fill='x', pady=(8, 0))
-        self.cancel_button = self.button(bar, 'ui.cancel', self.cancel)
-        self.cancel_button.pack(side='right')
-        self.log_toggle = self.button(bar, 'ui.show_log', self.toggle_log)
-        self.log_toggle.pack(side='left')
         self.log_frame = ttk.Frame(f)
         self.log = tk.Text(self.log_frame, height=10, wrap='word', state='disabled', font=('Consolas', 9))
         scroll = ttk.Scrollbar(self.log_frame, command=self.log.yview)
@@ -229,6 +234,13 @@ class App:
 
     def build_finish(self):
         f = ttk.Frame(self.body)
+        bar = ttk.Frame(f)
+        bar.pack(side='bottom', fill='x', pady=(12, 0))
+        self.button(bar, 'ui.close', self.on_close).pack(side='right')
+        self.open_button = self.button(bar, 'ui.open_folder', self.open_folder)
+        self.open_button.pack(side='right', padx=(0, 8))
+        self.back_button = self.button(bar, 'ui.back', lambda: self.show('form'))
+        self.back_button.pack(side='left')
         self.finish_title = ttk.Label(f, style='Title.TLabel', wraplength=620, justify='left')
         self.finish_title.pack(anchor='w')
         self.finish_text = ttk.Label(f, wraplength=620, justify='left')
@@ -237,13 +249,6 @@ class App:
         self.finish_steps.pack(fill='x', pady=(0, 8))
         self.finish_notice = self.notice(f)
         self.finish_notice.pack(fill='x', pady=(8, 0))
-        bar = ttk.Frame(f)
-        bar.pack(side='bottom', fill='x', pady=(12, 0))
-        self.button(bar, 'ui.close', self.on_close).pack(side='right')
-        self.open_button = self.button(bar, 'ui.open_folder', self.open_folder)
-        self.open_button.pack(side='right', padx=(0, 8))
-        self.back_button = self.button(bar, 'ui.back', lambda: self.show('form'))
-        self.back_button.pack(side='left')
         return f
 
     # ---- form -----------------------------------------------------------------------------------------------------
@@ -261,6 +266,7 @@ class App:
                 self.vars['lang'].set(self.lang_label(state['lang']))
         else:
             self.update_hint.configure(text='')
+        self.fit()
 
     def pick_file(self, name, pick_id):
         types = [(self.cat('ui.type_game'), '*.nsp *.xci'), (self.cat('ui.type_all'), '*.*')]
@@ -284,6 +290,7 @@ class App:
         problems = form.problems()
         if problems:
             self.form_error.configure(text=' '.join(self.cat(p) for p in problems))
+            self.fit()
             return
         self.form_error.configure(text='')
         command = form.command(self.layout.python, root=self.layout.root if self.layout.dev else None,
@@ -386,6 +393,7 @@ class App:
             self.bar.configure(value=frac * 1000)
         self.space_label.configure(text=m.need_text(self.cat))
         self.warn_label.configure(text='\n'.join(self.cat(i, **p) for i, p in m.warnings))
+        self.fit()   # new step rows and warnings make the screen taller
 
     def toggle_log(self):
         self.log_open = not self.log_open
