@@ -78,7 +78,7 @@ static void cb_module_inits(Cpu *c) {
         rt_log("boot: ENTER %s DT_INIT (%llu init_array entries)", m->name, (unsigned long long)entries);
         rt_call(c, m->init, 0);
         uint32_t state = ctor_state(m);
-        printf("boot: DT_INIT %s state=%u (%llu)\n", m->name, state, (unsigned long long)entries);
+        rt_logf("boot: DT_INIT %s state=%u (%llu)\n", m->name, state, (unsigned long long)entries);
         if (state != CTOR_DONE) rt_fatal("boot: %s DT_INIT left its constructor flag at %u, not 2", m->name, state);
         if (entries != expected_inits[k].entries)
             rt_fatal("boot: %s has %llu init_array entries, this game version has %llu", m->name, (unsigned long long)entries,
@@ -95,7 +95,7 @@ static void cb_module_finis(Cpu *c) {
 // ---- checkpoints (host.h)
 static void stats_line(void) {
     RtStats s = rt_stats();
-    printf("boot: passed (%llu SVCs, %llu threads, %llu host calls)\n", (unsigned long long)s.svcs,
+    rt_logf("boot: passed (%llu SVCs, %llu threads, %llu host calls)\n", (unsigned long long)s.svcs,
            (unsigned long long)s.threads, (unsigned long long)s.host_calls);
 }
 
@@ -114,7 +114,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
                 rt_fatal("boot: checkpoint %s: %s constructor flag reads %u", detail, ldr_module(i)->name,
                          ctor_state(ldr_module(i)));
         InterlockedExchange(&checkpoint_seen, 1);
-        printf("boot: checkpoint %s from main+%#llx\n", detail, (unsigned long long)(ret - main_mod->base));
+        rt_logf("boot: checkpoint %s from main+%#llx\n", detail, (unsigned long long)(ret - main_mod->base));
         return;
     }
     if (!strcmp(what, "nvn")) {
@@ -123,7 +123,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
                      (unsigned long long)NVN_RET);
         if (!InterlockedCompareExchange(&checkpoint_seen, 0, 0))
             rt_fatal("boot: first NVN call before the SetFocusHandlingMode checkpoint");
-        printf("boot: first NVN call nvnBootstrapLoader(\"%s\") from main+%#llx\n", detail,
+        rt_logf("boot: first NVN call nvnBootstrapLoader(\"%s\") from main+%#llx\n", detail,
                (unsigned long long)(ret - main_mod->base));
         if (rt_config()->seconds) return;   // --seconds: the run goes on into the world
         if (rt_trace & RT_TRACE_HOSTCALL) hostfn_report();
@@ -219,7 +219,7 @@ static void save_shot(const tex_t *t, const char *path) {
         }
     rt_write_png(path, px, w, h);
     free(px);
-    printf("boot: shot %s (%ux%u)\n", path, w, h);
+    rt_logf("boot: shot %s (%ux%u)\n", path, w, h);
 }
 
 // TOTK_SHOTS=lo-hi:step [TOTK_SHOTS_DIR=dir]: every step-th present in [lo, hi] saved as <dir>/f<n>.png (n the
@@ -291,7 +291,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     if (w < 0 || (double)w < cfg->seconds * 1e6) return;
     if (cfg->shot) save_shot(t, cfg->shot);
     GfxStats g = gfx_stats();
-    printf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "
+    rt_logf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "
            "shader failures %llu, draws skipped %llu)\n", (unsigned long long)g.frames,
            (unsigned long long)g.nvn_calls, (unsigned long long)g.nvn_distinct, (unsigned long long)g.unimplemented,
            (unsigned long long)g.validation_errors, (unsigned long long)g.shader_failures,

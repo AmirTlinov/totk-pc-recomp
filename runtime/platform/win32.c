@@ -199,6 +199,21 @@ int plat_file_write(const char *path, const void *data, size_t n) {
     return ok;
 }
 
+PlatAppend *plat_append_open(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return NULL;
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    return h == INVALID_HANDLE_VALUE ? NULL : (PlatAppend *)h;
+}
+
+int plat_append_write(PlatAppend *f, const void *data, size_t n) {
+    // Offset and OffsetHigh all ones: WriteFile appends at the end of the file, atomically against other writers.
+    OVERLAPPED o = {.Offset = 0xffffffff, .OffsetHigh = 0xffffffff};
+    DWORD put = 0;
+    return WriteFile((HANDLE)f, data, (DWORD)n, &put, &o) && put == n;
+}
+
 int plat_file_replace(const char *from, const char *to) {
     wchar_t a[WPATH], b[WPATH];
     if (!widen(from, a, WPATH) || !widen(to, b, WPATH)) return 0;

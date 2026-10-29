@@ -35,6 +35,51 @@
 // ---- logging, tracing, hashing
 unsigned rt_trace;
 
+// Log file. A game run whose stderr is not a file already (started from Explorer, a shortcut or a console) also
+// writes its log to logs\totk.log next to totk.exe, so a player has one to attach to a report; run_game.py and
+// `2> file` keep their own file. Each start moves the earlier logs to totk.1.log .. totk.4.log. A file stops at 64 MiB
+// (TOTK_TRACE can write that much). Lines from before log_open wait in a static buffer: mem_init runs first so that
+// nothing else lands in the guest address space, and an earlier open would put the CRT's heap there.
+#define LOG_KEEP 5
+#define LOG_CAP (64ull << 20)
+enum { LOG_EARLY, LOG_FILE, LOG_OFF };
+static int g_log_state;
+static PlatAppend *g_log_file;
+static char g_log_path[MAX_PATH * 3];
+static char g_log_early[32768];
+static size_t g_log_early_n;
+static uint64_t g_log_bytes;
+
+void rt_log_raw(const char *p, size_t n) {
+    fwrite(p, 1, n, stderr);
+    int state = __atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE);
+    if (state == LOG_EARLY) {
+        size_t at = __atomic_fetch_add(&g_log_early_n, n, __ATOMIC_RELAXED);
+        if (at + n <= sizeof g_log_early) memcpy(g_log_early + at, p, n);
+    } else if (state == LOG_FILE) {
+        uint64_t at = __atomic_fetch_add(&g_log_bytes, n, __ATOMIC_RELAXED);
+        if (at + n <= LOG_CAP) {
+            plat_append_write(g_log_file, p, n);
+        } else if (at <= LOG_CAP) {   // the first write past the cap says so, once
+            static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only\n";
+            plat_append_write(g_log_file, cut, sizeof cut - 1);
+        }
+    }
+}
+
+void rt_vlogf(const char *fmt, va_list ap) {
+    char buf[2048];
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    if (n > 0) rt_log_raw(buf, n < (int)sizeof buf ? (size_t)n : sizeof buf - 1);
+}
+
+void rt_logf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    rt_vlogf(fmt, ap);
+    va_end(ap);
+}
+
 void rt_log(const char *fmt, ...) {
     char buf[2048];
     int n = snprintf(buf, sizeof buf, "[host] ");
@@ -44,7 +89,45 @@ void rt_log(const char *fmt, ...) {
     va_end(ap);
     n = k < 0 ? n : n + k < (int)sizeof buf - 1 ? n + k : (int)sizeof buf - 2;
     buf[n++] = '\n';
-    fwrite(buf, 1, n, stderr);
+    rt_log_raw(buf, n);
+}
+
+const char *rt_log_path(void) {
+    return __atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE) == LOG_FILE ? g_log_path : NULL;
+}
+
+// Opens the log file for a game run (game = 1) and writes the buffered lines to it; anything else drops them. Runs on
+// the main thread before the boot starts other threads.
+static void log_open(int game) {
+    char dir[MAX_PATH * 3], from[MAX_PATH * 3 + 16], to[MAX_PATH * 3 + 16];
+    char *cut = NULL;
+    if (game && !plat_stderr_path(dir, sizeof dir) && plat_exe_path(dir, sizeof dir)) {
+        cut = strrchr(dir, '\\');
+        char *f = strrchr(dir, '/');
+        if (f > cut) cut = f;
+    }
+    if (cut && (size_t)(cut - dir) + sizeof "\\logs" <= sizeof dir) {
+        strcpy(cut, "\\logs");
+        plat_file_mkdir_p(dir);
+        for (int i = LOG_KEEP - 1; i > 0; i--) {   // totk.3.log -> totk.4.log, ..., totk.log -> totk.1.log
+            if (i > 1) snprintf(from, sizeof from, "%s\\totk.%d.log", dir, i - 1);
+            else snprintf(from, sizeof from, "%s\\totk.log", dir);
+            snprintf(to, sizeof to, "%s\\totk.%d.log", dir, i);
+            if (plat_file_exists(from)) plat_file_replace(from, to);
+        }
+        snprintf(g_log_path, sizeof g_log_path, "%s\\totk.log", dir);
+        g_log_file = plat_append_open(g_log_path);
+    }
+    if (!g_log_file) {
+        __atomic_store_n(&g_log_state, LOG_OFF, __ATOMIC_RELEASE);
+        return;
+    }
+    size_t n = __atomic_load_n(&g_log_early_n, __ATOMIC_RELAXED);
+    if (n > sizeof g_log_early) n = sizeof g_log_early;
+    plat_append_write(g_log_file, g_log_early, n);
+    g_log_bytes = n;
+    __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
+    rt_log("log: %s", g_log_path);
 }
 
 static void parse_trace(void) {
@@ -176,30 +259,30 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
         return EXCEPTION_CONTINUE_SEARCH;   // not our code: leave it to the handler that expects it
     if (InterlockedExchange(&busy, 1)) ExitProcess(71);
     char d[160];
-    fprintf(stderr, "FATAL: exception %#lx at host %p (totk.exe+%#llx)", code, (void *)rip,
+    rt_logf("FATAL: exception %#lx at host %p (totk.exe+%#llx)", code, (void *)rip,
             (unsigned long long)(rip - (uintptr_t)mi.lpBaseOfDll));
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
-        fprintf(stderr, ", %s address %#llx",
+        rt_logf(", %s address %#llx",
                 ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "writing" : ep->ExceptionRecord->ExceptionInformation[0] == 8 ? "executing" : "reading",
                 (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
-    fputc('\n', stderr);
+    rt_log_raw("\n", 1);
     uint64_t f = lifted_function(rip);
-    if (f) fprintf(stderr, "  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
+    if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     Cpu *c = kern_cpu();
     if (c) {
         for (int i = 0; i < 31; i++)
-            fprintf(stderr, "  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
-        fprintf(stderr, "  sp  %016llx\n  pc  %016llx  lr %s\n", (unsigned long long)c->sp, (unsigned long long)c->pc,
+            rt_logf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
+        rt_logf("  sp  %016llx\n  pc  %016llx  lr %s\n", (unsigned long long)c->sp, (unsigned long long)c->pc,
                 ldr_describe(c->x[30], d, sizeof d));
         uint64_t fp = c->x[29];
         for (int n = 0; n < 32 && fp && !(fp & 7) && readable(fp, 16); n++) {
             uint64_t next = LD64(fp), lr = LD64(fp + 8);
-            fprintf(stderr, "  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
+            rt_logf("  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
             if (next <= fp || next - fp > (64u << 20)) break;
             fp = next;
         }
     } else {
-        fprintf(stderr, "  not on a guest thread\n");
+        rt_logf("  not on a guest thread\n");
     }
     fflush(stderr);
     ExitProcess(71);
@@ -440,7 +523,7 @@ int main(int argc, char **argv) {
                      .gpu = cfg_get("TOTK_GPU")};
     portable_paths(&cfg);   // command-line paths below still win
     if (cfg.gpu && strcmp(cfg.gpu, "null") && strcmp(cfg.gpu, "vulkan")) {
-        fprintf(stderr, "TOTK_GPU must be null or vulkan, not '%s'\n", cfg.gpu);
+        rt_logf("TOTK_GPU must be null or vulkan, not '%s'\n", cfg.gpu);
         return 2;
     }
     const char *mode = NULL;
@@ -467,6 +550,7 @@ int main(int argc, char **argv) {
     }
     if (cfg.shot && !cfg.seconds) return usage(argv[0]);
     if (cfg.seconds && mode) return usage(argv[0]);
+    log_open(!mode);
     if (!mode) {
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         rt_boot();

@@ -47,9 +47,9 @@ static uint64_t g_nhost;
 void rt_fatal(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fputs("FATAL: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    rt_log_raw("FATAL: ", 7);
+    rt_vlogf(fmt, ap);
+    rt_log_raw("\n", 1);
     va_end(ap);
     fflush(stdout);
     fflush(stderr);

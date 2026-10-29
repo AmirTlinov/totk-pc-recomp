@@ -75,11 +75,11 @@ void ipc_backtrace(void) {
     const Cpu *c = t_req;
     if (!c) return;
     char d[160];
-    fprintf(stderr, "  ipc request from %s\n", ldr_describe(c->x[30], d, sizeof d));
+    rt_logf("  ipc request from %s\n", ldr_describe(c->x[30], d, sizeof d));
     uint64_t fp = c->x[29];
     for (int n = 0; n < 24 && fp && !(fp & 7) && readable(fp, 16); n++) {
         uint64_t next = LD64(fp), lr = LD64(fp + 8);
-        fprintf(stderr, "  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
+        rt_logf("  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
         if (next <= fp || next - fp > (64u << 20)) break;
         fp = next;
     }
@@ -109,7 +109,7 @@ void ipc_out(IpcResponse *rs, const void *p, uint32_t n) {
 
 void ipc_unimplemented(const IpcSession *s, const IpcRequest *rq) {
     fflush(stdout);
-    fprintf(stderr, "ipc: %s command %u (type %u, data %u bytes, x%u a%u b%u w%u c%u, copy %u move %u)\n", s->name,
+    rt_logf("ipc: %s command %u (type %u, data %u bytes, x%u a%u b%u w%u c%u, copy %u move %u)\n", s->name,
             rq->cmd, rq->type, rq->data_size, rq->nx, rq->na, rq->nb, rq->nw, rq->nc, rq->ncopy, rq->nmove);
     ipc_backtrace();
     rt_fatal("ipc: %s command %u is not implemented", s->name, rq->cmd);
@@ -235,9 +235,9 @@ static void dispatch(IpcSession *s, uint32_t *m) {
         rq.data_size = payload + 16 <= end ? (uint32_t)(end - payload - 16) : 0;
     } else {
         fflush(stdout);
-        fprintf(stderr, "ipc: %s message type %u:", s->name, rq.type);
-        for (unsigned i = 0; i < 16; i++) fprintf(stderr, " %08x", m[i]);
-        fputc('\n', stderr);
+        rt_logf("ipc: %s message type %u:", s->name, rq.type);
+        for (unsigned i = 0; i < 16; i++) rt_logf(" %08x", m[i]);
+        rt_log_raw("\n", 1);
         ipc_backtrace();
         rt_fatal("ipc: %s message type %u is not implemented", s->name, rq.type);
     }
