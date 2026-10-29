@@ -280,6 +280,55 @@ int probe_cfg(void) {
     CHECK(input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_SOUTH] = 1}, PAD_LAYOUT_XBOX) == 0,
           "pad layout: a bind line replaces the layout's own button");
     input_map_reset();
+    // Bind lines for stick directions and default parts; the remapping rows' edits (input_map.c)
+    memset(dn, 0, sizeof dn);
+    dn[KEY_I] = 1;
+    CHECK(input_map_bind("LSTICK_UP", "key:i, pad:south") == 1, "bind: a stick direction takes keys, skips pad entries");
+    input_map_stick(dn, 0, st);
+    CHECK(st[1] == 32767, "bind: I moves forward after bind_LSTICK_UP = key:i");
+    dn[KEY_I] = 0, dn[KEY_W] = 1;
+    input_map_stick(dn, 0, st);
+    CHECK(st[1] == 0, "bind: W no longer moves forward");
+    CHECK(input_map_bind("A", "key:default, pad:north") == 1, "bind: key:default with a pad entry");
+    memset(dn, 0, sizeof dn);
+    dn[KEY_E] = 1;
+    CHECK(input_map_buttons(dn) == 1ull << B_A &&
+              input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_NORTH] = 1}, PAD_LAYOUT_XBOX) == (1ull << B_A | 1ull << B_Y),
+          "bind: key:default keeps E, pad:north adds the top button in every layout");
+    CHECK(input_map_bind("B", "key:j, pad:default") == 1 &&
+              input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_EAST] = 1}, PAD_LAYOUT_XBOX) == 1ull << B_B &&
+              input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_SOUTH] = 1}, PAD_LAYOUT_NINTENDO) == 1ull << B_B,
+          "bind: pad:default keeps each layout's own button");
+    input_map_reset();
+    InputMap mp = input_map;
+    char line[256];
+    input_map_line(&mp, B_ZR, line, sizeof line);
+    CHECK(!line[0], "edit: an action at its defaults needs no line");
+    CHECK(input_map_set_key(&mp, B_A, 0, KEY_F) == B_ZR, "edit: F taken from ZR");
+    input_map_line(&mp, B_A, line, sizeof line);
+    CHECK(!strcmp(line, "key:f, pad:default"), "edit: A's line is key:f, pad:default");
+    input_map_line(&mp, B_ZR, line, sizeof line);
+    CHECK(!strcmp(line, "key:x, pad:default"), "edit: ZR keeps X");
+    CHECK(input_map_set_key(&mp, B_ZL, 1, KEY_NONE) == -1, "edit: clearing a key takes from no one");
+    uint8_t ks[8];
+    CHECK(input_map_keys_of(&mp, B_ZL, ks, 8) == 1 && ks[0] == KEY_MOUSE_R, "edit: ZL keeps its first key only");
+    mp = input_map;
+    CHECK(input_map_set_pad(&mp, B_X, PAD_LAYOUT_XBOX, PAD_SOUTH) == B_A, "edit: south swaps X with A (Xbox layout)");
+    uint8_t ps[8];
+    CHECK(input_map_pads_of(&mp, B_A, PAD_LAYOUT_XBOX, ps, 8) == 1 && ps[0] == PAD_WEST, "edit: A takes X's west button");
+    CHECK(input_map_pads_of(&mp, B_A, PAD_LAYOUT_NINTENDO, ps, 8) == 1 && ps[0] == PAD_WEST &&
+              input_map_pads_of(&mp, B_B, PAD_LAYOUT_NINTENDO, ps, 8) == 1 && ps[0] == PAD_EAST,
+          "edit: the face buttons are pinned in every layout after a gamepad edit");
+    input_map_line(&mp, B_X, line, sizeof line);
+    CHECK(!strcmp(line, "key:default, pad:south"), "edit: X's line is key:default, pad:south");
+    input_map_set_pad(&mp, B_X, PAD_LAYOUT_XBOX, PAD_WEST);   // and back
+    input_map_line(&mp, B_A, line, sizeof line);
+    CHECK(!line[0] && input_map_pads_of(&mp, B_A, PAD_LAYOUT_NINTENDO, ps, 8) == 1 && ps[0] == PAD_EAST,
+          "edit: swapping back restores every layout's defaults");
+    mp = input_map;
+    input_map_set_key(&mp, B_SL_UP, 0, KEY_NONE);
+    input_map_line(&mp, B_SL_UP, line, sizeof line);
+    CHECK(!strcmp(line, "none"), "edit: a stick direction without keys is none");
     // defaults live in the CfgMeta table: cfg_value and the typed accessors fall back to it
     cfg_load("cfg-probe-missing.ini");
     _putenv_s("TOTK_FPS60", "");

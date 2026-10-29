@@ -19,6 +19,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"   // SetFocusID, NavCursorVisible
 #include "backends/imgui_impl_vulkan.h"
+#include "ui/binds_page.h"
 #include "ui/option_rows.h"
 
 extern "C" {
@@ -567,7 +568,9 @@ static void tab_controls(float scale) {
     opt_slider("TOTK_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
     opt_toggle("TOTK_RUMBLE_TRIGGERS", UI_MENU_RUMBLE_TRIGGERS, UI_MENU_RUMBLE_TRIGGERS_DESC);
     opt_slider("TOTK_MOUSE_SENS", UI_MENU_MOUSE_SENS, 0, 10, UI_MENU_MOUSE_SENS_DESC, 0.1f, "%.1f");
+    binds_rows(scale);
     opt_end();
+    binds_after_page();
 }
 
 static void tab_menu(float scale) {
@@ -756,7 +759,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
     ImGui::TextDisabled("%s", version);
 
-    int step = g_modal                                                                                   ? 0
+    int step = g_modal || binds_modal()                                                                  ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
                                                                                                          : 0;
@@ -807,7 +810,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     if (ImGui::Button(cont, ImVec2(bw, 0))) set_open(0);
     ImGui::SameLine();
     if (ImGui::Button(quit, ImVec2(bw, 0))) gfx_window_request_close();
-    bool was_modal = g_modal;
+    bool was_modal = g_modal || binds_modal();
     if (g_tab != TAB_ADVANCED) g_modal = false;
     if (!was_modal && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
         set_open(0);

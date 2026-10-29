@@ -26,6 +26,7 @@ static int state;                    // 0 not started, 1 running, -1 disabled or
 static SDL_Gamepad *pad;
 static uint64_t next_scan;
 static int pad_rumble;               // the open gamepad has rumble motors
+static volatile LONG pad_labels[4];  // ... and the labels of its south, east, west, north buttons (PAD_LABEL_*), any thread
 static int pad_east_a;               // ... and labels its east face button A (Nintendo layout under TOTK_PAD_LAYOUT=auto)
 static int pad_layout = -1;          // PAD_LAYOUT_* in effect for the open gamepad, -1 to pick again; live (cfg_version)
 static unsigned pad_layout_seen;
@@ -221,6 +222,7 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
 static int key_vk(int key) {
     if (key >= KEY_A && key <= KEY_Z) return 'A' + (key - KEY_A);
     if (key >= KEY_0 && key <= KEY_9) return '0' + (key - KEY_0);
+    if (key >= KEY_NUM0 && key <= KEY_NUM9) return VK_NUMPAD0 + (key - KEY_NUM0);
     switch (key) {
     case KEY_SPACE: return VK_SPACE;
     case KEY_TAB: return VK_TAB;
@@ -233,8 +235,51 @@ static int key_vk(int key) {
     case KEY_MOUSE_L: return VK_LBUTTON;
     case KEY_MOUSE_R: return VK_RBUTTON;
     case KEY_MOUSE_M: return VK_MBUTTON;
+    case KEY_MOUSE_X1: return VK_XBUTTON1;
+    case KEY_MOUSE_X2: return VK_XBUTTON2;
+    case KEY_ENTER: return VK_RETURN;
+    case KEY_BACKSPACE: return VK_BACK;
+    case KEY_RSHIFT: return VK_RSHIFT;
+    case KEY_RCTRL: return VK_RCONTROL;
+    case KEY_LALT: return VK_LMENU;
+    case KEY_CAPSLOCK: return VK_CAPITAL;
+    case KEY_INSERT: return VK_INSERT;
+    case KEY_DELETE: return VK_DELETE;
+    case KEY_HOME: return VK_HOME;
+    case KEY_END: return VK_END;
+    case KEY_PAGEUP: return VK_PRIOR;
+    case KEY_PAGEDOWN: return VK_NEXT;
+    case KEY_F2: return VK_F2;
+    case KEY_F3: return VK_F3;
+    case KEY_F4: return VK_F4;
+    case KEY_F5: return VK_F5;
+    case KEY_F6: return VK_F6;
+    case KEY_F7: return VK_F7;
+    case KEY_F9: return VK_F9;
+    case KEY_F12: return VK_F12;
+    case KEY_NUM_ADD: return VK_ADD;
+    case KEY_NUM_SUB: return VK_SUBTRACT;
+    case KEY_NUM_MUL: return VK_MULTIPLY;
+    case KEY_NUM_DIV: return VK_DIVIDE;
+    case KEY_NUM_DECIMAL: return VK_DECIMAL;
+    case KEY_MINUS: return VK_OEM_MINUS;
+    case KEY_EQUALS: return VK_OEM_PLUS;
+    case KEY_LBRACKET: return VK_OEM_4;
+    case KEY_RBRACKET: return VK_OEM_6;
+    case KEY_SEMICOLON: return VK_OEM_1;
+    case KEY_APOSTROPHE: return VK_OEM_7;
+    case KEY_COMMA: return VK_OEM_COMMA;
+    case KEY_PERIOD: return VK_OEM_PERIOD;
+    case KEY_SLASH: return VK_OEM_2;
+    case KEY_BACKSLASH: return VK_OEM_5;
+    case KEY_GRAVE: return VK_OEM_3;
     }
     return 0;
+}
+
+uint32_t input_key_char(int key) {
+    if (key < KEY_MINUS || key > KEY_GRAVE) return 0;
+    return MapVirtualKeyW((UINT)key_vk(key), MAPVK_VK_TO_CHAR) & 0x7fffffffu;   // the top bit marks a dead key
 }
 
 // ---- mouse camera: raw motion accumulated by the window thread, one stick sample per presented frame
@@ -318,6 +363,9 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_SETCURSOR:
         if (cur_captured && LOWORD(l) == HTCLIENT) { SetCursor(NULL); *res = TRUE; return 1; }
         break;
+    case WM_SYSCOMMAND:   // Alt pressed alone would enter the window menu loop, which stalls the game: Alt is a game key
+        if ((w & 0xFFF0) == SC_KEYMENU && l == 0) { *res = 0; return 1; }
+        break;
     case WM_KEYDOWN:   // Esc is unbound in the game layout: it releases the cursor and opens the menu (menu_window_msg)
         if (w == VK_ESCAPE && !(cur_rel & CUR_REL)) { cur_rel_update(rel_esc); cursor_update(h); }
         break;
@@ -391,6 +439,7 @@ static void scan_pads(void) {
     if (pad) {
         SDL_CloseGamepad(pad); pad = NULL; sensor_pad = 0; sensor_ok = 0;
         InterlockedExchange(&pad_layout_shown, -1);
+        for (int i = 0; i < 4; i++) InterlockedExchange(&pad_labels[i], PAD_LABEL_NONE);
         rt_log("input: gamepad disconnected");
     }
     int n = 0;
@@ -400,6 +449,18 @@ static void scan_pads(void) {
     if (!pad) return;
     pad_rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     pad_east_a = SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_EAST) == SDL_GAMEPAD_BUTTON_LABEL_A;
+    for (int i = 0; i < 4; i++) {
+        SDL_GamepadButtonLabel lb = SDL_GetGamepadButtonLabel(pad, pad_sdl[PAD_SOUTH + i]);
+        InterlockedExchange(&pad_labels[i], lb == SDL_GAMEPAD_BUTTON_LABEL_A          ? PAD_LABEL_A
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_B        ? PAD_LABEL_B
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_X        ? PAD_LABEL_X
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_Y        ? PAD_LABEL_Y
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_CROSS    ? PAD_LABEL_CROSS
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_CIRCLE   ? PAD_LABEL_CIRCLE
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_SQUARE   ? PAD_LABEL_SQUARE
+                                            : lb == SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE ? PAD_LABEL_TRIANGLE
+                                                                                      : PAD_LABEL_NONE);
+    }
     pad_layout = -1;
     int motion = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
     rt_log("input: gamepad \"%s\" (%s, %s, east button %s)", SDL_GetGamepadName(pad), pad_rumble ? "rumble" : "no rumble",
@@ -420,8 +481,30 @@ static int pad_layout_get(void) {
     return pad_layout;
 }
 
-static void start(void) {
+// The TOTK_BIND_* values last applied, one per line; the tables are built again when one changes (the menu's remapping rows write
+// them while the game runs). Under lock.
+static unsigned binds_seen = ~0u;
+static char binds_applied[4096];
+
+static void binds_refresh(void) {
+    unsigned v = cfg_version();
+    if (v == binds_seen) return;
+    binds_seen = v;
+    char now[sizeof binds_applied];
+    size_t len = 0;
+    for (int a = 0; a < ACTION_COUNT; a++) {
+        char var[32];
+        snprintf(var, sizeof var, "TOTK_BIND_%s", input_action_name(a));
+        const char *s = cfg_get(var);
+        len += (size_t)snprintf(now + len, len < sizeof now ? sizeof now - len : 0, "%s\n", s ? s : "");
+    }
+    if (!strcmp(now, binds_applied)) return;
+    memcpy(binds_applied, now, sizeof now);
     input_map_configure();
+}
+
+static void start(void) {
+    binds_refresh();
     const char *e = cfg_get("TOTK_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (TOTK_INPUT=none)"); return; }
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
@@ -445,16 +528,22 @@ static void pick(int32_t *x, int32_t *y, int32_t kx, int32_t ky) {
     if (b > a) { *x = kx; *y = ky; }
 }
 
-// Under lock, state 1: the open gamepad's buttons (Switch bits after TOTK_PAD_LAYOUT and the TOTK_BIND_* lines) and
-// sticks; 0 without a connected gamepad.
-static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+// Under lock, state 1: the open gamepad's inputs by position (pd[PAD_*] != 0 held); 0 without a connected gamepad.
+static int pad_physical(uint8_t pd[PAD_COUNT]) {
     if ((!pad || !SDL_GamepadConnected(pad)) && GetTickCount64() >= next_scan) { next_scan = GetTickCount64() + RESCAN_MS; scan_pads(); }
     SDL_UpdateGamepads();
     if (!pad || !SDL_GamepadConnected(pad)) return 0;
-    uint8_t pd[PAD_COUNT] = {0};
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
     pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
     pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    return 1;
+}
+
+// Under lock, state 1: the open gamepad's buttons (Switch bits after TOTK_PAD_LAYOUT and the TOTK_BIND_* lines) and
+// sticks; 0 without a connected gamepad.
+static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+    uint8_t pd[PAD_COUNT] = {0};
+    if (!pad_physical(pd)) return 0;
     *b |= input_map_pad_buttons(pd, pad_layout_get());
     sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
     sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
@@ -469,6 +558,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
     if (state > 0) {
+        binds_refresh();
         if (state == 1) pad_read(&b, sl, sr);
         HWND w = gfx_window_handle();
         if (w && w == GetForegroundWindow()) {
@@ -481,7 +571,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             for (int k = 1; k < KEY_COUNT; k++) {
                 int vk = key_vk(k);
                 down[k] = vk && key_down(vk);
-                if (k < KEY_MOUSE_L || k > KEY_MOUSE_M) continue;
+                if (k < KEY_MOUSE_L || k > KEY_MOUSE_X2) continue;
                 if (cap && !was_captured) mouse_ignore[k] = down[k];
                 if (!down[k]) mouse_ignore[k] = 0;
                 if (!cap || mouse_ignore[k]) down[k] = 0;
@@ -549,6 +639,7 @@ int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly) {
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
     AcquireSRWLockExclusive(&lock);
     if (!state) start();
+    if (state > 0) binds_refresh();
     int ok = state == 1 && pad_read(&b, sl, sr);
     ReleaseSRWLockExclusive(&lock);
     *buttons = b;
@@ -565,6 +656,45 @@ uint16_t rumble_motor(float a, float curve, float strength) {
 
 int input_pad_layout(void) {
     return (int)InterlockedCompareExchange(&pad_layout_shown, 0, 0);
+}
+
+int input_pad_label(int pad_id) {
+    if (pad_id < PAD_SOUTH || pad_id > PAD_NORTH) return PAD_LABEL_NONE;
+    return (int)InterlockedCompareExchange(&pad_labels[pad_id - PAD_SOUTH], 0, 0);
+}
+
+void input_map_snapshot(InputMap *m) {
+    AcquireSRWLockExclusive(&lock);
+    if (!state) start();
+    if (state > 0) binds_refresh();
+    *m = input_map;
+    ReleaseSRWLockExclusive(&lock);
+}
+
+int input_capture(int reset, int *id) {
+    static uint8_t prev_k[KEY_COUNT], prev_p[PAD_COUNT];
+    static int prev_esc;
+    uint8_t k[KEY_COUNT] = {0}, p[PAD_COUNT] = {0};
+    HWND w = gfx_window_handle();
+    int fg = w && w == GetForegroundWindow();
+    for (int i = 1; i < KEY_COUNT; i++) k[i] = fg && key_down(key_vk(i));
+    int esc = fg && key_down(VK_ESCAPE);
+    AcquireSRWLockExclusive(&lock);
+    if (!state) start();
+    if (state == 1) pad_physical(p);
+    ReleaseSRWLockExclusive(&lock);
+    int got = INPUT_CAPTURE_NONE;
+    if (!reset) {
+        if (esc && !prev_esc) got = INPUT_CAPTURE_CANCEL;
+        for (int i = 1; i < KEY_COUNT && !got; i++)
+            if (k[i] && !prev_k[i]) got = INPUT_CAPTURE_KEY, *id = i;
+        for (int i = 1; i < PAD_COUNT && !got; i++)
+            if (p[i] && !prev_p[i]) got = INPUT_CAPTURE_PAD, *id = i;
+    }
+    memcpy(prev_k, k, sizeof k);
+    memcpy(prev_p, p, sizeof p);
+    prev_esc = esc;
+    return got;
 }
 
 int input_rumble_triggers_enabled(void) {

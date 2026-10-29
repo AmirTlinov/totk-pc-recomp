@@ -26,6 +26,7 @@ static ImGuiKey key_of(WPARAM vk) {
     case VK_ESCAPE: return ImGuiKey_Escape;
     case VK_TAB: return ImGuiKey_Tab;
     case VK_BACK: return ImGuiKey_Backspace;
+    case VK_DELETE: return ImGuiKey_Delete;   // clears a cell of the remapping rows
     case VK_HOME: return ImGuiKey_Home;
     case VK_END: return ImGuiKey_End;
     case VK_PRIOR: return ImGuiKey_PageUp;

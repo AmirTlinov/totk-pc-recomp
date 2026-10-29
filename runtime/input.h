@@ -23,6 +23,21 @@ int input_menu_gate(int *held, int menu_open, uint64_t *buttons, int32_t sticks[
 int input_pad_read(uint64_t *buttons, int32_t *lx, int32_t *ly);
 // The gamepad layout in effect (PAD_LAYOUT_*, input_map.h; TOTK_PAD_LAYOUT, live); -1 without a gamepad. Any thread.
 int input_pad_layout(void);
+// The label on a face button of the open gamepad (input_map.h PAD_SOUTH..PAD_NORTH, as SDL reports it); PAD_LABEL_NONE for another
+// button, an unknown label or no gamepad. Any thread.
+enum { PAD_LABEL_NONE, PAD_LABEL_A, PAD_LABEL_B, PAD_LABEL_X, PAD_LABEL_Y, PAD_LABEL_CROSS, PAD_LABEL_CIRCLE,
+       PAD_LABEL_SQUARE, PAD_LABEL_TRIANGLE };
+int input_pad_label(int pad);
+// The menu's remapping rows (Controls tab). input_map_snapshot copies the tables in effect (after any changed TOTK_BIND_* line).
+// input_capture polls the keys, the mouse buttons and the gamepad for a press: reset 1 takes what is held now as the
+// start (a held key counts once released and pressed again) and returns NONE; then it returns KEY or PAD with *id the
+// key or pad id (input_map.h) pressed since the last call, or CANCEL for Esc. Keys count only while the game window is in front.
+enum { INPUT_CAPTURE_NONE, INPUT_CAPTURE_KEY, INPUT_CAPTURE_PAD, INPUT_CAPTURE_CANCEL };
+struct InputMap;   // input_map.h (not included here: swkbd_win.c has button names of its own)
+void input_map_snapshot(struct InputMap *m);
+int input_capture(int reset, int *id);
+// The character on a punctuation key (KEY_MINUS..KEY_GRAVE) in the keyboard layout in use, 0 for another key.
+uint32_t input_key_char(int key);
 
 // Mouse camera and cursor (input_win.c, Win32 window thread). The window procedure calls input_window_msg first for raw
 // mouse input, cursor hiding and confinement; it returns 1 with *res set when the message is handled. input_cursor_suspend(1)

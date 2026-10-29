@@ -313,3 +313,103 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     apply(key, out);
     return true;
 }
+
+// ---- binding rows (the remapping rows of the Controls tab): a label and three cells, each its own nav item
+
+// Text centred (left-aligned when centred is false) in [x0, x1] on a row from y to y + h, at the font size or smaller so
+// a long name ("Нажатие правого стика", "Стрелка вправо") fits; under 65 % it is clipped instead.
+static void fit_text(ImDrawList *dl, float x0, float x1, float y, float h, ImU32 col, const char *t, bool centred) {
+    ImFont *font = ImGui::GetFont();
+    float fs = ImGui::GetFontSize(), room = x1 - x0, tw = font->CalcTextSizeA(fs, FLT_MAX, 0, t).x;
+    if (tw > room) {
+        fs = fmaxf(fs * room / tw, fs * 0.65f);
+        tw = font->CalcTextSizeA(fs, FLT_MAX, 0, t).x;
+    }
+    float x = centred && tw < room ? x0 + (room - tw) * 0.5f : x0;
+    ImVec4 clip(x0, y, x1, y + h);
+    dl->AddText(font, fs, ImVec2(x, y + (h - fs) * 0.5f), col, t, NULL, 0, &clip);
+}
+
+// The label column and the three cells of a binding row of width w.
+static void bind_columns(float x, float w, float cx[3], float *cw) {
+    float lw = floorf(w * 0.34f), gap = floorf(8 * g_scale);
+    *cw = floorf((w - lw - gap * 3) / 3);
+    for (int c = 0; c < 3; c++) cx[c] = x + lw + gap + c * (*cw + gap);
+}
+
+void opt_bind_header(UiTextId c0, UiTextId c1, UiTextId c2) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x, cx[3], cw, fs = ImGui::GetFontSize() * 0.8f;
+    bind_columns(p.x, w, cx, &cw);
+    const UiTextId cols[3] = {c0, c1, c2};
+    ImFont *font = ImGui::GetFont();
+    for (int c = 0; c < 3; c++) {
+        const char *t = menu_text(cols[c]);
+        float tw = font->CalcTextSizeA(fs, FLT_MAX, 0, t).x;
+        ImGui::GetWindowDrawList()->AddText(font, fs, ImVec2(cx[c] + (cw - tw) * 0.5f, p.y), kDim, t);
+    }
+    ImGui::Dummy(ImVec2(w, fs * 1.2f));
+}
+
+int opt_bind_row(const char *key, const char *label, UiTextId desc, const char *const cells[3], const bool enabled[3],
+                 const char *note) {
+    ImGui::PushID(key);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = floorf(fs * 1.9f), cx[3], cw;
+    bind_columns(p.x, w, cx, &cw);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float r = 8 * g_scale, pad = 6 * g_scale;
+    fit_text(dl, p.x + 16 * g_scale, cx[0] - fs * 0.3f, p.y, h, IM_COL32(240, 236, 224, 255), label, false);
+    int result = -1;
+    bool row_foc = false, row_hov = false;
+    for (int c = 0; c < 3; c++) {
+        ImVec2 a(cx[c], p.y), b(cx[c] + cw, p.y + h);
+        const char *t = cells[c] && cells[c][0] ? cells[c] : "-";
+        if (!enabled[c]) {   // not a nav item: the cursor skips it
+            dl->AddRect(a, b, IM_COL32(255, 255, 255, 14), r);
+            fit_text(dl, a.x + pad, b.x - pad, a.y, h, kGrey, t, true);
+            continue;
+        }
+        ImGui::SetCursorScreenPos(a);
+        ImGui::PushID(c);
+        ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));   // the cell's own border shows the selection
+        bool clicked = ImGui::InvisibleButton("##cell", ImVec2(cw, h), ImGuiButtonFlags_EnableNav);
+        ImGui::PopStyleColor();
+        char id[80];
+        snprintf(id, sizeof id, "%s#%d", key, c);
+        bool to_key = g_focus_key[0] && !strcmp(id, g_focus_key);
+        if (g_take_first || to_key) {
+            ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
+            ImGui::SetNavCursorVisible(true);
+            if (g_take_first) ImGui::SetScrollY(0);
+            else ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleEdgeY);
+            g_take_first = false;
+            if (to_key) g_focus_key[0] = 0;
+        }
+        bool hov = ImGui::IsItemHovered(), foc = ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible;
+        row_foc |= foc;
+        row_hov |= hov;
+        if (clicked) result = c;
+        if (foc && (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
+                    ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false)))
+            result = 10 + c;
+        dl->AddRectFilled(a, b, hov || foc ? IM_COL32(255, 255, 255, 22) : IM_COL32(0, 0, 0, 40), r);
+        dl->AddRect(a, b, hov || foc ? kGold : IM_COL32(255, 255, 255, 38), r, 0, hov || foc ? 2.0f : 1.0f);
+        fit_text(dl, a.x + pad, b.x - pad, a.y, h, IM_COL32(255, 255, 255, 255), t, true);
+        ImGui::PopID();
+    }
+    char k[64];
+    snprintf(k, sizeof k, "TOTK_%s", key);
+    if (row_foc) desc_set(g_focus, desc, k, NULL, NULL);
+    if (row_hov) desc_set(g_hover, desc, k, NULL, NULL);
+    if (!g_first.text[0]) desc_set(g_first, desc, k, NULL, NULL);
+    if (note && (row_foc || row_hov)) {   // e.g. what moved here, after the description
+        Desc &d = row_hov ? g_hover : g_focus;
+        size_t n = strlen(d.text);
+        snprintf(d.text + n, sizeof d.text - n, "\n\n%s", note);
+    }
+    ImGui::SetCursorScreenPos(p);
+    ImGui::Dummy(ImVec2(w, h));
+    ImGui::PopID();
+    return result;
+}
