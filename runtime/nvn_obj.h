@@ -3,7 +3,8 @@
 // Objects are stored in place in the NVN object memory allocated by the game, with size not exceeding the reserved size in nvn.h (FITS static assertion).
 // State objects (Blend / Color / ... 4–0x18 bytes) are small structs the game copies by value; their layout is packed in place with bit-fields.
 //
-// In this port the interface layer is runtime/nvn_api.c and the replay layers are the back ends of gfx.h (GfxBackend).
+// In this port the interface layer is runtime/nvn_api_*.c and nvn_ext.c, and the replay layers are the back ends of
+// gfx.h (GfxBackend).
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

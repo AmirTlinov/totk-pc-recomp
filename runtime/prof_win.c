@@ -557,7 +557,8 @@ int rt_knob(const char *name, const char *def) {
 
 // TOTK_ONE_PER_CORE=1: the process keeps the first logical processor of each physical core, so busy threads (the
 // render thread, the guest cores, the job workers) never share a core's execution units with another; "ab" switches
-// it with the A/B blocks. Off by default until measured (Savage Wind Recomp #200: +4-10% on an 8-core SMT CPU).
+// it with the A/B blocks. Off by default until measured here; Savage Wind Recomp
+// reported +4-10% from the same rule on an 8-core SMT CPU.
 static void cpu_placement(void) {
     static int mode = -1, applied = -1;
     static DWORD_PTR all, one;

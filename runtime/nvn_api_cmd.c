@@ -750,7 +750,7 @@ NVN_API(nvnCommandBufferDrawElementsInstanced) {
 }
 // void nvnCommandBufferDrawElementsIndirect(NVNcommandBuffer *cmd, NVNdrawPrimitive prim, NVNindexType type,
 // NVNbufferAddress indices, NVNbufferAddress indirect): the arguments at indirect are often GPU-written, so the replay
-// draws with vkCmdDrawIndexedIndirect from the pool buffer (nxnative hle_nvn.c:2160, SavageWindRecomp cmdbuf.c:608)
+// draws with vkCmdDrawIndexedIndirect from the pool buffer (nxnative hle_nvn.c, SavageWindRecomp cmdbuf.c)
 NVN_API(nvnCommandBufferDrawElementsIndirect) {
     *REC(cmd_of(c), OP_DRAW_IDX_IND, p_draw_idx_ind) = (p_draw_idx_ind){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
 }
@@ -831,7 +831,7 @@ NVN_API(nvnCommandBufferCopyTextureToTexture) {
 // void nvnCommandBufferDownsample(NVNcommandBuffer *cmd, const NVNtexture *src, const NVNtexture *dst): level 0 of src
 // into level 0 of dst, whole extents, filtered. Recorded as a linear-filter texture copy: copy_t2t resolves a
 // multisample source into an equal-size target and blits (2x2 average at half size) between sizes. As nxnative
-// hle_nvn.c:2219 and SavageWindRecomp cmdbuf.c:650 record it; maxwell.md 1.19.
+// hle_nvn.c and SavageWindRecomp cmdbuf.c record it; docs/maxwell.md 1.19.
 NVN_API(nvnCommandBufferDownsample) {
     p_copy_t2t *o = REC(cmd_of(c), OP_COPY_T2T, p_copy_t2t);
     o->src = tex_pin(arg_p(c, 1));

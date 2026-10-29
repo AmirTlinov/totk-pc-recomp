@@ -97,7 +97,7 @@ uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input 
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);   // Output Locations (VS varyings, FS colour targets)
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]);     // CS: the LocalSize execution mode; 1, 1, 1 otherwise
 
-// ---- back end (gfx_null.c, vk_*.c). Called by nvn_api.c on guest threads.
+// ---- back end (gfx_null.c, vk_*.c). Called by the NVN front end (nvn_api_*.c, nvn_ext.c) on guest threads.
 typedef struct {
     const char *name;
     int  (*pool_init)(pool_t *p);                          // 0 fails MemoryPoolInitialize
@@ -129,7 +129,7 @@ const GfxBackend *gfx_backend(void);                       // TOTK_GPU=null|vulk
 void nvn_procs_register(void);                             // hostfn_register every proc; before hostfn_seal (ov_gfx.c)
 uint64_t nvn_proc_address(const char *name);               // synthetic host address of a proc, 0 for an unknown name
 
-// ---- statistics and frames (nvn_api.c, vk_*.c; boot.c prints them)
+// ---- statistics and frames (nvn_api_*.c, vk_*.c; boot.c prints them)
 typedef struct { uint64_t frames, nvn_calls, nvn_distinct, unimplemented, validation_errors, shader_failures,
                  draws_skipped; } GfxStats;
 GfxStats gfx_stats(void);

@@ -1,7 +1,7 @@
 // NVN proc table. Every name the game's proc loader asks for gets a synthetic host
 // address through hostfn_register before hostfn_seal; nvnBootstrapLoader and nvnDeviceGetProcAddress hand them out.
-// nvnp_<name> is the implementation of one proc: the weak definitions here stop with the proc's name, nvn_api.c and
-// nvn_ext.c define the strong ones. The name list is runtime/nvn_procs.inc (tools/gen_nvn_procs.py).
+// nvnp_<name> is the implementation of one proc: the weak definitions here stop with the proc's name, nvn_api_*.c
+// and nvn_ext.c define the strong ones. The name list is runtime/nvn_procs.inc (tools/gen_nvn_procs.py).
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,6 +1,7 @@
-// The op-stream replay of the Vulkan back end. vk_exec.c (T6c1) walks the command
+// The op-stream replay of the Vulkan back end. vk_exec.c walks the command
 // handles of a submission, keeps render targets, passes, clears and fixed-function state; draws, binds and dispatches
-// (T6c2) and copies, counters, events and conditional rendering (T6c3) plug in through the two hooks at the bottom.
+// (vk_exec_draw.c) and copies, counters, events and conditional rendering (vk_exec_xfer.c) plug in through the two
+// hooks at the bottom.
 // Runs on the submitting thread under vk_sync_submit's lock: no locking inside.
 // The op loop follows MacNativeGames nvn_mtl.m (MIT, Copyright (c) 2026 jhaizhou) and the pass handling LAS Recomp
 // (MIT, Copyright (c) 2026 Peiikai); vk_exec.c names the sources.
@@ -11,7 +12,7 @@
 #include "vk.h"
 
 // Dynamic state the next draw must record (VkExec.dirty). vk_exec_record sets them all at the start of each command
-// buffer; the state ops set theirs; T6c2 clears what it recorded.
+// buffer; the state ops set theirs; vk_exec_draw.c clears what it recorded.
 enum {
     VK_EXEC_DIRTY_VIEWPORT = 1 << 0,     // viewports or depth range
     VK_EXEC_DIRTY_SCISSOR = 1 << 1,
@@ -56,7 +57,7 @@ typedef struct VkExec {
                                                       // VK_FORMAT_UNDEFINED: none
     uint32_t pass_ncolor, pass_samples;               // colorAttachmentCount and rasterization samples of the pass
 
-    // ---- fixed-function state (T6c1 keeps it; T6c2 records it before draws)
+    // ---- fixed-function state (vk_exec.c keeps it; vk_exec_draw.c records it before draws)
     float vp[16][6];                     // OP_VIEWPORTS: x, y, w, h, near, far
     int has_vp;                          // a viewport was set; else the render area
     p_scissor scissor;                   // OP_SCISSOR (scissor 0)
@@ -67,20 +68,21 @@ typedef struct VkExec {
     p_poly_offset poly_offset;           // OP_POLY_OFFSET: depth bias factor, units, clamp
     p_prim_restart prim_restart;         // OP_PRIM_RESTART: applied to indexed strip and fan draws (op_draw_idx)
     float blend_color[4];                // OP_BLEND_COLOR
-    int64_t copy_stride;                 // OP_COPY_STRIDE: row stride of buffer <-> texture copies (T6c3)
+    int64_t copy_stride;                 // OP_COPY_STRIDE: row stride of buffer <-> texture copies (vk_exec_xfer.c)
     const dpool_t *tex_pool, *samp_pool; // OP_SET_TEX_POOL, OP_SET_SAMP_POOL
-    // Pipeline inputs. T6c1 writes depth_clamp (OP_DEPTH_CLAMP), raster_discard (OP_RASTER_DISCARD) and, at pass begin,
-    // color_fmt, depth_fmt and samples; T6c2 owns every other field (shaders, prim, y_flip, state objects, vertex input).
+    // Pipeline inputs. vk_exec.c writes depth_clamp (OP_DEPTH_CLAMP), raster_discard (OP_RASTER_DISCARD) and, at pass
+    // begin, color_fmt, depth_fmt and samples; vk_exec_draw.c owns every other field (shaders, prim, y_flip, state
+    // objects, vertex input).
     VkPipeState pipe;
 
-    // ---- T6c2 slots (draws, binds, dispatch): left empty by T6c1
+    // ---- vk_exec_draw.c slots (draws, binds, dispatch): left empty by vk_exec.c
     const prog_t *prog;                  // OP_BIND_PROGRAM
     int32_t prog_stages;
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
     p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
 
-    // ---- T6c3 slots (render enable, conditional rendering): left empty by T6c1
+    // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip
     p_render_cond render_cond;           // last OP_RENDER_COND
     int has_render_cond;
@@ -161,14 +163,14 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
                 const uint32_t dispatch[3], uint32_t base_instance);
 
 // Handler hooks. vk_exec.c defines both WEAK: they stop with rt_fatal naming the op.
-// T6c2: OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BIND_* (program, state, vattr, vstream, vbuf, ubo, ssbo, tex, samp, img),
-// OP_UPDATE_UB, OP_DRAW_IDX_IND, OP_DISPATCH_IND. payload: nvn_op_payload of the record.
+// vk_exec_draw.c: OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BIND_* (program, state, vattr, vstream, vbuf, ubo, ssbo, tex,
+// samp, img), OP_UPDATE_UB, OP_DRAW_IDX_IND, OP_DISPATCH_IND. payload: nvn_op_payload of the record.
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload);
 // The aspect a sampled view of img reads (vk_exec_draw.c get_view): stencil for a view in STENCIL depth-stencil mode.
 VkImageAspectFlags vk_exec_view_aspect(const VkTexImage *img, const view_t *v, int hv);
 VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageViewType type, uint32_t aspect,
                                 uint32_t level, uint32_t base, uint32_t layers, int blocks);   // kept for the image's life
-// T6c3: OP_COPY_B2B, OP_COPY_B2T, OP_COPY_T2B, OP_COPY_T2T, OP_CLEAR_TEX, OP_SIGNAL_EVENT, OP_REPORT_COUNTER,
+// vk_exec_xfer.c: OP_COPY_B2B, OP_COPY_B2T, OP_COPY_T2B, OP_COPY_T2T, OP_CLEAR_TEX, OP_SIGNAL_EVENT, OP_REPORT_COUNTER,
 // OP_RESET_COUNTER, OP_RENDER_ENABLE, OP_RENDER_COND, OP_CLEAR_BUF.
 void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
 // vk_exec_xfer.c, samples-passed counting: a draw about to be recorded in the open pass (begins an occlusion query

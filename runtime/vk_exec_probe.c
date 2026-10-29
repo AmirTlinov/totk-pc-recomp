@@ -2,7 +2,7 @@
 // submissions get consecutive fence values; fence_wait and fence_done agree; completion callbacks run in submit order on
 // the completion thread; a guest-memory word a callback writes is visible once fence_wait returns; finish drains every
 // submission; a present of a cleared vk_texture.c image (layout GENERAL) reads back exactly through the swapchain
-// capture. Clear part (task T6c1): a hand-built op stream (SET_RT to an RGBA8 and a D32 texture, whole-target clears,
+// capture. Clear part: a hand-built op stream (SET_RT to an RGBA8 and a D32 texture, whole-target clears,
 // then scissored clears) through submit reads back exactly with read_texels.
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,7 +154,7 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
     return 0;
 }
 
-// ---- clear part (task T6c1): a hand-built op stream through submit, read back with read_texels.
+// ---- clear part: a hand-built op stream through submit, read back with read_texels.
 
 static uint8_t *put(uint8_t *p, uint32_t op, const void *payload, uint32_t n) {
     op_hdr h = {op, (uint32_t)((sizeof h + n + 7) & ~7u)};
@@ -239,7 +239,7 @@ static int test_clear(const GfxBackend *b, uint8_t *guest, int *n_inside) {
     return 0;
 }
 
-// ---- draw part (task T6c2): the pipeline self-test, then a hand-built stream that clears an RGBA8 target, binds a census
+// ---- draw part: the pipeline self-test, then a hand-built stream that clears an RGBA8 target, binds a census
 // vertex + fragment pair and draws one triangle; a census compute shader is dispatched. The census (build/v121/shaders,
 // tools/shader_census.py) is read the way vk_pipeline_selftest reads it: a pair is a fragment shader and a vertex
 // shader of the same source file.
@@ -544,7 +544,7 @@ static int test_draw(const GfxBackend *b, uint8_t *guest, int *n_drawn, int *n_t
     return 0;
 }
 
-// ---- xfer part (task T6c3): copies, texture clear, event and counter through submit.
+// ---- xfer part: copies, texture clear, event and counter through submit.
 
 #define XF_W 64
 #define XF_H 64
