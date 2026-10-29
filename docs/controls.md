@@ -20,7 +20,17 @@ Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into
 | Plus | Start | Tab | menu, inventory |
 | Minus | Back | M | map |
 
-Esc is unbound in the game; it releases the mouse cursor (see Mouse camera). Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are two tables in `runtime/input_map.c`, `input_bindings` (platform-neutral key ids) and `input_pad_bindings` (gamepad inputs by position); `runtime/input_win.c` translates Win32 virtual keys and SDL buttons, so a remapping page can edit both later.
+Esc is unbound in the game; it opens the settings menu and releases the mouse cursor (see Mouse camera). Z and X duplicate ZL and ZR so menu pages turn with two neighbouring keys; the menu tabs (L, R) are Q and R. The mouse wheel is unbound. The bindings are two tables in `runtime/input_map.c`, `input_bindings` (platform-neutral key ids) and `input_pad_bindings` (gamepad inputs by position); `runtime/input_win.c` translates Win32 virtual keys and SDL buttons, so a remapping page can edit both later.
+
+## Window keys
+
+| Key | Gamepad | Action |
+|---|---|---|
+| F1 or Esc | Minus and Plus together | open or close the settings menu; the game gets no input while it is open |
+| F10 | | performance overlay: off, frame rate, full panel |
+| F11 | | borderless fullscreen on or off, saved to `totk.ini` |
+
+The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
 
 ## Remapping
 

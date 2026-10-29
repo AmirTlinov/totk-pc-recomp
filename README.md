@@ -2,93 +2,63 @@
 
 **TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native Windows x86-64 application.
 
-> [!NOTE]
-> Currently supported:
-> - Windows 10 or later, x86-64, with a GPU that offers Vulkan 1.3 and `VK_EXT_external_memory_host`
-> - Game version **1.2.1** (the update the host runs); the base game as XCI or NSP
-
 > [!IMPORTANT]
-> **No game files are included.** TotK Recomp needs your own legally obtained copy of *Tears of the Kingdom*: a base game (1.0.0) and the 1.2.1 update, plus `prod.keys` from your own console. Instructions for obtaining those files will not be provided.
+> **No game files are included.** You need your own legally obtained copy of *Tears of the Kingdom*, dumped from your own console: the base game and the 1.2.1 or 1.4.3 update. Instructions for obtaining those files will not be provided.
 >
-> Extraction, the generated C and `totk.exe` happen on your machine and stay out of this repository. The program you build contains the game, so it is for your own use. Do not share it.
+> The game is built from your files on your machine, so the result contains the game. It is for your own use. Do not share it.
 
-The Switch code is lifted from ARM64 to C ahead of time, compiled with Clang, and linked with a host that answers the system calls. NVN, the Switch graphics API, is implemented on Vulkan. Maxwell shaders are translated to SPIR-V the first time the game uses them, then read from a cache. The design is described in [docs/architecture.md](docs/architecture.md).
+The Switch code is translated from ARM64 to C ahead of time and compiled into a native executable. NVN, the Switch graphics API, runs on Vulkan. How it works: [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-This is an early build: version 1.2.1 starts, loads saves and runs in the world at 60 fps with keyboard, mouse or gamepad input and with sound, and it has been tested on AMD, NVIDIA and Intel GPUs. Visual bugs and crashes are expected. No release has been published yet, and macOS, Linux, other game versions and an in-game settings menu are not supported yet.
+Early development. The game is playable on Windows, with visual bugs and crashes still expected. macOS, Linux and the Steam Deck are planned.
 
-To report a problem, open an issue and follow [CONTRIBUTING.md](CONTRIBUTING.md). Testers: [docs/tester-guide.md](docs/tester-guide.md) says what to send back.
+Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Features
 
-- Native code, not emulation: the 1.2.1 `main`, `sdk` and `subsdk0` modules are compiled into `totk.exe`.
-- 60 fps with the game running at real-time speed, using MacNativeGames' frame-rate patches; `TOTK_FPS_LIMIT` sets the limit (30, 60, 120, 144 or `display`; above 60 is experimental) and `TOTK_REALTIME=0` switches the real-time step off.
-- Keyboard, mouse and the first gamepad, merged into one controller, with the mouse on the camera and every button remappable: [docs/controls.md](docs/controls.md).
-- Rumble with adjustable strength, and motion controls on gamepads that have a gyro.
-- Sound through the game's own audio renderer, including voice.
-- Language from the Windows locale, docked mode by default, a resizable window, and F11 for borderless fullscreen.
-- Shader and pipeline caches, so later launches reuse what the first one compiled.
+- Native code, not emulation
+- Game updates 1.2.1 and 1.4.3, with saves that carry over between them
+- 60 fps by default; up to 360 fps or the monitor's refresh rate (experimental)
+- Resolutions up to 8K, supersampling and AMD FSR 1 upscaling
+- In-game settings menu (F1) and performance overlay (F10)
+- Keyboard, mouse and gamepad with remapping, rumble and gyro
+- Shaders prepared at install instead of during play
+- RomFS mods
 
-## How this project is made
+## Installing
 
-Most of the code and documentation here is written by AI coding agents (Claude Code) under the maintainer's direction. The maintainer sets the goals, plays every build, decides what is merged and reviews the result; the agents read the upstream code, write and test the changes and measure them. [AGENTS.md](AGENTS.md) holds the rules they work under. The same standards apply to every contribution, whoever or whatever wrote it: [CONTRIBUTING.md](CONTRIBUTING.md).
+Requirements: Windows 10 or later, an x86-64 CPU with AVX2, a GPU with Vulkan 1.3 and `VK_EXT_external_memory_host`, about 36 GiB free during setup (20 GiB after).
 
-## Documentation
+1. Download `TotK-Setup-<version>-windows.zip` from [Releases](../../releases/latest) and unpack it.
+2. Start `TotK-Setup.exe`. If SmartScreen warns about an unsigned app, choose *More info*, then *Run anyway*.
+3. Pick your game files, the language and an install folder, and press *Start*. The setup builds the game once.
+4. Play `totk.exe` from the install folder.
 
-- Players and testers: [controls](docs/controls.md), [tester guide](docs/tester-guide.md).
-- How it works: [architecture](docs/architecture.md), and the [Maxwell GPU behaviour](docs/maxwell.md) the Vulkan back end has to match.
-- Building: [building](docs/building.md), and the [installer](docs/installer.md) that builds the game on a player's machine.
-- Coding agents: [AGENTS.md](AGENTS.md).
-
-## Building from source
-
-Windows 10 or later, an x86-64 CPU with AVX2, a Vulkan 1.3 GPU and about 60 GB of disk. [docs/building.md](docs/building.md) lists the toolchain (MSYS2 UCRT64 Clang, Python 3.12 and 3.14, .NET 10, the Vulkan SDK, hactool) and the steps: extract and verify your game files, build the shader translator, lift the modules to C, compile and link `build\v121\totk.exe`, prepare the shaders.
-
-Settings live in `totk.ini` next to `totk.exe`; copy [totk.ini.example](totk.ini.example), which lists them, and edit it. A `TOTK_*` environment variable of the same name overrides the file (`TOTK_FPS_LIMIT=30` beats `fps_limit = 60`). Saves go to `build\profile`, created on first use. Everything the build writes stays under `build\` and `generated\`, which git ignores.
-
-## Contributing
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Nothing that came out of the game goes into the repository: no game files, keys, extracted data, generated C, binaries, shaders or caches. `tools/check_content.py` is what CI runs, and it is what you run before a commit.
+To update, run a newer `TotK-Setup.exe` on the same folder; saves and settings are kept. Settings are in the in-game menu and in `totk.ini` ([totk.ini.example](totk.ini.example) lists every key). Controls: [docs/controls.md](docs/controls.md).
 
 ## Credits
 
-This project stands on two MIT codebases and the projects they came from. Code taken from them keeps its license; the copies are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+TotK Recomp builds on the projects below. What was taken from each, with its license, is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai (MIT) is a static recompilation of *Link's Awakening* for Windows, macOS and Linux. The lifter, the FP/SIMD lowering, the Windows memory layer and the differential tests start there.
-- **[MacNativeGames](https://github.com/ly05010419/MacNativeGames)** (MIT) runs *Tears of the Kingdom* natively on Apple silicon. The game-specific host behaviour, the NVN front end, the version tables, the extraction checks and the shader translator's patches come from there.
-- **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** and **[nxnative](https://github.com/seedds/nxnative)** (MIT) are the Horizon host and NVN layer that MacNativeGames grew from.
-- **[Ryujinx](https://github.com/Ryujinx/Ryujinx)** (MIT) provides the Maxwell shader translator and the audio-effect algorithms.
-- **[hactool](https://github.com/SciresM/hactool)** by SciresM (ISC) extracts NCA and update containers.
-- **[SDL 3](https://libsdl.org)** (zlib) is the gamepad and the audio output.
-- **[libopus](https://opus-codec.org)** (BSD) decodes voice.
-- **[libvpx](https://chromium.googlesource.com/webm/libvpx)** (BSD) decodes the cutscene movies.
-- **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** (MIT) allocates GPU memory.
-- **[deko3d](https://github.com/devkitPro/deko3d)** (zlib) is the source of the block-linear image layout, via MacNativeGames, and a reference for Maxwell command semantics.
-- **[SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp)** (MIT), a static recompilation of *Breath of the Wild*, is the model for preemption at indirect calls and a reference for frame pacing and the platform split.
-- The Switch homebrew community's documentation ([Switchbrew](https://switchbrew.org)).
+- [LAS Recomp](https://github.com/peiikai/LASRecomp)
+- [MacNativeGames](https://github.com/ly05010419/MacNativeGames)
+- [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) and [nxnative](https://github.com/seedds/nxnative)
+- [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp)
+- [Ryujinx](https://github.com/Ryujinx/Ryujinx)
+- [deko3d](https://github.com/devkitPro/deko3d)
+- [hactool](https://github.com/SciresM/hactool)
+- [SDL 3](https://libsdl.org), [Dear ImGui](https://github.com/ocornut/imgui), [AMD FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [libopus](https://opus-codec.org), [libvpx](https://chromium.googlesource.com/webm/libvpx), [Zstandard](https://github.com/facebook/zstd)
+- [Switchbrew](https://switchbrew.org) and the Switch homebrew community
 
-## Legal
-
-TotK Recomp is an independent, non-commercial fan project. It is not affiliated with, endorsed by or sponsored by Nintendo. *The Legend of Zelda*, *Tears of the Kingdom* and *Nintendo Switch* are trademarks of Nintendo.
-
-No game files, game code, assets, shaders, fonts or keys are included in this repository. You must provide your own legally obtained copy to play. The executable you build from that copy contains the game. Keep it to yourself.
+Most of the code and documentation is written by AI coding agents (Claude Code) under the maintainer's direction; the maintainer plays every build and decides what is merged. [AGENTS.md](AGENTS.md) holds the rules they work under.
 
 ## License
 
-The project's own code is under the [MIT License](LICENSE). The license covers this project's code only and grants nothing for Nintendo's game, which you supply yourself.
+The project's own code is under the [MIT License](LICENSE); third-party code keeps its own license ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). The license grants nothing for Nintendo's game.
 
-Third-party code keeps its own license. The full list, with the commit each copy was taken from, is [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). A local build links or ships these pieces (versions are the MSYS2 UCRT64 packages [docs/building.md](docs/building.md) was verified with; a newer package from the same source is fine):
+TotK Recomp is an independent, non-commercial fan project, not affiliated with or endorsed by Nintendo. *The Legend of Zelda*, *Tears of the Kingdom* and *Nintendo Switch* are trademarks of Nintendo.
 
-| Component | Version | License | How it is used |
-|---|---|---|---|
-| SDL 3 | 3.4.18 | zlib | `SDL3.dll` next to `totk.exe` (gamepad, audio) |
-| libiconv | 1.19 | LGPL 2.1+ | `libiconv-2.dll`, unmodified, a dependency of SDL 3 |
-| libopus | 1.6.1 | BSD 3-clause | `libopus-0.dll` next to `totk.exe` (voice) |
-| libvpx | 1.17.0 | BSD 3-clause, with the WebM patent grant | linked statically into `totk.exe` (movies) |
-| Vulkan Memory Allocator | 3.4.0 | MIT | compiled into `totk.exe` |
-| Ryujinx shader translator | 1.3.2 | MIT | `build\xlate\totk_xlate.exe`, a separate process |
-| GCC runtime (`libstdc++`) | 16.2.0 | GPL 3.0 with the GCC Runtime Library Exception | linked into `totk.exe` |
-| winpthreads (mingw-w64) | 14.0.0 | MIT / BSD | linked into `totk.exe` |
+## Building from source
 
-Unicorn (GPL 2.0) stays a separate test tool for the lifter. hactool (ISC) and Capstone (BSD) run at build time.
+[docs/building.md](docs/building.md) lists the toolchain and the steps. Everything the build writes stays under `build\` and `generated\`, which git ignores; run `tools/check_content.py` before a commit. Testers: [docs/tester-guide.md](docs/tester-guide.md).

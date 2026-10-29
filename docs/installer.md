@@ -23,6 +23,7 @@ The install folder (`main.c` `portable_paths()` reads this layout; it stays port
   totk.ini                       language; the other keys as commented defaults (totk.ini.example)
   exefs/, romfs/                 extracted from the player's files
   profile/                       saves
+  logs/                          totk.log of the last run, totk.1.log to totk.4.log of the runs before it
   shader and pipeline caches     prepared by the setup
   totk-install.json              what built this folder: release version, input hashes, finished steps
 ```

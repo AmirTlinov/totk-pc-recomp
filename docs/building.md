@@ -22,7 +22,7 @@ Versions are the ones the build was verified with; newer patch releases are fine
 MSYS2 packages, after `pacman -Syuu` (run it twice; the first pass updates the core and exits):
 
 ```sh
-pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-{clang,lld,ninja,gcc,make,pkgconf,sdl3,opus,libvpx,vulkan-devel,\
+pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-{clang,lld,ninja,gcc,make,pkgconf,sdl3,opus,libvpx,zstd,vulkan-devel,\
 vulkan-memory-allocator,vulkan-validation-layers,shaderc,spirv-tools} base-devel git unzip
 ```
 
@@ -49,7 +49,8 @@ hactool reads `-k <prod.keys>`; MSYS2 shells set `HOME`, which hides its default
 
 ## Build
 
-From the repository root, in PowerShell.
+From the repository root, in PowerShell. Every step that depends on the game version takes it as `<ver>`: `v143` for
+1.4.3 or `v121` for 1.2.1. The tools default to `v121` when `--version` is left out. Saves load on either version.
 
 1. Python environments (once). `.venv` runs the lifter and the build; `.venv-py314` runs the extraction scripts, which
    need the stdlib `compression.zstd` of Python 3.14:
@@ -61,11 +62,11 @@ From the repository root, in PowerShell.
    uv pip install --python .venv-py314/Scripts/python.exe -r tools/requirements-py314.txt
    ```
 
-2. Copy `config.example.toml` to `config.local.toml` and set the paths to your base game, the 1.2.1 update and
-   `prod.keys`. `config.local.toml` is ignored by git. The tools read the keys file themselves.
+2. Copy `config.example.toml` to `config.local.toml` and set the paths to your base game, the update and your console's
+   keys file. `config.local.toml` is ignored by git. The tools read the keys file themselves.
 
-3. Extract and verify. This writes `build\extracted\v0` (1.0.0) and `build\extracted\v121` (1.2.1); a hash mismatch
-   stops the run:
+3. Extract and verify. This writes `build\extracted\v0` (1.0.0) and `build\extracted\<ver>` for each update in
+   `updates`, identified by its hash; a hash mismatch stops the run:
 
    ```powershell
    .venv-py314\Scripts\python tools\extract.py
@@ -77,23 +78,23 @@ From the repository root, in PowerShell.
    .venv\Scripts\python tools\build_xlate.py
    ```
 
-5. Lift the modules to C, write the RomFS half of the frame-rate patches, then compile and link `build\v121\totk.exe`:
+5. Lift the modules to C, write the RomFS half of the frame-rate patches, then compile and link `build\<ver>\totk.exe`:
 
    ```powershell
-   .venv\Scripts\python recomp\gen.py --exefs build\extracted\v121\exefs --out generated\v121 --patches recomp\patches-v121.txt
-   .venv-py314\Scripts\python tools\make_romfs_patches.py
-   .venv\Scripts\python tools\build_game.py
+   .venv\Scripts\python recomp\gen.py --exefs build\extracted\<ver>\exefs --out generated\<ver> --patches recomp\patches-<ver>.txt
+   .venv-py314\Scripts\python tools\make_romfs_patches.py --version <ver>
+   .venv\Scripts\python tools\build_game.py --version <ver>
    ```
 
    Lifting takes about 15 s, a clean compile about 200 s on 24 threads; later builds recompile only what changed.
-   `--patches` builds in the 60 fps and real-time frame step patches, switchable at run time. The link copies
+   `--patches` builds in the frame-rate, resolution and other patch sets, switchable at run time. The link copies
    `SDL3.dll`, `libiconv-2.dll` and `libopus-0.dll` next to the exe.
 
 6. Prepare the shaders (once per build folder and translator). It needs `refs\MacNativeGames` (`tools\fetch_refs.sh`)
    for the shared shader list:
 
    ```powershell
-   .venv-py314\Scripts\python tools\prepare_shaders.py build\v121
+   .venv-py314\Scripts\python tools\prepare_shaders.py build\<ver> --version <ver>
    ```
 
    Without this step the first launch compiles shaders and pipelines during play and stutters until the caches fill.
@@ -103,24 +104,18 @@ From the repository root, in PowerShell.
 7. Run. Keep the window in the foreground; an unfocused window stalls the game.
 
    ```powershell
-   build\v121\totk.exe
+   build\<ver>\totk.exe
    ```
 
 Settings live in `totk.ini` next to `totk.exe` ([totk.ini.example](../totk.ini.example) lists them). Saves go to
-`build\profile`.
+`build\profile` for `v121` and `build\profile-<ver>` for other versions (`build_game.py --profile` changes it).
 
 ### Portable folder
 
-`.venv\Scripts\python tools\package_build.py` writes `build\v121-portable`, which runs on another of your machines
-without MSYS2, Python or .NET. `romfs.bin` stays out unless you pass `--with-romfs`; otherwise put it in `romfs\` next to
-the exe or point `TOTK_ROMFS` at its folder. Run `totk.exe --prepare-shaders` once in the copied folder. The folder
-holds code and data derived from your game: for your own machines only.
-
-### Game version 1.4.3
-
-Add the 1.4.3 update to `updates` in `config.local.toml`; `extract.py` writes `build\extracted\v143`. Then the same
-commands with `v143`: `gen.py --exefs build\extracted\v143\exefs --out generated\v143 --patches recomp\patches-v143.txt`,
-`make_romfs_patches.py --version v143` and `build_game.py --version v143`.
+`.venv\Scripts\python tools\package_build.py --version <ver>` writes `build\<ver>-portable`, which runs on another of
+your machines without MSYS2, Python or .NET. `romfs.bin` stays out unless you pass `--with-romfs`; otherwise put it in
+`romfs\` next to the exe or point `TOTK_ROMFS` at its folder. Run `totk.exe --prepare-shaders` once in the copied
+folder. The folder holds code and data derived from your game: for your own machines only.
 
 ## Checks
 
@@ -128,7 +123,7 @@ Before a commit:
 
 - `python tools/check_content.py --staged`: nothing game-derived is staged. CI runs the same check;
   `git config core.hooksPath .githooks` runs it before each local commit.
-- `build\v121\totk.exe --selftest`: layout, dispatch table and host-function registry, without game files.
+- `build\<ver>\totk.exe --selftest`: layout, dispatch table and host-function registry, without game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
@@ -146,8 +141,8 @@ change passes these, all run with `.venv`:
 Runtime probes, each a mode of `totk.exe` (the list is at the top of `runtime/main.c`): `--probe-kernel`,
 `--probe-vkexec`, `--probe-nvn-tex` and `--probe-shader` cover most runtime changes.
 
-Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version v121 --translate` extracts every Maxwell shader
-to `build\v121\shaders\` and runs it through the translator and `spirv-val`; failure groups go to `failures.txt`.
+Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader
+to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; failure groups go to `failures.txt`.
 `tools\xlate_smoke.py` checks the translator alone, without game files.
 
 ## Reverse engineering (optional)
