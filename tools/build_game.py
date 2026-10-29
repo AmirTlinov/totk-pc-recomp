@@ -168,6 +168,21 @@ def write_if_changed(path, text):
     path.write_text(text, encoding='utf-8', newline='\n')   # Ninja and clang read UTF-8; paths may be non-ASCII
 
 
+def copy_romfs_patches(version, out):
+    """totk.exe loads romfs-patches beside romfs-index.bin (runtime/romfs.c overlay_init). tools/make_romfs_patches.py
+    writes them into build/<version> only, so a build in another directory ran without the 60 fps overlay (the quick
+    menus' captured background turned black). Copies them when their manifest differs."""
+    src = ROOT / 'build' / version / 'romfs-patches'
+    dst = out / 'romfs-patches'
+    if src.resolve() == dst.resolve() or not (src / 'manifest.tsv').is_file():
+        return
+    if (dst / 'manifest.tsv').is_file() and (dst / 'manifest.tsv').read_bytes() == (src / 'manifest.tsv').read_bytes():
+        return
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+    print(f'romfs patches: copied from {src}')
+
+
 def c_string(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
@@ -666,6 +681,7 @@ def main():
     else:
         romfs_index.write_placeholder(out)
         print(f'build_game: warning: no {paths["romfs"] / "index.json"}; totk.exe will have no RomFS', file=sys.stderr)
+    copy_romfs_patches(args.version, out)
     global RUNTIME
     RUNTIME = (args.runtime or RUNTIME).resolve()
     stale = stale_shaders(RUNTIME)
