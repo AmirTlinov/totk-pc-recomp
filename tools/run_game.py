@@ -5,7 +5,7 @@ backup, and deletes the copy afterwards. The log records how many other totk.exe
 timings taken next to them are not comparable.
 
     python tools/run_game.py build/v121 --save user-save-2026-10-21-field --seconds 15 --tag idle --env TOTK_TRACE=perf
-    python tools/run_game.py build/v121-pf --save user-save-2026-10-21-monsters --script tools/input/fight.txt \
+    python tools/run_game.py build/v121 --save user-save-2026-10-21-monsters --script tools/input/fight.txt \
         --seconds 18 --tag fight --quiet --env TOTK_TRACE=perf,sched
 """
 import argparse
