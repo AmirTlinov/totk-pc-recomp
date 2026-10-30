@@ -203,6 +203,16 @@ static void cfg_window_size(int *w, int *h) {
     *h = y;
 }
 
+// Windows turns the display off and sleeps after the idle timeout, and gamepad input does not count as activity. While
+// the window is up and not minimized it holds the display and the system on, as other games do. The state belongs to
+// the calling thread, so only the window thread (window_main and wnd_proc) calls this; the process exit releases it.
+static void keep_awake(int on) {
+    static int cur = -1;
+    if (on == cur) return;
+    cur = on;
+    SetThreadExecutionState(on ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+}
+
 // F11: borderless window over the whole monitor, and back to the saved window. The swapchain follows through WM_SIZE.
 // Not Alt+Enter: Enter is the Plus button (input_win.c). A background window (test runs) keeps its place behind the
 // user's windows and takes no focus.
@@ -372,6 +382,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_SIZE:
+        keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) InterlockedExchange(&g_dirty, 1);
         refresh_rate_update(h, 0);
         return 0;
@@ -441,6 +452,7 @@ static DWORD WINAPI window_main(void *arg) {
         }
         note_applied();
         refresh_rate_update(g_hwnd, 1);
+        keep_awake(1);
     }
     SetEvent(g_wnd_ready);
     if (g_wnd_failed) return 1;
