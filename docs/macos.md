@@ -69,6 +69,8 @@ The macOS CI job builds both version configurations and checks CPU calls, save f
 
 The default profile fixes scene and output to 3840x2160, requests 144 Hz presentation, bounds the present queue to two tickets and disables MetalFX scaling/interpolation and experimental invisible-draw skipping. Runtime scaling/graphics toggles are locked. Required shader/pipeline failures stop strict rendering. The clock uses `CLOCK_UPTIME_RAW` without the upstream 120 Hz minimum-step clamp or per-call initialization and gate counters. Shader arithmetic keeps separate rounding; the native translator excludes Windows patch 0008 because it changes a support-buffer ABI the Metal host does not implement.
 
+The resolution patches disable the game's dynamic scene multiplier, including 1.2.1's emergency reduction, while preserving each effect's downsample ratio. Original instructions are checked before any write. Scene validation applies to full-canvas composition; smaller inventory and effect targets do not establish the presented scene's dimensions. With local 1.2.1 modules, `python tests/macos_resolution_test.py` executes both size producers against Unicorn.
+
 Repeated argument addresses, exact pool lookups and uniform snapshot lookups use validated caches. GPU probes compare cached results with the authoritative path, including invalidation and encoder changes. The idle GPU spin-kernel thread defaults off. `TOTK_GPU_KEEPALIVE`, `TOTK_ARG_BIND_CACHE`, `TOTK_POOL_QUERY_CACHE` and `TOTK_USNAP_INDEX` remain explicit environment controls for profiling; a microbenchmark win does not establish a gameplay win.
 
 `TOTK_NATIVE_4K144=0` enables upstream diagnostic behavior. Such a run cannot satisfy strict acceptance.
@@ -83,6 +85,8 @@ PYTHONPATH=tools .venv-py314/bin/python -m macos.benchmark build/gameplay.csv \
 ```
 
 Select the measured gameplay segment explicitly; the analyzer reports excluded frames. Keep cold-start/shader preparation and steady gameplay captures separate. A gameplay segment must last at least 60 seconds. Every frame must have its own verified scene/output/drawable dimensions, a unique game-frame ID and a consecutive presentation ticket. Unknown scene coverage, repeats and dropped tickets fail acceptance. Average presented FPS must reach 144 and p99 must fit 6.944444 ms; tolerance covers only CSV timestamp quantization and floating point precision, reported in nanoseconds.
+
+An explicit `TOTK_INPUT_FILE` accepts read-only `flag pass_gpu N` (up to 120 frames), `flag draw_log N` and `flag uw_log N` captures without unlocking graphics settings. `TOTK_PASS_GPU_FILE` selects a TSV for per-pass GPU timestamps. Exclude those instrumented frames from performance acceptance; pass timing changes submission boundaries.
 
 Presentation callbacks enqueue immutable records; a dedicated writer formats and buffers CSV. It flushes at least once per second while active, and normal window close drains the queue. An abrupt process failure may lose the tail. Queue overflow or I/O failure stops the capture instead of silently dropping records. With tracing disabled the present path does not capture frame metadata.
 

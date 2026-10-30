@@ -1,8 +1,10 @@
 // macOS runtime policy and measurements, independent of generated game tables.
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 void native_policy_init(void);
+void native_patch_main(void *image, size_t size);
 int native_policy_strict(void);
 int native_host_check(void);
 void native_check_output(unsigned width, unsigned height);

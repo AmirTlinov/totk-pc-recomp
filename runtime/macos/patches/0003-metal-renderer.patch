@@ -57,15 +57,19 @@
  // NVN 空设备的 Metal 执行层，见 nvn_mtl.h。
  // Metal execution layer of the NVN null device, see nvn_mtl.h.
  #import <Metal/Metal.h>
-@@ -2283,6 +2284,7 @@
+@@ -2283,6 +2284,11 @@
      return key && !strncmp(key, prefix, 16);
  }
  void dm_gfx_set_flag(const char *name, int v) {
-+    if (native_policy_strict()) { MLOG("native 4K/144 policy locks runtime graphics flags"); return; }
++    // Read-only captures preserve the render policy. Their instrumented frames
++    // must be excluded from performance acceptance.
++    if (native_policy_strict() && strcmp(name, "pass_gpu") && strcmp(name, "draw_log") && strcmp(name, "uw_log")) {
++        MLOG("native 4K/144 policy locks runtime graphics flags"); return;
++    }
      if (!strcmp(name, "arg_epoch")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_on, v != 0); MLOG("[flag] arg_epoch = %d", v != 0); return; }
      if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
      if (!strcmp(name, "tex_slots")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_on, v != 0); MLOG("[flag] tex_slots = %d", v != 0); return; }
-@@ -4468,6 +4470,8 @@
+@@ -4468,6 +4474,8 @@
  static NSMutableDictionary<NSString *, NSString *> *g_shassets;
  static NSString *g_shmap_path, *g_msl_dir;
  static NSString *exe_rel(const char *rel) {
@@ -74,31 +78,40 @@
      char buf[4096]; uint32_t n = sizeof buf;
      if (_NSGetExecutablePath(buf, &n)) return nil;
      char *dir = dirname(buf);
-@@ -9432,6 +9436,10 @@
+@@ -9432,6 +9440,11 @@
          MLOG("[mfx-up] 主机模式放大点 %.8s（%s）：源 %lux%lu（格式 %lu）→ 画布 %lux%lu（格式 %lu）；常量 con0 %g %g %g %g、输出 %ux%u → 有效区域 %lux%lu%s",
               fs->key, hdr ? "HDR" : "perceptual", (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat,
               k[0], k[1], k[2], k[3], ow, oh, (unsigned long)cw, (unsigned long)ch, why ? "：常量不符，保留游戏自己的放大" : ""); } }
 +    if (native_policy_strict()) {
-+        if (!why) native_check_scene(atomic_load(&g_cur_frame), (unsigned)cw, (unsigned)ch);
++        if (!why && dst.width == 3840 && dst.height == 2160)
++            native_check_scene(atomic_load(&g_cur_frame), (unsigned)cw, (unsigned)ch);
 +        return 0;
 +    }
      // the scene's content, not its texture, must be smaller than the canvas: a reused scene texture can be allocated
      // larger than the content the game drew (dynamic resolution, a size changed while playing) (from PR #42)
      if (!why && (cw >= dst.width || ch >= dst.height)) why = 3;
-@@ -9460,6 +9468,12 @@
+@@ -9460,6 +9473,20 @@
     Returns 1 when the draw was replaced (not to be encoded). */
  static int mfxup_draw(NvProg *pr) {
      g_mfxup_src = nil; g_mfxup_out = nil; g_mfxup_sh = nil;
 +    if (native_policy_strict() && pr && pr->sh[1] && !strncmp(pr->sh[1]->key,"0ac9a54938974396",16)) {
 +        int scene_id=(int)(S.tex[1][0]&0xfffff);
 +        id<MTLTexture> scene=scene_id>0 ? (__bridge id<MTLTexture>)tex_fast(scene_id) : nil;
-+        if(scene)native_check_scene(atomic_load(&g_cur_frame),(unsigned)scene.width,(unsigned)scene.height);
++        const view_t *view=&R.rt.cview[0];
++        id<MTLTexture> canvas=R.rt.n==1 && R.rt.color[0] ? attachment_texture(R.rt.color[0],view,R.rt.has_cview[0]) : nil;
++        // Inventory and other offscreen views share this shader. Only a full
++        // canvas compose can establish the presented scene's resolution.
++        if(scene && canvas.width==3840 && canvas.height==2160 && !(S.color.blend_en&1) &&
++           (S.chmask.mask&15)==15 && !(R.rt.depth && (S.ds.dt || S.ds.st)) &&
++           (!S.has_vp || (S.vp[0][0]==0 && S.vp[0][1]==0 && S.vp[0][2]==3840 && S.vp[0][3]==2160)) &&
++           scissor_full(R.rt.color[0],view,R.rt.has_cview[0]))
++            native_check_scene(atomic_load(&g_cur_frame),(unsigned)scene.width,(unsigned)scene.height);
 +    }
 +    if (native_policy_strict() && pr && pr->sh[1]) (void)mfxup_dock(pr->sh[1]);
      if (!pr || !mfxup_enabled()) return 0;
      __unsafe_unretained NvShader *fs = pr->sh[1];
      if (!fs) return 0;
-@@ -9489,9 +9503,9 @@
+@@ -9489,9 +9516,9 @@
  static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
      if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
      __unsafe_unretained NvProg *pr = prog_get(S.prog);
@@ -110,7 +123,7 @@
      if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
      geometry_dump(pr, dw, di);
      if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
-@@ -9684,7 +9698,7 @@
+@@ -9684,7 +9711,7 @@
      if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
      if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
      __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
@@ -119,7 +132,7 @@
      if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
      static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
      if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
-@@ -11793,6 +11807,7 @@
+@@ -11793,6 +11820,7 @@
  
      CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
      if (!layer) return 0;
@@ -127,7 +140,7 @@
      if (g_present_layer_resident != layer) { if (!layer.residencySet) MDIE("present layer has no residency set (layer device %s)", layer.device ? "set" : "missing"); [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
  #if TARGET_OS_OSX
      if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
-@@ -11813,6 +11828,10 @@
+@@ -11813,6 +11841,10 @@
      id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
      if (!supplied) g_drawable_ns += now_ns() - dt0;
      if (!dr) return 0;
@@ -138,7 +151,7 @@
      int alloc_i = (int)((ticket * 2 + (interp >= 0 ? 0 : 1)) % 3);   // the interpolated frame of a ticket and the ticket's own frame use different allocators
      pthread_mutex_lock(&g_pq_mu);
      while (g_present_alloc_busy[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
-@@ -11938,6 +11957,7 @@
+@@ -11938,6 +11970,7 @@
      uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
      [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
          CFTimeInterval tt = d.presentedTime;
@@ -146,7 +159,7 @@
          if (interp < 0) g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};   // statistics per game frame; the interpolated one is not a game frame
          cadence_note(tt, interp >= 0);
          front_frame_presented();
-@@ -12039,7 +12059,7 @@
+@@ -12039,7 +12072,7 @@
      if (mode == 2) return CAFrameRateRangeMake(60, 120, 120);
      const char *explicit_hz = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
      int hz = explicit_hz ? atoi(explicit_hz) : (rt && !strcmp(rt, "0")) ? 60 : mtl_display_hz();
@@ -155,7 +168,7 @@
      return CAFrameRateRangeMake(hz, hz, hz);
  }
  static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 省电模式 30 Hz | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
-@@ -12222,7 +12242,7 @@
+@@ -12222,7 +12255,7 @@
          else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL：放开显示节拍（帧 %llu）", (unsigned long long)atomic_load(&g_cur_frame)); }
      }
      pthread_mutex_lock(&g_pq_mu);
@@ -164,7 +177,7 @@
      pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0};
      if (crop) memcpy(it->crop, crop, sizeof it->crop);   // 当帧状态随票号入队，不在出图线程晚读可变window | The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
      uint64_t tk = ++g_pq_in;
-@@ -12485,7 +12505,7 @@
+@@ -12485,7 +12518,7 @@
          rp.renderTargetWidth = W; rp.renderTargetHeight = H;
          id<MTL4RenderCommandEncoder> re = enc_r_begin(rp);
          enc_r_pso(re, ps); enc_r_viewport(re, (MTLViewport){0, 0, W, H, 0, 1}); enc_r_scissor(re, (MTLScissorRect){0, 0, W, H});

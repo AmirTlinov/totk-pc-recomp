@@ -69,7 +69,12 @@ void native_check_output(unsigned w, unsigned h) {
 
 void native_check_scene(uint64_t frame, unsigned w, unsigned h) {
     if (!strict_mode) return;
-    if (w != 3840 || h != 2160) runtime_fail("native 4K scene target is not 3840x2160");
+    if (w != 3840 || h != 2160) {
+        char message[160];
+        snprintf(message, sizeof message, "native 4K scene is %ux%u at frame %llu; expected 3840x2160",
+                 w, h, (unsigned long long)frame);
+        runtime_fail(message);
+    }
     if (frame == UINT64_MAX) runtime_fail("frame identity overflow");
     atomic_store_explicit(&scene_frames[frame % 64], frame + 1, memory_order_relaxed);
 }
