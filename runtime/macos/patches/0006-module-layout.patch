@@ -1,0 +1,25 @@
+--- a/runtime/loader.c
++++ b/runtime/loader.c
+@@ -20,6 +20,7 @@
+ #include "mach_vm_compat.h"
+ #include <sys/ucontext.h>
+ #include "runtime_tables.h"
++#include "native_layout.h"
+ #include "game_patches.h"
+ #include "game_version.h"
+ #define NM (sizeof(modules)/sizeof(modules[0]))
+@@ -183,7 +184,13 @@
+  /* The main module gets one private, writable page after its rewritten image. The
+     real-time frame-step patch reads its two floats from this page via ADRP. */
+  m->size=page_up(m->file_size)+(!strcmp(m->name,"main")?0x4000:0);
+- m->base=mmap(NULL,m->size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
++ uintptr_t requested=0;
++ for(unsigned i=0;i<sizeof(native_modules)/sizeof(*native_modules);i++)if(!strcmp(m->name,native_modules[i].name)){
++  need(native_modules[i].size==m->size,"native layout image size");requested=native_modules[i].base;break;
++ }
++ need(requested!=0,"native module absent from recomp/layout.py layout");
++ m->base=mmap((void *)requested,m->size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
++ need((uintptr_t)m->base==requested,"native module address is occupied; refusing to overwrite host memory");
+  need(m->base!=MAP_FAILED,"map module");need(fread(m->base,1,m->file_size,f)==m->file_size,"read image");fclose(f);
+  unsigned char digest[32];CC_SHA256(m->base,(CC_LONG)m->file_size,digest);char hex[65];
+  for(unsigned i=0;i<32;i++)snprintf(hex+i*2,3,"%02x",digest[i]);

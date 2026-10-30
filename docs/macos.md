@@ -1,0 +1,89 @@
+# Native Apple Silicon build
+
+The macOS target executes prepared ARM64 game code with a direct Metal 4 renderer. It supports preparation for 1.4.3 (default) and 1.2.1. It requires Apple Silicon, macOS 26+, Xcode with its Metal toolchain, Python 3.14+, Ninja and .NET 10 for building the shader service. The packaged game needs neither Python nor .NET.
+
+Full-game compatibility and 3840x2160 at 144 rendered frames per second are acceptance targets. A successful build or synthetic probe does not establish gameplay performance, physics correctness or driver stability. The pinned upstream renderer has previously recorded driver faults during full-game submission; game-data runs on the target Mac must resolve that boundary before declaring the port ready.
+
+## Build
+
+Install the tools and dependencies, then create the Python environment:
+
+```sh
+brew install ninja opus libvpx llvm dotnet openssl@3 brotli uv
+uv venv --python 3.14 .venv-py314
+uv pip install --python .venv-py314/bin/python -r tools/requirements-macos.txt
+tools/fetch_refs.sh
+```
+
+Install Xcode's Metal Toolchain if `xcrun --find metal` fails. Static libraries must contain ARM64 and target macOS 26 or earlier. The builder checks their deployment targets and uses an installed compatible keg when the newest Homebrew bottle targets a newer OS.
+
+Copy `config.macos.example.toml` to the ignored `config.local.toml`. Set paths to the base game, cumulative update, key file and firmware directory. Keys are passed by path. The native host requires verified system shared fonts, including for availability queries. Extraction and prepared game files stay under `build/` and `generated/`.
+
+```sh
+.venv-py314/bin/python tools/build_game.py --target macos-arm64 --version v143 --extract --package
+```
+
+This extracts and verifies inputs, rewrites the ARM64 modules, runs structural/differential and native-call gates, creates runtime tables, prepares shaders and packages a locally signed app:
+
+```text
+build/macos-arm64/v143/TotK Recomp.app
+```
+
+When verified extraction already exists, use `--prepare-game --package` instead of `--extract --package`. Later builds can use `--package` alone. Use `--version v121` for 1.2.1. The builder uses the same pinned sources for both versions. Its source checkout in `refs/` remains untouched; changes are applied to an ignored export.
+
+The signature is ad hoc for local use. Public distribution/notarization is a separate signing process. The playable app contains the player's game data and stays local.
+
+## Build without game files
+
+```sh
+.venv-py314/bin/python tools/build_macos.py --probes --package
+PYTHONPATH=tools .venv-py314/bin/python -m macos.check
+PYTHONPATH=tools .venv-py314/bin/python -m macos.shaders
+.venv-py314/bin/python tests/macos_shader_test.py
+.venv-py314/bin/python tests/macos_save_test.py -v
+.venv-py314/bin/python tests/macos_layout_test.py -v
+.venv-py314/bin/python tests/macos_benchmark_test.py -v
+```
+
+`TotK Recomp Diagnostics.app` contains the real compiled host and renderer with explicit empty game tables. It refuses game boot. `--selftest` checks native execution and Metal 4 capability. The GPU runner tests masked clears, depth/stencil, resource aliasing/lifetimes, uniform snapshots, bindings and render-stream behavior under Metal validation; each run keeps separate logs. The shader test uses a synthetic Maxwell kernel through the native translator, SPIRV-Cross and Apple's Metal compiler. It contains no game shader.
+
+The native call-window test and hardware probe can also run without game data:
+
+```sh
+.venv-py314/bin/python build/macos-arm64/source/games/totk/scripts/test_call_window.py
+mkdir -p build/macos-arm64/source/games/totk/analysis
+make -C build/macos-arm64/source/games/totk probe-call PY="$PWD/.venv-py314/bin/python"
+```
+
+The macOS CI job builds both version configurations and checks CPU calls, save failures, layout and presentation accounting. Physical GPU/display acceptance runs on the target Mac.
+
+## Rendering and measurement
+
+The default profile fixes scene and output to 3840x2160, requests 144 Hz presentation, bounds the present queue to two tickets and disables MetalFX scaling/interpolation and experimental invisible-draw skipping. Runtime scaling/graphics toggles are locked. Required shader/pipeline failures stop strict rendering. The clock uses elapsed time without the upstream 120 Hz minimum-step clamp. Shader arithmetic keeps separate rounding; the native translator excludes Windows patch 0008 because it changes a support-buffer ABI the Metal host does not implement.
+
+`TOTK_NATIVE_4K144=0` enables upstream diagnostic behavior. Such a run cannot satisfy strict acceptance.
+
+Capture actual drawable presentation timestamps by launching the app executable from a terminal:
+
+```sh
+TOTK_FRAME_TRACE="$PWD/build/gameplay.csv" \
+  'build/macos-arm64/v143/TotK Recomp.app/Contents/MacOS/TotKRecomp'
+PYTHONPATH=tools .venv-py314/bin/python -m macos.benchmark build/gameplay.csv \
+  --start-ticket 1000 --end-ticket 11000 --output build/gameplay-result.json
+```
+
+Select the measured gameplay segment explicitly; the analyzer reports excluded frames. Keep cold-start/shader preparation and steady gameplay captures separate. A gameplay segment must last at least 60 seconds. Every frame must have its own verified scene/output/drawable dimensions, a unique game-frame ID and a consecutive presentation ticket. Unknown scene coverage, repeats and dropped tickets fail acceptance. Average presented FPS must reach 144 and p99 must fit 6.944444 ms; tolerance covers only CSV timestamp quantization and floating point precision, reported in nanoseconds.
+
+These timing and dimension checks still need visual acceptance at a physical 4K/144 display mode: fixed allocation dimensions alone do not prove viewport coverage or image fidelity. Check the same saves/routes for terrain, transparencies, shadows, UI, physics, cloth, input latency and audio. Dynamic resolution, frame generation and reused frames cannot count toward the target. No target result is inferred from GPU probes or from another machine.
+
+## Player files and saves
+
+| Data | Location |
+|---|---|
+| Versioned profiles | `~/Library/Application Support/TotKRecomp/<version>/` |
+| Shader cache | `~/Library/Caches/TotKRecomp/<version>/<toolchain-OS-GPU identity>/` |
+| Logs | `~/Library/Logs/TotKRecomp/` |
+
+Only one local app instance can own the player profile. A save writes to `save-tx/work`. Commit snapshots it with APFS copy-on-write, flushes data, atomically exchanges the committed directory, flushes publication metadata and completes a full drive barrier before returning success. Failures return to the game and retain working data. Last writable-mount unmount rolls back to the committed generation; dirty work is kept in a recovery directory. Read-only mounts cannot modify either generation. Clean restarts do not accumulate recovery copies.
+
+The previous committed generation and interrupted recovery work remain under the profile. Recovery copies are deliberate player data; they are never silently pruned. Fault-injection tests cover copy/flush/publication failures and process termination. They do not simulate physically removing power from the storage device.

@@ -1,0 +1,83 @@
+--- a/runtime/loader.c
++++ b/runtime/loader.c
+@@ -1,5 +1,6 @@
+ /* Native ARM64 module loader. Guest images and generated metadata stay local. */
+ #include "runtime.h"
++#include "native_policy.h"
+ #include "totk_ui_lang.h"
+ #include <TargetConditionals.h>
+ #include <dlfcn.h>
+@@ -292,13 +293,35 @@
+  ThreadEnvironment *e=pthread_getspecific(environment_key);pthread_setspecific(environment_key,NULL);
+  for(unsigned i=0;i<4;i++)pthread_setspecific(runtime_keys[i],NULL);environment_destroy(e);
+ }
+-uint64_t runtime_now_ns(void) {mach_timebase_info_data_t tb;mach_timebase_info(&tb);return (uint64_t)((__uint128_t)mach_absolute_time()*tb.numer/tb.denom);}
++static mach_timebase_info_data_t host_timebase;
++static pthread_once_t timebase_once = PTHREAD_ONCE_INIT;
++static void timebase_init(void) { need(mach_timebase_info(&host_timebase)==KERN_SUCCESS,"host timebase"); }
++uint64_t runtime_now_ns(void) {
++ pthread_once(&timebase_once,timebase_init);
++ return (uint64_t)((__uint128_t)mach_absolute_time()*host_timebase.numer/host_timebase.denom);
++}
++typedef struct { uint64_t address; const Gate *gate; const char *module; } GateEntry;
++static GateEntry *gate_index;
++static size_t gate_mask;
++static size_t gate_hash(uint64_t a) { a >>= 2; a ^= a >> 33; a *= 0xff51afd7ed558ccdULL; a ^= a >> 33; return (size_t)a; }
++static void gates_init(void) {
++ size_t n=0, cap=16;
++ for(unsigned i=0;i<NM;i++)n+=modules[i].ngate;
++ while(cap<n*2)cap*=2;
++ gate_index=calloc(cap,sizeof *gate_index);need(gate_index!=NULL,"native gate index");gate_mask=cap-1;
++ for(unsigned i=0;i<NM;i++)for(unsigned j=0;j<modules[i].ngate;j++) {
++  const Gate *g=modules[i].gates+j;uint64_t a=(uintptr_t)modules[i].base+g->ret;size_t slot=gate_hash(a)&gate_mask;
++  while(gate_index[slot].gate){need(gate_index[slot].address!=a,"duplicate native gate");slot=(slot+1)&gate_mask;}
++  gate_index[slot]=(GateEntry){a,g,modules[i].name};
++ }
++}
+ void runtime_dispatch(uint64_t ret,uint64_t *regs) {
+- for(unsigned i=0;i<NM;i++)for(unsigned j=0;j<modules[i].ngate;j++) {
+-  const Gate *g=&modules[i].gates[j];if((uintptr_t)modules[i].base+g->ret!=ret)continue;
+-  if(g->timer){mach_timebase_info_data_t tb;mach_timebase_info(&tb);__uint128_t ns=(__uint128_t)mach_absolute_time()*tb.numer/tb.denom;
+-   need(g->arg<31&&g->arg!=18,"timer target register");regs[g->arg]=(uint64_t)(ns*12/625);__atomic_fetch_add(&timer_calls,1,__ATOMIC_RELAXED);return;}
+-  __atomic_fetch_add(&svc_calls,1,__ATOMIC_RELAXED);runtime_svc(g->arg,regs,modules[i].name,g->original);return;
++ size_t slot=gate_hash(ret)&gate_mask;
++ while(gate_index[slot].gate) {
++  const GateEntry *entry=&gate_index[slot];const Gate *g=entry->gate;
++  if(entry->address!=ret){slot=(slot+1)&gate_mask;continue;}
++  if(g->timer){need(g->arg<31&&g->arg!=18,"timer target register");regs[g->arg]=(uint64_t)((__uint128_t)runtime_now_ns()*12/625);__atomic_fetch_add(&timer_calls,1,__ATOMIC_RELAXED);return;}
++  __atomic_fetch_add(&svc_calls,1,__ATOMIC_RELAXED);runtime_svc(g->arg,regs,entry->module,g->original);return;
+  }
+  runtime_fail("unknown gate return address");
+ }
+@@ -481,19 +504,28 @@
+  (void)num;void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
+  signal(SIGABRT,SIG_DFL);raise(SIGABRT);
+ }
++static void install_signals(void) {
++ struct sigaction a={0};a.sa_sigaction=crash;a.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&a.sa_mask);
++ sigaction(SIGSEGV,&a,NULL);sigaction(SIGBUS,&a,NULL);sigaction(SIGILL,&a,NULL);sigaction(SIGTRAP,&a,NULL);
++ {struct sigaction ab={0};ab.sa_handler=abort_report;ab.sa_flags=SA_ONSTACK;sigemptyset(&ab.sa_mask);sigaction(SIGABRT,&ab,NULL);}
++}
+ int main(int argc,char **argv) {
++ if(argc==2){install_signals();int r=native_run_probe(argv[1]);if(r>=0)return r;}
++#ifdef TOTK_PROBE_BUILD
++ runtime_fail("This build contains runtime probes only. Supply verified game files and rebuild to play.");
++#endif
++ native_policy_init();
+  need(argc==3,"usage: totk-native rewritten-dir probe|boot");
+  /* One game or GPU probe at a time (memory, GPU time): wait for the slot before anything is loaded. */
+  if(!strcmp(argv[2],"boot")||!strncmp(argv[2],"probe-gpu",9))runtime_game_slot_acquire(argv[2]);
+  if(strcmp(argv[2],"boot"))setenv("TOTK_PROBE_GPU","1",1);   /* standalone probes submit GPU work; the game does not unless TOTK_GPU_ALLOW_SUBMIT=1 */
+  else unsetenv("TOTK_PROBE_GPU");need(sysconf(_SC_PAGESIZE)==0x4000,"expected 16KB Apple pages");
+- struct sigaction a={0};a.sa_sigaction=crash;a.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&a.sa_mask);
+- sigaction(SIGSEGV,&a,NULL);sigaction(SIGBUS,&a,NULL);sigaction(SIGILL,&a,NULL);sigaction(SIGTRAP,&a,NULL);
+- {struct sigaction ab={0};ab.sa_handler=abort_report;ab.sa_flags=SA_ONSTACK;sigemptyset(&ab.sa_mask);sigaction(SIGABRT,&ab,NULL);}
++ install_signals();
+  for(unsigned i=0;i<8;i++)need(pthread_key_create(&runtime_keys[i],NULL)==0&&runtime_keys[i]!=0,"allocate Darwin key");
+  runtime_hle_stack_init((uint64_t)runtime_keys[4]*8);
+  need(pthread_key_create(&environment_key,environment_destroy)==0,"thread environment key");
+  for(unsigned i=0;i<NM;i++)map_module(&modules[i],argv[1]);
++ gates_init();
+  for(unsigned i=0;i<NM;i++)relocate(&modules[i]);
+  for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,"main"))runtime_game_patches(&modules[i]);
+ #if !TARGET_OS_IPHONE

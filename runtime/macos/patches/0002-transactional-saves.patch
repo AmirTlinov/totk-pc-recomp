@@ -1,0 +1,149 @@
+--- a/runtime/fs_host.c
++++ b/runtime/fs_host.c
+@@ -7,6 +7,7 @@
+ #include "autoload.h"
+ #include "runtime.h"
+ #include "fs_host.h"
++#include "save_store.h"
+ #include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -43,6 +44,21 @@
+ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+ static char profile[1024], save_root[1024];
+ static pthread_once_t once = PTHREAD_ONCE_INIT;
++static NativeSaveStore save_store;
++static pthread_rwlock_t snapshot_lock = PTHREAD_RWLOCK_INITIALIZER;
++typedef struct { int held; int away; } SaveAccess;
++static SaveAccess save_access(int exclusive) {
++    SaveAccess access = {.away=runtime_core_away()};
++    int r=exclusive ? pthread_rwlock_wrlock(&snapshot_lock) : pthread_rwlock_rdlock(&snapshot_lock);
++    if(r)runtime_fail("save snapshot lock");
++    access.held=1;return access;
++}
++static void save_access_end(SaveAccess *access) {
++    if(access->held)pthread_rwlock_unlock(&snapshot_lock);
++    runtime_core_back(&access->away);
++}
++#define SAVE_ACCESS(exclusive) SaveAccess access __attribute__((cleanup(save_access_end))) = save_access(exclusive)
++
+ 
+ static void need(int c, const char *m) { if (!c) runtime_fail(m); }
+ 
+@@ -74,6 +90,8 @@
+     char p[1100]; make_dir(profile);
+     snprintf(p, sizeof p, "%s/save", profile); make_dir(p);
+     need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1], (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
++    snprintf(p, sizeof p, "%s/save-tx", profile);
++    need(native_save_open(&save_store, save_root, p)==0,"open transactional save storage");
+     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
+     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
+     snprintf(p, sizeof p, "%s/cache", profile); make_dir(p);
+@@ -127,7 +145,7 @@
+ static unsigned mount_save(const char *name, const uint64_t *uid) {
+     ready(); uint64_t me[2]; runtime_account_uid(me);
+     if (!uid || uid[0] != me[0] || uid[1] != me[1]) return R_TARGET_NOT_FOUND;
+-    return mount_add(name, M_SAVE, save_root);
++    return mount_add(name, M_SAVE, save_store.work);
+ }
+ static unsigned char save_exists(uint64_t application, const uint64_t *uid) {
+     ready(); uint64_t me[2]; runtime_account_uid(me);
+@@ -175,12 +193,24 @@
+     if (!runtime_romfs_owns(name)) runtime_fail("unmount of unknown fs mount");
+ }
+ static unsigned commit(const char *name) {
++    SAVE_ACCESS(1);
+     pthread_mutex_lock(&lock); int found = 0, save = 0;
+     for (int i = 0; i < 16; i++) if (mounts[i].kind && !strcmp(mounts[i].name, name)) { found = 1; save = mounts[i].kind == M_SAVE; }
+     pthread_mutex_unlock(&lock);
+     if (!found) return R_PATH_NOT_FOUND;
+-    for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) fcntl(fd, F_FULLFSYNC); }
+-    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
++    if (save) {
++        atomic_fetch_add(&save_writers, 1);
++        int r=native_save_commit(&save_store);
++        atomic_fetch_sub(&save_writers, 1);
++        if(r){fprintf(stderr,"[totk] save commit failed: %s; working data retained\n",strerror(errno));return R_INVALID_ARGUMENT;}
++        if (!(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);
++    } else {
++        pthread_mutex_lock(&lock);
++        int r=0;
++        for(int i=0;i<NFILES;i++)if(files[i].fd>0 && files[i].mode&OPEN_WRITE && fcntl(files[i].fd,F_FULLFSYNC))r=R_INVALID_ARGUMENT;
++        pthread_mutex_unlock(&lock);
++        if(r)return (unsigned)r;
++    }
+     return 0;
+ }
+ 
+@@ -191,7 +221,7 @@
+     return v > 0 ? f : NULL;
+ }
+ void runtime_fs_log(const char *what, const char *path);
+-static unsigned open_file(uint64_t *out, const char *path, int mode) {
++static unsigned open_file(uint64_t *out, const char *path, int mode) { SAVE_ACCESS(0);
+     if (path && !runtime_romfs_owns(path)) runtime_fs_log(mode & 2 ? "write" : "read", path);
+     if (runtime_romfs_owns(path)) return runtime_romfs_open(out, path, mode);
+     if (!out || !(mode & (OPEN_READ | OPEN_WRITE)) || (mode & ~7)) return R_INVALID_ARGUMENT;
+@@ -220,7 +250,7 @@
+ }
+ static unsigned read_options(uint64_t *out, uint64_t h, int64_t off, void *buf, uint64_t size, const void *options) { (void)options; return read_file(out, h, off, buf, size); }
+ static unsigned read_exact(uint64_t h, int64_t off, void *buf, uint64_t size) { uint64_t n = 0; unsigned r = read_file(&n, h, off, buf, size); return r ? r : n == size ? 0 : R_INVALID_ARGUMENT; }
+-static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint64_t size, const int32_t *option) {
++static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint64_t size, const int32_t *option) { SAVE_ACCESS(0);
+     int fd, mode; File *f = offset < 0 || (!buffer && size) ? NULL : file_of(h, &fd, &mode); if (!f) return R_INVALID_ARGUMENT;
+     if (!(mode & OPEN_WRITE)) return R_OPEN_MODE;
+     struct stat st; if (fstat(fd, &st)) runtime_fail("host save stat");
+@@ -232,7 +262,7 @@
+         if (delay_ms > 0) usleep((useconds_t)delay_ms * 1000);   /* tests only: slow saves down so a window close lands in the middle of one */
+     }
+     while (done < size) { ssize_t n = pwrite(fd, (const uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n <= 0) runtime_fail("host save write failure"); done += (uint64_t)n; }
+-    if (option && (*option & 1)) fcntl(fd, F_FULLFSYNC);
++    if (option && (*option & 1) && fcntl(fd, F_FULLFSYNC)) return errno_result();
+     return 0;
+ }
+ static unsigned file_size(int64_t *out, uint64_t h) {
+@@ -240,27 +270,27 @@
+     int fd; struct stat st; if (!out || !file_of(h, &fd, NULL) || fstat(fd, &st)) return R_INVALID_ARGUMENT;
+     *out = st.st_size; return 0;
+ }
+-static unsigned set_file_size(uint64_t h, int64_t size) {
++static unsigned set_file_size(uint64_t h, int64_t size) { SAVE_ACCESS(0);
+     int fd, mode; if (size < 0 || !file_of(h, &fd, &mode)) return R_INVALID_ARGUMENT;
+     if (!(mode & OPEN_WRITE)) return R_OPEN_MODE;
+     if (files[h - FILE_BASE].save) save_touched();
+     return ftruncate(fd, size) ? errno_result() : 0;
+ }
+-static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; fcntl(fd, F_FULLFSYNC); return 0; }
+-static void close_file(uint64_t h) {
++static unsigned flush_file(uint64_t h) { SAVE_ACCESS(0); int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; return fcntl(fd, F_FULLFSYNC) ? errno_result() : 0; }
++static void close_file(uint64_t h) { SAVE_ACCESS(0);
+     if (runtime_romfs_handle(h)) { runtime_romfs_close(h); return; }
+     if (!file_of(h, NULL, NULL)) runtime_fail("close invalid file handle");
+     pthread_mutex_lock(&lock); int fd = files[h - FILE_BASE].fd, save = files[h - FILE_BASE].save; files[h - FILE_BASE].fd = 0; pthread_mutex_unlock(&lock);
+     close(fd);
+     if (save) { save_touched(); atomic_fetch_sub(&save_writers, 1); }
+ }
+-static unsigned create_file(const char *path, int64_t size) {
++static unsigned create_file(const char *path, int64_t size) { SAVE_ACCESS(0);
+     char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; if (size < 0) return R_INVALID_ARGUMENT;
+     int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600); if (fd < 0) return errno_result();
+     int bad = ftruncate(fd, size); close(fd); return bad ? errno_result() : 0;
+ }
+-static unsigned delete_file(const char *path) { char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; return unlink(p) ? errno_result() : 0; }
+-static unsigned rename_file(const char *from, const char *to) {
++static unsigned delete_file(const char *path) { SAVE_ACCESS(0); char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; return unlink(p) ? errno_result() : 0; }
++static unsigned rename_file(const char *from, const char *to) { SAVE_ACCESS(0);
+     char a[1100], b[1100]; unsigned r = save_change_path(from, a, sizeof a); if (!r) r = host_path(to, b, sizeof b); if (r) return r;
+     struct stat st; if (!stat(b, &st)) return R_ALREADY_EXISTS;
+     return rename(a, b) ? errno_result() : 0;
+@@ -275,8 +305,8 @@
+ /* ---------- directories ---------- */
+ typedef struct { char name[769]; uint8_t pad0[3]; int8_t type; uint8_t pad1[3]; int64_t size; } DirectoryEntry;
+ _Static_assert(sizeof(DirectoryEntry) == 0x310, "nn::fs::DirectoryEntry");
+-static unsigned create_directory(const char *path) { char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; return mkdir(p, 0700) ? errno_result() : 0; }
+-static unsigned delete_recursive(const char *path) { char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; struct stat st; if (stat(p, &st)) return R_PATH_NOT_FOUND; return remove_tree(p) ? R_INVALID_ARGUMENT : 0; }
++static unsigned create_directory(const char *path) { SAVE_ACCESS(0); char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; return mkdir(p, 0700) ? errno_result() : 0; }
++static unsigned delete_recursive(const char *path) { SAVE_ACCESS(0); char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; struct stat st; if (stat(p, &st)) return R_PATH_NOT_FOUND; return remove_tree(p) ? R_INVALID_ARGUMENT : 0; }
+ static unsigned open_directory(uint64_t *out, const char *path, int mode) {
+     if (runtime_romfs_owns(path)) { fprintf(stderr, "[totk] OpenDirectory on RomFS %s\n", path); runtime_fail("RomFS directory listing not implemented"); }
+     char p[1100]; unsigned r = host_path(path, p, sizeof p); if (r) return r; if (!out || mode < 1 || mode > 3) return R_INVALID_ARGUMENT;
