@@ -7,11 +7,30 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from macos.build import BUILD, compile_runtime, digest, preserve_source_times, probe_headers, stage_sources
+from macos.prepare import llvm_bin
 
+
+class PreparationTests(unittest.TestCase):
+    def test_explicit_llvm_directory_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix='llvm tools ') as temporary:
+            directory = Path(temporary)
+            for name in ('llvm-objcopy', 'llvm-objdump'):
+                tool = directory / name
+                tool.write_text('#!/bin/sh\nexit 0\n')
+                tool.chmod(0o755)
+            with patch.dict(os.environ, LLVM_BIN=str(directory)):
+                self.assertEqual(llvm_bin(), directory.resolve())
+
+    def test_incomplete_explicit_llvm_fails_without_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, LLVM_BIN=temporary):
+                with self.assertRaisesRegex(RuntimeError, 'LLVM tools are missing'):
+                    llvm_bin()
 
 class SourceExportTests(unittest.TestCase):
     def check_export(self, removed=False):

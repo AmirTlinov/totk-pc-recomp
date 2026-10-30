@@ -8,6 +8,21 @@ from pathlib import Path
 from macos.build import ROOT, GENERATED_MARKER, run, digest, write
 
 
+def llvm_bin():
+    """Resolve an installed LLVM before starting expensive game preparation."""
+    explicit = os.environ.get('LLVM_BIN')
+    if explicit:
+        candidates = [Path(explicit)]
+    else:
+        found = shutil.which('llvm-objcopy')
+        candidates = ([Path(found).parent] if found else []) + [Path('/opt/homebrew/opt/llvm/bin')]
+        candidates += sorted(Path('/opt/homebrew/opt').glob('llvm@*/bin'), reverse=True)
+    for folder in candidates:
+        if all(os.access(folder / tool, os.X_OK) for tool in ('llvm-objcopy', 'llvm-objdump')):
+            return folder.resolve()
+    raise RuntimeError('LLVM tools are missing; install Homebrew llvm or set LLVM_BIN to its bin directory')
+
+
 def write_layout(tree, out, version):
     sys.path.insert(0, str(ROOT / 'recomp'))
     from layout import native_layout
@@ -57,6 +72,7 @@ def check_inputs(version, extracted):
 def prepare_game(tree, out, version, jobs, extracted):
     if sys.version_info < (3, 14):
         raise RuntimeError('Game preparation requires Python 3.14 or later (compression.zstd)')
+    llvm = llvm_bin()
     check_inputs(version, extracted)
     out.mkdir(parents=True, exist_ok=True)
     generated = ROOT / 'generated/macos-arm64'
@@ -64,10 +80,7 @@ def prepare_game(tree, out, version, jobs, extracted):
     link(tree / 'extracted', extracted)
     link(tree / 'rewritten', generated)
     link(tree / 'build' / version, out)
-    env = dict(os.environ, DM_RULESET='native', DM_PRIVATE_GATES='0', TOTK_PYTHON=sys.executable)
-    llvm = Path('/opt/homebrew/opt/llvm/bin')
-    if llvm.is_dir():
-        env['LLVM_BIN'] = str(llvm)
+    env = dict(os.environ, DM_RULESET='native', DM_PRIVATE_GATES='0', TOTK_PYTHON=sys.executable, LLVM_BIN=str(llvm))
     commands = [
         ['scripts/prepare_modules.py', f'extracted/{version}/exefs', '--output', f'extracted/{version}/elf'],
         *[['third_party/d2r/patch_nso.py', f'extracted/{version}/exefs/{name}', f'rewritten/{version}', name]
@@ -89,7 +102,8 @@ def prepare_game(tree, out, version, jobs, extracted):
             write(p, f'// {GENERATED_MARKER}\n' + p.read_text())
     # Binary and tabular rewriter output cannot carry a C comment. A marked
     # manifest fingerprints every artifact and keeps their provenance together.
-    files = {p.name: digest(p) for p in (generated / version).iterdir() if p.is_file()}
+    files = {p.name: digest(p) for p in sorted((generated / version).iterdir())
+             if p.is_file() and p.name != 'provenance.json'}
     write(generated / version / 'provenance.json', json.dumps(
         {'generated_from': GENERATED_MARKER, 'version': version, 'files': files}, indent=2) + '\n')
     from macos.shaders import prepare_shaders

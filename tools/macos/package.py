@@ -14,11 +14,14 @@ def copy(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
         shutil.copytree(source, destination)
-    else:
+    elif source.stat().st_size >= 64 * (1 << 20):
         # clonefile through cp keeps local multi-GB game copies cheap on APFS.
         import subprocess
         if subprocess.run(['cp', '-c', str(source), str(destination)], capture_output=True).returncode:
             shutil.copy2(source, destination)
+    else:
+        # Shader libraries are small and numerous; avoid a process per file.
+        shutil.copy2(source, destination)
 
 
 def package(tree, out, version, probes):

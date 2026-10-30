@@ -1,7 +1,8 @@
 """Build native hactool: toolchain/hactool/hactool[.exe] from pinned SciresM sources.
 
 Fetches the pinned commit into toolchain/src/hactool, resets it (local changes and build output there are discarded),
-applies portable.patch (MacNativeGames' Windows-relevant changes) and unicode.patch (ours), and builds a static exe
+applies portable.patch (MacNativeGames' extraction changes and our stdin/key parsing fixes) and unicode.patch,
+and builds a static exe
 with MSYS2 UCRT64 gcc; mbedtls comes with hactool's tree. The exe and hactool's LICENSE go to toolchain/hactool, where
 tools/extract.py and tools/make_release.py take them. macOS uses Apple Clang ARM64,
 the bundled mbedtls, and only portable.patch; the Unicode resource patch is Windows-only.

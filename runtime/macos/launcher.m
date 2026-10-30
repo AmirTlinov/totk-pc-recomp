@@ -74,7 +74,6 @@ int main(int argc, char **argv) {
             {"TOTK_RESOURCE_ROOT", root}, {"DM_MSL_DIR", cache},
             {"TOTK_PROFILE_DIR", profile}, {"TOTK_SHADER_CACHE", cache}, {"TOTK_GAME_SLOT_DIR", slot},
             {"TOTK_ROMFS_PROOF_DIR", profile}, {"TOTK_SHARED_FONTS", @"extracted/firmware/shared-fonts"},
-            {"TOTK_INPUT_FILE", [profile stringByAppendingPathComponent:@"input.txt"]},
             {"TOTK_SHADER_CONTRIB", [cache stringByAppendingPathComponent:@"shader-list-contribution.txt"]},
             {"TOTK_CONTROLS", [support stringByAppendingPathComponent:@"controls.txt"]},
         };
