@@ -69,6 +69,10 @@ VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded
 int vk_init(void);                          // idempotent; 1 on success, 0 on failure (reason logged with rt_log)
 void vk_shutdown(void);
 int vk_selftest(void);                      // 0 on success
+// Call with the result of a failed queue submit, present or wait before stopping on it: VK_ERROR_DEVICE_LOST logs
+// what VK_EXT_device_fault reports (description, faulting addresses with their precision, vendor codes) once per
+// process. Any other result returns at once.
+void vk_device_fault_report(VkResult r);
 
 // ---- window and present (gfx_window.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled

@@ -490,6 +490,7 @@ static void flip_locked(void) {
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
+    vk_device_fault_report(r);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&g_dirty, 1);
 }
 
@@ -763,6 +764,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         if (!create_swapchain()) goto out;
         r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     }
+    vk_device_fault_report(r);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;     // lost, not ready: skip the frame
     if (r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
@@ -870,6 +872,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_flip_idx = idx;
         if (!defer) flip_locked();
     } else {
+        vk_device_fault_report(r);
         rt_log("gfx: present submit failed (%d)", (int)r);
     }
     g_frame++;
