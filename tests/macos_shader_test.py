@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from macos.build import BUILD
+from macos.shaders import compile_libraries
 
 
 def main():
@@ -33,8 +34,15 @@ def main():
         assert reflection, 'missing reflection'
         source = out / (variant + '_b.metal')
         assert source.is_file()
-        subprocess.run(['xcrun', 'metal', '-fmetal-math-mode=safe', source, '-o', out / 'exit.metallib'], check=True)
-        assert (out / 'exit.metallib').stat().st_size > 0
+        duplicate = out / 'duplicate.metal'
+        duplicate.write_bytes(source.read_bytes())
+        libraries = out / 'libraries'
+        assert compile_libraries([source, duplicate], libraries, 2) == 1
+        compiled = list(libraries.glob('*.metallib'))
+        assert len(compiled) == 1 and compiled[0].stat().st_size > 0
+        modified = compiled[0].stat().st_mtime_ns
+        assert compile_libraries([source, duplicate], libraries, 2) == 0
+        assert compiled[0].stat().st_mtime_ns == modified
         print(json.dumps(dict(status='pass', stages=['native translator', 'SPIRV-Cross', 'Metal compiler'],
                               scope='synthetic EXIT compute shader; no game or GPU execution')))
 

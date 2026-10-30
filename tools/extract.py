@@ -287,8 +287,9 @@ def main():
     if not (args.base and args.keys and args.update and args.work):
         config = tomllib.loads(args.config.read_text(encoding='utf-8'))
     given = config.get('input', {})
-    base, keys = args.base or Path(given['base']), args.keys or Path(given['keys'])
-    updates = args.update or given.get('updates', [])
+    base = (args.base or Path(given['base'])).expanduser()
+    keys = (args.keys or Path(given['keys'])).expanduser()
+    updates = [Path(path).expanduser() for path in (args.update or given.get('updates', []))]
     work = args.work or ROOT / config.get('work', {}).get('dir', 'build')
     extracted, logs = work / 'extracted', work / 'logs'
     logs.mkdir(parents=True, exist_ok=True)

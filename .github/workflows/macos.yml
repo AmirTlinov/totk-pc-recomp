@@ -42,7 +42,11 @@ jobs:
           python tests/macos_save_test.py -v
           python tests/macos_layout_test.py -v
           python tests/macos_benchmark_test.py -v
+          python tests/macos_build_test.py -v
+          python tests/macos_trace_test.py -v
           build/macos-arm64/probes-v143/totk-native --probe-policy
+          build/macos-arm64/probes-v143/totk-native --probe-clock
+          build/macos-arm64/probes-v143/totk-native --probe-pool-cache
           build/macos-arm64/probes-v143/totk-native --probe-save
       - name: ARM64 calling convention
         run: |

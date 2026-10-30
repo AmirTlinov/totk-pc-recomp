@@ -27,7 +27,9 @@ static int fault(const char *step) {
 static int sync_path(const char *path, int directory) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | (directory ? O_DIRECTORY : 0));
     if (fd < 0) return -1;
-    int r = directory ? fsync(fd) : fcntl(fd, F_FULLFSYNC);
+    // The final publication barrier flushes the drive's entire queue, including
+    // every file synced here. Draining that queue once per file stalls saves.
+    int r = fsync(fd);
     int error = errno;
     close(fd);
     errno = error;

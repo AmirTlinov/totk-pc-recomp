@@ -31,6 +31,10 @@ build/macos-arm64/v143/TotK Recomp.app
 
 When verified extraction already exists, use `--prepare-game --package` instead of `--extract --package`. Later builds can use `--package` alone. Use `--version v121` for 1.2.1. The builder uses the same pinned sources for both versions. Its source checkout in `refs/` remains untouched; changes are applied to an ignored export.
 
+The host uses `-O3`, ThinLTO with an incremental linker cache, and dead stripping. Diagnostic entry points and probe objects are excluded from the game build. Source exports preserve timestamps only for unchanged bytes, so editing one patch does not rebuild unrelated objects. Static-library and compiler changes invalidate their consumers.
+
+Shader preparation deduplicates identical MSL and reuses atomically published metallibs under a compiler/toolchain identity. These assets live outside the replaceable source export. An unchanged shader does not start the Metal compiler again.
+
 The signature is ad hoc for local use. Public distribution/notarization is a separate signing process. The playable app contains the player's game data and stays local.
 
 ## Build without game files
@@ -43,6 +47,8 @@ PYTHONPATH=tools .venv-py314/bin/python -m macos.shaders
 .venv-py314/bin/python tests/macos_save_test.py -v
 .venv-py314/bin/python tests/macos_layout_test.py -v
 .venv-py314/bin/python tests/macos_benchmark_test.py -v
+.venv-py314/bin/python tests/macos_trace_test.py -v
+.venv-py314/bin/python tests/macos_build_test.py -v
 ```
 
 `TotK Recomp Diagnostics.app` contains the real compiled host and renderer with explicit empty game tables. It refuses game boot. `--selftest` checks native execution and Metal 4 capability. The GPU runner tests masked clears, depth/stencil, resource aliasing/lifetimes, uniform snapshots, bindings and render-stream behavior under Metal validation; each run keeps separate logs. The shader test uses a synthetic Maxwell kernel through the native translator, SPIRV-Cross and Apple's Metal compiler. It contains no game shader.
@@ -59,7 +65,9 @@ The macOS CI job builds both version configurations and checks CPU calls, save f
 
 ## Rendering and measurement
 
-The default profile fixes scene and output to 3840x2160, requests 144 Hz presentation, bounds the present queue to two tickets and disables MetalFX scaling/interpolation and experimental invisible-draw skipping. Runtime scaling/graphics toggles are locked. Required shader/pipeline failures stop strict rendering. The clock uses elapsed time without the upstream 120 Hz minimum-step clamp. Shader arithmetic keeps separate rounding; the native translator excludes Windows patch 0008 because it changes a support-buffer ABI the Metal host does not implement.
+The default profile fixes scene and output to 3840x2160, requests 144 Hz presentation, bounds the present queue to two tickets and disables MetalFX scaling/interpolation and experimental invisible-draw skipping. Runtime scaling/graphics toggles are locked. Required shader/pipeline failures stop strict rendering. The clock uses `CLOCK_UPTIME_RAW` without the upstream 120 Hz minimum-step clamp or per-call initialization and gate counters. Shader arithmetic keeps separate rounding; the native translator excludes Windows patch 0008 because it changes a support-buffer ABI the Metal host does not implement.
+
+Repeated argument addresses, exact pool lookups and uniform snapshot lookups use validated caches. GPU probes compare cached results with the authoritative path, including invalidation and encoder changes. The idle GPU spin-kernel thread defaults off. `TOTK_GPU_KEEPALIVE`, `TOTK_ARG_BIND_CACHE`, `TOTK_POOL_QUERY_CACHE` and `TOTK_USNAP_INDEX` remain explicit environment controls for profiling; a microbenchmark win does not establish a gameplay win.
 
 `TOTK_NATIVE_4K144=0` enables upstream diagnostic behavior. Such a run cannot satisfy strict acceptance.
 
@@ -74,6 +82,8 @@ PYTHONPATH=tools .venv-py314/bin/python -m macos.benchmark build/gameplay.csv \
 
 Select the measured gameplay segment explicitly; the analyzer reports excluded frames. Keep cold-start/shader preparation and steady gameplay captures separate. A gameplay segment must last at least 60 seconds. Every frame must have its own verified scene/output/drawable dimensions, a unique game-frame ID and a consecutive presentation ticket. Unknown scene coverage, repeats and dropped tickets fail acceptance. Average presented FPS must reach 144 and p99 must fit 6.944444 ms; tolerance covers only CSV timestamp quantization and floating point precision, reported in nanoseconds.
 
+Presentation callbacks enqueue immutable records; a dedicated writer formats and buffers CSV. It flushes at least once per second while active, and normal window close drains the queue. An abrupt process failure may lose the tail. Queue overflow or I/O failure stops the capture instead of silently dropping records. With tracing disabled the present path does not capture frame metadata.
+
 These timing and dimension checks still need visual acceptance at a physical 4K/144 display mode: fixed allocation dimensions alone do not prove viewport coverage or image fidelity. Check the same saves/routes for terrain, transparencies, shadows, UI, physics, cloth, input latency and audio. Dynamic resolution, frame generation and reused frames cannot count toward the target. No target result is inferred from GPU probes or from another machine.
 
 ## Player files and saves
@@ -84,6 +94,8 @@ These timing and dimension checks still need visual acceptance at a physical 4K/
 | Shader cache | `~/Library/Caches/TotKRecomp/<version>/<toolchain-OS-GPU identity>/` |
 | Logs | `~/Library/Logs/TotKRecomp/` |
 
-Only one local app instance can own the player profile. A save writes to `save-tx/work`. Commit snapshots it with APFS copy-on-write, flushes data, atomically exchanges the committed directory, flushes publication metadata and completes a full drive barrier before returning success. Failures return to the game and retain working data. Last writable-mount unmount rolls back to the committed generation; dirty work is kept in a recovery directory. Read-only mounts cannot modify either generation. Clean restarts do not accumulate recovery copies.
+Only one local app instance can own the player profile. A save writes to `save-tx/work`. Commit snapshots it with APFS copy-on-write, calls `fsync` on the files, atomically exchanges the committed directory, flushes publication metadata and completes one checked `F_FULLFSYNC` drive barrier before returning success. This barrier also persists every preceding file sync on the device. Failures return to the game and retain working data. Last writable-mount unmount rolls back to the committed generation; dirty work is kept in a recovery directory. Read-only mounts cannot modify either generation. Clean restarts do not accumulate recovery copies.
+
+RomFS streaming has a separate handle-lifetime lock. Save publication cannot block asset reads, and closing an overlay file waits for its readers before releasing the descriptor.
 
 The previous committed generation and interrupted recovery work remain under the profile. Recovery copies are deliberate player data; they are never silently pruned. Fault-injection tests cover copy/flush/publication failures and process termination. They do not simulate physically removing power from the storage device.

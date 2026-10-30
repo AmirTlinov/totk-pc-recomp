@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import build_xlate
 from macos.build import BUILD, ROOT, digest, run, stage_sources, write, library_prefix
@@ -23,12 +24,10 @@ def build_tools(tree, jobs):
     work.mkdir(parents=True, exist_ok=True)
     build_xlate.verify_vendor()
     identity = hashlib.sha256(build_xlate.identity().encode())
-    identity.update((tree.parent.parent / '.source-id').read_bytes())
     source = tree / 'tools/totk_xlate'
     for p in sorted([*source.glob('*.cs'), source / 'totk_xlate.csproj', Path(__file__)]):
         identity.update(p.name.encode()); identity.update(p.read_bytes())
     identity.update(subprocess.check_output(['dotnet', '--version']))
-    identity.update(SPIRV_PIN.encode())
     stamp = work / 'source.id'
     service = work / 'service/totk_xlate'
     if not service.is_file() or not stamp.is_file() or stamp.read_text() != identity.hexdigest():
@@ -60,11 +59,8 @@ def build_tools(tree, jobs):
         run(['dotnet', 'publish', project / 'totk_xlate.csproj', '-c', 'Release', '-r', 'osx-arm64',
              '-p:PublishAot=true', '-p:InvariantGlobalization=true', '-p:AppleMinOSVersion=26.0', f'-p:RyuSrc={vendor}',
              '-o', service.parent], env=dict(os.environ, MACOSX_DEPLOYMENT_TARGET='26.0', LIBRARY_PATH=str(static)))
+        run(['codesign', '--force', '--sign', '-', service])
         write(stamp, identity.hexdigest())
-    # Include the actual native binary in the cache namespace as well as sources.
-    run(['codesign', '--force', '--sign', '-', service])
-    cache_id = hashlib.sha256((identity.hexdigest() + digest(service)).encode()).hexdigest()
-    write(service.with_suffix('.id'), cache_id + '\n')
     link(tree / 'build/shader-service', service.parent)
     src = work / 'SPIRV-Cross'
     if not src.exists():
@@ -92,34 +88,55 @@ def build_tools(tree, jobs):
             list(pool.map(compile_one, SPIRV_SOURCES))
         run(['xcrun', 'clang++', '-arch', 'arm64', '-mmacosx-version-min=26.0',
              *[out / (name + '.o') for name in SPIRV_SOURCES], '-o', binary])
+        run(['codesign', '--force', '--sign', '-', binary])
         write(cross_stamp, cross_identity)
     link(tree / 'build/spirv-cross', out)
     for executable in (service, binary):
         run(['lipo', '-verify_arch', 'arm64', executable])
-        run(['codesign', '--force', '--sign', '-', executable])
         dependencies = subprocess.check_output(['otool', '-L', executable], text=True).splitlines()[1:]
         if any(not line.strip().startswith(('/usr/lib/', '/System/Library/')) for line in dependencies):
             raise RuntimeError(f'Native helper has an unbundled dependency: {executable}')
-    cache_id = hashlib.sha256((identity.hexdigest() + digest(service) + digest(binary)).encode()).hexdigest()
+    metal = subprocess.check_output(['xcrun', 'metal', '--version'], text=True)
+    cache_id = hashlib.sha256((identity.hexdigest() + digest(service) + digest(binary) + metal).encode()).hexdigest()
     write(service.with_suffix('.id'), cache_id + '\n')
     return service, binary
 
 
+def compile_libraries(sources, libraries, jobs):
+    """Compile each distinct MSL once; publish only complete cache entries."""
+    libraries.mkdir(parents=True, exist_ok=True)
+    def compile_shader(item):
+        sha, source = item
+        out = libraries / (sha + '.metallib')
+        if out.is_file() and out.stat().st_size:
+            return 0
+        with tempfile.TemporaryDirectory(dir=libraries, prefix='compile-') as temporary:
+            compiled = Path(temporary) / 'shader.metallib'
+            run(['xcrun', 'metal', '-fmetal-math-mode=safe', '-o', compiled, source])
+            compiled.replace(out)
+        return 1
+    unique = {digest(source): source for source in sources}
+    with ThreadPoolExecutor(jobs) as pool:
+        return sum(pool.map(compile_shader, unique.items()))
+
+
 def prepare_shaders(tree, version, jobs):
     service, cross = build_tools(tree, jobs)
+    # Runtime source exports may be replaced; immutable compiled assets survive.
+    seeds = BUILD / 'shader-seed'
+    seeds.mkdir(exist_ok=True)
+    link(tree / 'build/shader-seed', seeds)
     seed = tree / f'build/shader-seed/{version}'
     run([sys.executable, tree / 'scripts/prepare_shader_seed.py', '--romfs', tree / f'extracted/{version}/romfs',
          '--output', seed, '--translator', service, '--spirv-cross', cross, '--version', version,
          '--modules', tree / f'rewritten/{version}'], cwd=tree)
     run([sys.executable, tree / 'scripts/shader_list.py', 'export', tree / 'assets/shader_list.tsv',
          tree / 'build/pso_manifest.tsv', tree / 'build/pso_title.tsv'], cwd=tree)
-    libraries = tree / 'build/shader-libs'
+    compiler_id = hashlib.sha256((service.with_suffix('.id').read_text() + '-fmetal-math-mode=safe').encode()).hexdigest()
+    libraries = BUILD / 'shader-libs' / compiler_id
     libraries.mkdir(parents=True, exist_ok=True)
-    def compile_shader(source):
-        out = libraries / (digest(source) + '.metallib')
-        run(['xcrun', 'metal', '-fmetal-math-mode=safe', '-o', out, source])
-    with ThreadPoolExecutor(jobs) as pool:
-        list(pool.map(compile_shader, sorted(seed.glob('*.metal'))))
+    link(tree / 'build/shader-libs', libraries)
+    compile_libraries(sorted(seed.glob('*.metal')), libraries, jobs)
     write(seed / 'translator.id', service.with_suffix('.id').read_text())
 
 

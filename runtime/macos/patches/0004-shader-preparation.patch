@@ -1,0 +1,33 @@
+--- a/scripts/make_output_res_overlay.py
++++ b/scripts/make_output_res_overlay.py
+@@ -27,6 +27,8 @@
+ def extra_kib(w, h):
+     """KiB added to DynamicTextureAllocatorMem (and to Graphics, and to the application pool) for a w x h output."""
+     ratio = w * h / (BASE_W * BASE_H)
++    if (w, h) == (3840, 2160):
++        ratio += w * h / (1600 * 900) - 1
+     if ratio <= 1: return 0
+     return math.ceil(DTA_KIB * ratio / 1024) * 1024 - DTA_KIB
+ 
+--- a/scripts/verify_rewrites.py
++++ b/scripts/verify_rewrites.py
+@@ -87,7 +87,7 @@
+             gate([sys.executable, str(ROOT / 'scripts/test_v143_atomics.py')], atomic_json, environment)
+         else:
+             gate([sys.executable, str(ROOT / 'scripts/test_exclusive_windows.py'), str(outputs), str(inputs[0]), "--version", version], atomic_json, environment)
+-        gate(['make', 'probe-call'], analysis / 'native-call-build.log', environment)
++        gate(['make', 'probe-call', f'PY={sys.executable}'], analysis / 'native-call-build.log', environment)
+     if not re.search(r'^OK$', call_log.read_text(), re.M):
+         raise RuntimeError('Prepared-call differential tests did not pass')
+     atomic = json.loads(atomic_json.read_text())
+--- a/tools/totk_xlate/Service.cs
++++ b/tools/totk_xlate/Service.cs
+@@ -289,7 +289,7 @@
+         // DebugMode (AST optimizer off) since 2026-10-13: --debug-mode / TOTK_SHADER_DEBUGMODE, as in shader_service.py
+         var job = new JsonObject
+         {
+-            ["key"] = variant, ["stage"] = stage, ["code"] = (string)rq["code"], ["c1"] = GetStr(rq, "c1", ""), ["debug"] = debugMode != 0, ["reduced"] = true,
++            ["key"] = variant, ["stage"] = stage, ["code"] = (string)rq["code"], ["c1"] = GetStr(rq, "c1", ""), ["debug"] = debugMode != 0, ["reduced"] = false,
+             ["tex"] = GetObj(rq, "tex").DeepClone(), ["img"] = GetObj(rq, "img").DeepClone(), ["attr"] = GetObj(rq, "attr").DeepClone(), ["fout"] = GetObj(rq, "fout").DeepClone(),
+         };
+         if (Truthy(Get(rq, "local"))) job["local"] = rq["local"].DeepClone();

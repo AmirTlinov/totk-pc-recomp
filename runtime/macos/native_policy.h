@@ -14,4 +14,8 @@ typedef struct {
 void native_check_scene(uint64_t frame, unsigned width, unsigned height);
 NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigned dw, unsigned dh);
 void native_presented(uint64_t ticket, NativeFrame frame, double seconds);
+void native_trace_init(void);
+void native_trace_finish(void);
+int native_trace_active(void);
+_Noreturn void native_exit(int status);
 int native_run_probe(const char *name);

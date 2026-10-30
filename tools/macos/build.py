@@ -6,6 +6,7 @@ objects live under build/macos-arm64; no build command runs inside refs/.
 from __future__ import annotations
 
 import argparse
+import filecmp
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import tempfile
 import tomllib
 import fcntl
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,7 @@ gate.S hle_stack.S hle_stack.c thread_enter.S gfx_bridge.c frontend.m account.c 
 motion_fusion.c autoload.c gamepad.m gamepad_feedback.m gfx_probe.c vpool_probe.m gpu_path_probe.m
 memory_probe.c shared_font.c ipc.c audio_renderer.c audio_mixer.c audio_reverb.c audio_effects.c fs_host.c
 opus_codec.c movie_host.c time_host.c applet_host.c swkbd_host.c'''.split()
+PROBE_SOURCES = {'gfx_probe.c', 'vpool_probe.m', 'gpu_path_probe.m', 'memory_probe.c'}
 FRAMEWORKS = '''Metal MetalFX Foundation QuartzCore ImageIO CoreGraphics CoreText UniformTypeIdentifiers
 Cocoa CoreVideo CoreFoundation AudioToolbox GameController CoreHaptics IOKit'''.split()
 
@@ -82,6 +85,21 @@ def stage_sources():
         return _stage_sources()
 
 
+def preserve_source_times(tree, previous):
+    """Keep unchanged inputs incremental; changed archive files must look new."""
+    for new in tree.rglob('*'):
+        if not new.is_file():
+            continue
+        old = previous / new.relative_to(tree)
+        if old.is_file() and filecmp.cmp(new, old, shallow=False):
+            stat = old.stat()
+            os.utime(new, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        else:
+            # A removed patch restores the upstream commit's OLD archive time.
+            # Touch changed bytes so Ninja cannot reuse a newer, patched object.
+            os.utime(new, None)
+
+
 def _stage_sources():
     """Export committed inputs, ignoring local modifications in the reference checkout."""
     pin = mng_pin()
@@ -92,7 +110,7 @@ def _stage_sources():
     for p in patches:
         identity.update(p.name.encode())
         identity.update(p.read_bytes())
-    identity.update(Path(__file__).read_bytes())
+    identity.update(b'macos-source-export-v2')
     source = BUILD / 'source'
     stamp = source / '.source-id'
     if stamp.is_file() and stamp.read_text() == identity.hexdigest():
@@ -102,12 +120,16 @@ def _stage_sources():
         temp = Path(temporary)
         archive = temp / 'source.tar'
         with archive.open('wb') as out:
-            run(['git', '-C', REF, 'archive', pin, 'games/totk', 'vendor/ryujinx', 'LICENSE'], stdout=out)
+            run(['git', '-C', REF, 'archive', pin, 'games/totk', 'LICENSE'], stdout=out)
         with tarfile.open(archive) as tar:
             tar.extractall(temp / 'tree', filter='data')
         tree = temp / 'tree'
         for patch in patches:
             run(['git', 'apply', '--unsafe-paths', '--directory', str(tree / 'games/totk'), patch], cwd=ROOT)
+        # Preserve Ninja's dependencies when another patched file changes.
+        # git archive gives unmodified sources stable mtimes; patched files need
+        # this byte comparison because git apply otherwise touches all of them.
+        preserve_source_times(tree, source)
         write(tree / '.source-id', identity.hexdigest())
         if source.exists():
             shutil.rmtree(source)
@@ -123,6 +145,7 @@ def ninja_path(value):
     return str(value).replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
 
 
+@cache
 def library_prefix(name, archive):
     """Reject dependencies whose deployment target exceeds our macOS minimum."""
     preferred = Path(subprocess.check_output(['brew', '--prefix', name], text=True).strip())
@@ -172,45 +195,59 @@ def compile_runtime(tree, out, version, jobs, probes):
             set(prepared.get('headers', {})) != required or
             any(not (out / name).is_file() or digest(out / name) != sha for name, sha in prepared['headers'].items())):
             raise RuntimeError('Native preparation is stale or changed; run --prepare-game again')
-    includes = [tree / 'third_party/d2r_gfx/gfx/nvn/include', out, INTEGRATION]
+    includes = [tree / 'third_party/d2r_gfx/gfx/nvn/include', tree / 'third_party/d2r_gfx/gfx/nvn', out, INTEGRATION]
     libs = []
     for name, inc in [('opus', 'include/opus'), ('libvpx', 'include')]:
         archive = 'libopus.a' if name == 'opus' else 'libvpx.a'
         prefix = library_prefix(name, archive)
         includes.append(prefix / inc)
         libs.append(prefix / 'lib' / archive)
-    flags = ['-arch', 'arm64', '-mmacosx-version-min=26.0', '-std=gnu11', '-O2', '-g',
+    flags = ['-arch', 'arm64', '-mmacosx-version-min=26.0', '-std=gnu11', '-O3', '-flto=thin', '-g',
              '-fno-strict-aliasing', '-Wall', '-Wextra', '-Wno-deprecated-declarations',
              '-Wno-unused-function', '-Wno-unused-parameter', '-fobjc-arc', f'-DTOTK_GAME_{version.upper()}=1']
     flags += [f'-I{p}' for p in includes]
+    if probes:
+        flags.append('-DTOTK_PROBE_BUILD=1')
     sources = [tree / 'runtime' / ('game_patches_v143.c' if s == 'game_patches.c' and version == 'v143' else s)
-               for s in RUNTIME_SOURCES]
+               for s in RUNTIME_SOURCES if probes or s not in PROBE_SOURCES]
     gfx = tree / 'third_party/d2r_gfx/gfx'
     sources += sorted(p for d in ('nvn', 'tex') for p in (gfx / d).iterdir() if p.suffix in ('.c', '.m', '.S'))
     sources += sorted(p for p in INTEGRATION.iterdir() if p.suffix in ('.c', '.m') and p.name != 'launcher.m')
-    objects = [out / 'obj' / f'{i}-{p.name}.o' for i, p in enumerate(sources)]
+    objects = [out / 'obj' / f'{p.name}.o' for p in sources]
+    if len(set(objects)) != len(objects):
+        raise RuntimeError('Native source basenames must be unique')
+    compiler = subprocess.check_output(['xcrun', 'clang', '--version'], text=True).strip()
+    compiler_stamp = out / 'compiler.id'
+    write(compiler_stamp, compiler + '\n')
+    lto_cache = out / 'lto-cache'
+    lto_cache.mkdir(exist_ok=True)
     lines = ['ninja_required_version = 1.10',
              f'flags = {" ".join(quote(x) for x in flags)}',
              'rule cc', '  command = xcrun clang $flags -MMD -MF $out.d -c $in -o $out',
              '  depfile = $out.d', '  deps = gcc', '  description = CC $in', 'rule link',
-             '  command = xcrun clang -arch arm64 -mmacosx-version-min=26.0 $in ' +
+             '  command = xcrun clang -arch arm64 -mmacosx-version-min=26.0 -flto=thin -Wl,-dead_strip ' +
+             quote(f'-Wl,-cache_path_lto,{lto_cache}') + ' $in ' +
              ' '.join(quote(p) for p in libs) + ' ' +
-             ' '.join(f'-framework {f}' for f in FRAMEWORKS) + ' -o $out', '  description = LINK $out']
+             ' '.join(f'-framework {f}' for f in FRAMEWORKS) +
+             ' -o $out && codesign --force --sign - $out', '  description = LINK $out']
     for src, obj in zip(sources, objects):
         obj.parent.mkdir(parents=True, exist_ok=True)
-        lines.append(f'build {ninja_path(obj)}: cc {ninja_path(src)}')
+        lines.append(f'build {ninja_path(obj)}: cc {ninja_path(src)} | {ninja_path(compiler_stamp)}')
+    for obsolete in (out / 'obj').glob('*.o'):
+        if obsolete not in objects:
+            obsolete.unlink()
     binary = out / 'totk-native'
-    lines += [f'build {ninja_path(binary)}: link ' + ' '.join(ninja_path(p) for p in objects),
+    lines += [f'build {ninja_path(binary)}: link ' + ' '.join(ninja_path(p) for p in objects) +
+              ' | ' + ' '.join(ninja_path(p) for p in libs),
               f'default {ninja_path(binary)}']
     write(out / 'build.ninja', '\n'.join(lines) + '\n')
     run(['ninja', '-f', out / 'build.ninja', '-j', jobs], cwd=out)
-    run(['codesign', '--force', '--sign', '-', binary])
     inputs = {str(p.relative_to(ROOT)): digest(p) for folder in (INTEGRATION, ROOT / 'tools/macos')
               for p in sorted(folder.rglob('*')) if p.is_file() and '__pycache__' not in p.parts}
     inputs['recomp/layout.py'] = digest(ROOT / 'recomp/layout.py')
     write(out / 'build-info.json', json.dumps({'target': 'macos-arm64', 'version': version, 'inputs': inputs,
           'libraries': {str(p): digest(p) for p in libs},
-          'compiler': subprocess.check_output(['xcrun', 'clang', '--version'], text=True).splitlines()[0],
+          'compiler': compiler.splitlines()[0],
           'upstream': mng_pin(), 'source_id': (tree.parent.parent / '.source-id').read_text(),
           'probe_only': probes, 'binary_sha256': digest(binary)}, indent=2) + '\n')
     return binary
