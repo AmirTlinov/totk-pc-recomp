@@ -180,3 +180,8 @@
 # takes longer than flight_spike_ms (0 to 60000).
 # flight = 0
 # flight_spike_ms = 100
+# Largest render target (bytes, 0 to 1073741824) that goes back to its game memory when the game waits for a GPU fence.
+# A game that reads a larger target without invalidating it sees stale bytes at the default. With trace = gfx the log
+# names each dirty target over the limit that stays on the GPU ("fence write-back skipped-for-size") and each one over
+# 65536 bytes that went back ("over-default"). Raising it costs a copy per such target and wait.
+# wb_fence_limit = 65536
