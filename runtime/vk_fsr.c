@@ -99,7 +99,11 @@ static void free_images(VkCtx *c) {
 
 static int ensure_images(VkCtx *c, uint32_t w, uint32_t h) {
     if (F.img[0] && F.w == w && F.h == h) return 1;
-    vkDeviceWaitIdle(c->device);   // a swapchain size change: earlier presents may still read the old images
+    // A swapchain size change: earlier presents may still read the old images. vkDeviceWaitIdle needs every queue
+    // externally synchronized, so it holds the queue lock like a submission.
+    vk_queue_lock();
+    vkDeviceWaitIdle(c->device);
+    vk_queue_unlock();
     free_images(c);
     for (int i = 0; i < 2; i++) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,

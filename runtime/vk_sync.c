@@ -314,6 +314,7 @@ VkCommandBuffer vk_sync_split(void) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(s->cb, &bi);
+    vk_crumb(s->cb, VK_CRUMB_SUBMIT, cur_fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
     return s->cb;
@@ -342,11 +343,13 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     uint64_t t0 = perf_begin();
     vkBeginCommandBuffer(s->cb, &bi);
+    vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     rec_end();
+    vk_crumb(s->cb, VK_CRUMB_SUBMIT_END, fence);   // the recorder is done with the part
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
     vkEndCommandBuffer(s->cb);
