@@ -203,7 +203,7 @@ class Check(Step):
             raise InstallError('check.dest_not_folder', path=str(dest))
         if ctx.mode == 'install' and dest.is_dir() and any(dest.iterdir()):
             raise InstallError('check.dest_not_empty', path=str(dest))
-        lang = ctx.options.lang or ctx.state.get('lang')
+        lang = ini.canonical_language(ctx.options.lang or ctx.state.get('lang'))
         if not lang:
             raise InstallError('check.lang_missing')
         if lang not in ini.LANGUAGES:
