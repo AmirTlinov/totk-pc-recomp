@@ -217,6 +217,16 @@ class IniTest(unittest.TestCase):
         self.assertEqual(ini.set_language('[language]\nlocale = de-DE\n', 'fr'),
                          '[language]\nlang = fr\nlocale = de-DE\n')
 
+    def test_old_chinese_codes_are_written_as_the_canonical_ones(self):
+        self.assertEqual(ini.canonical_language('zh-CN'), 'zh-Hans')
+        self.assertEqual(ini.canonical_language('zh-TW'), 'zh-Hant')
+        self.assertEqual(ini.canonical_language('ja'), 'ja')
+        self.assertNotIn('zh-CN', ini.LANGUAGES)
+        self.assertNotIn('zh-TW', ini.LANGUAGES)
+        out = ini.set_language(self.EXAMPLE, 'zh-CN')
+        self.assertEqual(ini.get_language(out), 'zh-Hans')
+        self.assertEqual(ini.get_language(ini.set_language(out, 'zh-TW')), 'zh-Hant')
+
     def test_write_keeps_user_lines(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
