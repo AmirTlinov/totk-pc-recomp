@@ -14,7 +14,7 @@ from macos.build import BUILD
 
 def main():
     service = BUILD / 'shader-toolchain/service/totk_xlate'
-    cross = BUILD / 'shader-toolchain/spirv-cross/spirv-cross'
+    cross = BUILD / 'shader-toolchain/spirv-cross-build/spirv-cross'
     with tempfile.TemporaryDirectory(dir=BUILD, prefix='shader-test-') as tmp:
         out = Path(tmp)
         code = out / 'exit.bin'

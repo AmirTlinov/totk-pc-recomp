@@ -77,7 +77,8 @@ def build_tools(tree, jobs):
     # Consume only committed files, just as for the native runtime.
     if subprocess.check_output(['git', '-C', src, 'status', '--porcelain']):
         raise RuntimeError('SPIRV-Cross checkout has local modifications')
-    out = work / 'spirv-cross'
+    # APFS is usually case-insensitive: "spirv-cross" aliases "SPIRV-Cross".
+    out = work / 'spirv-cross-build'
     out.mkdir(exist_ok=True)
     binary = out / 'spirv-cross'
     flags = ['-arch', 'arm64', '-mmacosx-version-min=26.0', '-std=c++11', '-O3', '-DNDEBUG', '-Wno-deprecated-declarations']
