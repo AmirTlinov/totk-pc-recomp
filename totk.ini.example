@@ -95,7 +95,8 @@
 [display]
 # Presentation mode: mailbox (default when the driver offers it, vsync otherwise), fifo (vsync) or immediate.
 # vk_present = mailbox
-# Window client area in pixels (640x360 to 7680x4320), and borderless fullscreen. F11 switches fullscreen and saves it
+# Window client area in screen pixels (640x360 to 7680x4320), and borderless fullscreen. Windows display scaling does
+# not apply: at 150% scale, 1920x1080 covers the area 1280x720 covers at 100%. F11 switches fullscreen and saves it
 # here. Changes while the game runs take effect at once.
 # window_size = 1920x1080
 # fullscreen = 0
