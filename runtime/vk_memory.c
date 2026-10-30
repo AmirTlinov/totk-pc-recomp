@@ -1722,7 +1722,10 @@ uint64_t vk_upload_flush(int wait) {
         vk_queue_lock();
         VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
         vk_queue_unlock();
-        if (r != VK_SUCCESS) rt_fatal("vk: upload submit failed (%d)", (int)r);
+        if (r != VK_SUCCESS) {
+            vk_device_fault_report(r);
+            rt_fatal("vk: upload submit failed (%d)", (int)r);
+        }
         if (ninflight == cap_inflight) grow((void **)&inflight, &cap_inflight, sizeof *inflight);
         inflight[ninflight++] = open_b;
         open_active = 0;

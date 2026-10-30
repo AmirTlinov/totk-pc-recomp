@@ -267,6 +267,7 @@ static int create_device(void) {
     else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -363,6 +364,64 @@ void vk_shutdown(void) {
 }
 
 VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }
+
+static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
+    switch (t) {
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "read invalid";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "write invalid";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "execute invalid";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+    default: return "unknown type";
+    }
+}
+
+// The query runs once per process. Threads that hit the loss at the same time wait on the lock until it is logged, so
+// none of them reaches its rt_fatal and ends the process before the report is written.
+void vk_device_fault_report(VkResult r) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static int done;
+    if (r != VK_ERROR_DEVICE_LOST) return;
+    AcquireSRWLockExclusive(&lock);
+    if (done) { ReleaseSRWLockExclusive(&lock); return; }
+    done = 1;
+    VkCtx *c = vk_ctx();
+    PFN_vkGetDeviceFaultInfoEXT get =
+        c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(c->device, "vkGetDeviceFaultInfoEXT")
+                                 : NULL;
+    if (!get) {
+        rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"
+                                                                                                    : "not enabled");
+        ReleaseSRWLockExclusive(&lock);
+        return;
+    }
+    VkDeviceFaultCountsEXT n = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult q = get(c->device, &n, NULL);
+    VkDeviceFaultAddressInfoEXT *ai = calloc(n.addressInfoCount + 1, sizeof *ai);
+    VkDeviceFaultVendorInfoEXT *vi = calloc(n.vendorInfoCount + 1, sizeof *vi);
+    VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
+    uint64_t binary = n.vendorBinarySize;
+    n.vendorBinarySize = 0;   // the vendor binary is not fetched; its size alone is logged
+    if (q == VK_SUCCESS && ai && vi) q = get(c->device, &n, &info);
+    if (q != VK_SUCCESS && q != VK_INCOMPLETE) {
+        rt_log("vk: device lost; vkGetDeviceFaultInfoEXT failed (%d)", (int)q);
+    } else {
+        rt_log("vk: device fault: \"%s\" (%u address infos, %u vendor infos, vendor binary %llu bytes)", info.description,
+               n.addressInfoCount, n.vendorInfoCount, (unsigned long long)binary);
+        // The faulting access lies in the precision-aligned range around the reported address.
+        for (uint32_t i = 0; i < n.addressInfoCount; i++)
+            rt_log("vk: device fault address %u: %s at %#llx, precision %#llx", i, fault_address_type(ai[i].addressType),
+                   (unsigned long long)ai[i].reportedAddress, (unsigned long long)ai[i].addressPrecision);
+        for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+            rt_log("vk: device fault vendor info %u: \"%s\" code %#llx data %#llx", i, vi[i].description,
+                   (unsigned long long)vi[i].vendorFaultCode, (unsigned long long)vi[i].vendorFaultData);
+    }
+    free(ai);
+    free(vi);
+    ReleaseSRWLockExclusive(&lock);
+}
 
 int vk_selftest(void) {
     if (!vk_init()) return 1;
