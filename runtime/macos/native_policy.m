@@ -24,6 +24,9 @@ void native_policy_init(void) {
     const struct { const char *key, *value; } defaults[] = {
         {"TOTK_GPU_KEEPALIVE", "0"}, {"TOTK_ARG_BIND_CACHE", "1"},
         {"TOTK_POOL_QUERY_CACHE", "1"}, {"TOTK_USNAP_INDEX", "1"},
+        // Speculative pipeline scans compile mostly unused render states.
+        // Keep the recorded startup cache and compile new states on demand.
+        {"TOTK_PSO_PREDICT", "0"},
     };
     for (unsigned i=0; i<sizeof defaults/sizeof *defaults; ++i)
         if (setenv(defaults[i].key, defaults[i].value, 0)) runtime_fail("set native performance defaults");

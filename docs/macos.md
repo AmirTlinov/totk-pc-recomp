@@ -71,7 +71,7 @@ The default profile fixes scene and output to 3840x2160, requests 144 Hz present
 
 The resolution patches disable the game's dynamic scene multiplier, including 1.2.1's emergency reduction, while preserving each effect's downsample ratio. Original instructions are checked before any write. Scene validation applies to full-canvas composition; smaller inventory and effect targets do not establish the presented scene's dimensions. With local 1.2.1 modules, `python tests/macos_resolution_test.py` executes both size producers against Unicorn.
 
-Repeated argument addresses, exact pool lookups and uniform snapshot lookups use validated caches. GPU probes compare cached results with the authoritative path, including invalidation and encoder changes. The idle GPU spin-kernel thread defaults off. `TOTK_GPU_KEEPALIVE`, `TOTK_ARG_BIND_CACHE`, `TOTK_POOL_QUERY_CACHE` and `TOTK_USNAP_INDEX` remain explicit environment controls for profiling; a microbenchmark win does not establish a gameplay win.
+Repeated argument addresses, exact pool lookups and uniform snapshot lookups use validated caches. GPU probes compare cached results with the authoritative path, including invalidation and encoder changes. The idle GPU spin-kernel thread and speculative pipeline prediction default off. Prediction scans can compile thousands of states that no draw uses; recorded startup pipelines still warm normally, and new states compile on demand. `TOTK_GPU_KEEPALIVE`, `TOTK_PSO_PREDICT`, `TOTK_ARG_BIND_CACHE`, `TOTK_POOL_QUERY_CACHE` and `TOTK_USNAP_INDEX` remain explicit environment controls for profiling; a microbenchmark win does not establish a gameplay win.
 
 `TOTK_NATIVE_4K144=0` enables upstream diagnostic behavior. Such a run cannot satisfy strict acceptance.
 
