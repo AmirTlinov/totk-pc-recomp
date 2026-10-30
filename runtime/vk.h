@@ -36,7 +36,7 @@ typedef struct VkCtx {
     int validation;                         // layer active
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
-        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock,
+        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
         has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
@@ -56,8 +56,11 @@ typedef struct {
     uint32_t sg_size;                  // requiredSubgroupSize on sg_pin_stages (32)
     VkShaderStageFlags sg_pin_stages;  // 0: no pin, stages run at the device's subgroupSize
     int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (TOTK_GPL=0: off)
+    int amd;                           // an AMD GPU (vendor 0x1002), any driver
+    int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
 } VkCaps;
 extern VkCaps vk_caps;
+void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc
 void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (TOTK_VK_NO_FLOAT64 clears shaderFloat64)
 // Before vkCreateDevice, with the driver's graphics pipeline library feature and properties: sets vk_caps.gpl,
 // 1 = enable the extensions (VK_KHR_pipeline_library, VK_EXT_graphics_pipeline_library) and the feature.
@@ -71,8 +74,20 @@ void vk_shutdown(void);
 int vk_selftest(void);                      // 0 on success
 // Call with the result of a failed queue submit, present or wait before stopping on it: VK_ERROR_DEVICE_LOST logs
 // what VK_EXT_device_fault reports (description, faulting addresses with their precision, vendor codes) once per
-// process. Any other result returns at once.
+// process, after the GPU breadcrumbs (vk_crumbs_report). Any other result returns at once.
 void vk_device_fault_report(VkResult r);
+
+// ---- GPU breadcrumbs (vk_crumbs.c): with VK_AMD_buffer_marker, each crumb has the GPU write its code into host memory
+// twice, when the command processor reaches it and when all work before it has finished. After a lost device the two
+// codes bracket the work that hung. Without the extension every call returns at once.
+enum { VK_CRUMB_SUBMIT = 1, VK_CRUMB_SUBMIT_END, VK_CRUMB_UPLOAD, VK_CRUMB_UPLOAD_END, VK_CRUMB_ASTC, VK_CRUMB_PRESENT,
+       VK_CRUMB_PRESENT_END };
+void vk_crumbs_init(VkCtx *c);       // after the allocator exists
+void vk_crumbs_release(void);
+// Records crumb kind with number n (a timeline value, a batch number; the low 28 bits are kept) into cb. Only the
+// thread that records cb may call it: never into a replay part while the recorder thread owns it (vk_rec.h).
+void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n);
+void vk_crumbs_report(void);         // logs the two codes and what they name
 
 // ---- window and present (gfx_window.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled

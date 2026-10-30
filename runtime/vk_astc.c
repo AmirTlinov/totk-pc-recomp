@@ -104,7 +104,7 @@ static struct {
     VmaAllocation tab_alloc;
     int tab_uploaded;
 } G = {.mode = -1};
-static uint64_t n_dispatch, n_texels;
+static uint64_t n_dispatch, n_texels, n_chunks;   // n_chunks: the breadcrumb number of the next scratch chunk
 
 // TOTK_ASTC_TIME=1 (or vk_astc_time_enable): timestamps around the dispatches of each scratch chunk (the decode
 // alone) and around a whole vk_astc_record call (one texture upload or WriteTexels: copies and barriers included),
@@ -449,6 +449,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
             bcp[i1 - i0] = (VkBufferCopy){rg[i1].src, in, region_in(&rg[i1], bw, bh)};
             in += region_in(&rg[i1], bw, bh), out += region_out(&rg[i1]);
         }
+        vk_crumb(cb, VK_CRUMB_ASTC, ++n_chunks);
         if (chunks)   // the previous chunk's dispatches and image copy are done with the scratch
             mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,

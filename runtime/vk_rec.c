@@ -12,6 +12,7 @@
 #include <string.h>
 #include <windows.h>
 
+#include "cfg.h"
 #include "host.h"
 #include "vk.h"
 
@@ -128,7 +129,13 @@ void rec_drain(void) {
 void rec_begin(VkCommandBuffer cb) {
     static int mode = -1;
     if (mode < 0) {
-        mode = rt_knob("VK_RECORDER", "1");
+        // Default off on AMD GPUs: with the recorder their drivers lost the device within the first frames or at menu
+        // opens, 1 boot in 3 on an RX 9070 XT, and TOTK_VK_RECORDER=0 ended it for three users (issue #5); under RADV
+        // the kernel saw an illegal opcode at the end of a command buffer (issue #40). The cause is not found.
+        const char *set = cfg_get("TOTK_VK_RECORDER");
+        mode = rt_knob("VK_RECORDER", vk_caps.amd ? "0" : "1");
+        if (!mode && vk_caps.amd && !(set && *set))
+            rt_log("vk_rec: no recorder thread on AMD GPUs (TOTK_VK_RECORDER=1 turns it on)");
         if (mode) {
             wake_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
             rec_thread = wake_ev ? CreateThread(NULL, 0, rec_main, NULL, 0, NULL) : NULL;
