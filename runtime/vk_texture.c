@@ -475,6 +475,36 @@ static void sweep_released(void) {
     while (nreleased > RELEASED_MAX && rel_head) destroy_tex(rel_head);
 }
 
+// TOTK_TEX_VRAM_PRESSURE (percent of the device-local budget, default 90; 0 = off): above it, each submit drops up to
+// PRESSURE_STEP of the oldest released entries, so a 4 GiB card does not keep RELEASED_MAX released images (each ASTC
+// one decoded to RGBA8) while the heap spills into system memory. A few per submit, for the reason above. Only entries
+// that come back intact are dropped: mirrored ones the GPU never wrote, re-uploaded from their storage. A render target
+// lives only in its image; dropping it brought the texture back empty (black flashes in a Depths boss fight, ~170
+// "left uninitialised" aliases a minute).
+#define PRESSURE_STEP 32
+static int vram_pressure = -1;
+static uint64_t n_pressure_drops;
+
+static void sweep_pressure(void) {   // tex_lock held
+    if (vram_pressure < 0) {
+        const char *s = cfg_get("TOTK_TEX_VRAM_PRESSURE");
+        vram_pressure = s && *s ? atoi(s) : 90;
+        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
+        rt_log("vk: released textures under VRAM pressure: %s%d%%", vram_pressure ? "dropped above " : "off", vram_pressure);
+    }
+    if (!vram_pressure || !rel_head || submit_epoch & 7) return;   // the budget query every 8 submits
+    uint64_t used, budget;
+    int exact;
+    if (!vk_mem_vram(&used, &budget, &exact) || used <= budget / 100 * (uint64_t)vram_pressure) return;
+    int dropped = 0;
+    for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
+        next = e->rel_next;
+        if (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty) continue;
+        destroy_tex(e);
+        dropped++, n_pressure_drops++;
+    }
+}
+
 // ---------------------------------------------------------------- uploads
 static uint32_t texel_alpha_one(int format, uint32_t *elem) {
     switch (format) {
@@ -1032,6 +1062,7 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 void vk_texture_new_submit(void) {
     lock();
     if (!++submit_epoch) submit_epoch = 1;
+    sweep_pressure();
     static uint64_t log_at;
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) / 60;
     if ((rt_trace & RT_TRACE_PERF) && f != log_at && tex_alias > 0) {
@@ -1050,6 +1081,9 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)ck, (unsigned long long)n_checks, (unsigned long long)calls,
                (unsigned long long)untr);
         n_checks = 0;
+        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu", (unsigned long long)f * 60,
+               nreleased, (unsigned long long)n_pressure_drops);
+        n_pressure_drops = 0;
     }
     unlock();
 }
