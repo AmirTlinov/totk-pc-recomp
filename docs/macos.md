@@ -53,7 +53,7 @@ PYTHONPATH=tools .venv-py314/bin/python -m macos.shaders
 .venv-py314/bin/python tests/macos_build_test.py -v
 ```
 
-`TotK Recomp Diagnostics.app` contains the real compiled host and renderer with explicit empty game tables. It refuses game boot. `--selftest` checks native execution and Metal 4 capability. The GPU runner tests masked clears, depth/stencil, resource aliasing/lifetimes, uniform snapshots, bindings and render-stream behavior under Metal validation; each run keeps separate logs. The shader test uses a synthetic Maxwell kernel through the native translator, SPIRV-Cross and Apple's Metal compiler. It contains no game shader.
+`TotK Recomp Diagnostics.app` contains the real compiled host and renderer with explicit empty game tables. It refuses game boot. `--selftest` checks native execution and Metal 4 capability. The GPU runner tests masked clears, depth/stencil, resource aliasing/lifetimes, uniform snapshots, bindings and render-stream behavior under Metal validation; each run keeps separate logs. `--probe-warm-pipelines` compiles and executes 128 distinct render/compute pipelines with the startup and in-play worker limits. The shader test uses a synthetic Maxwell kernel through the native translator, SPIRV-Cross and Apple's Metal compiler. It contains no game shader.
 
 The native call-window test and hardware probe can also run without game data:
 
@@ -74,6 +74,8 @@ The resolution patches disable the game's dynamic scene multiplier, including 1.
 Repeated argument addresses, exact pool lookups and uniform snapshot lookups use validated caches. GPU probes compare cached results with the authoritative path, including invalidation and encoder changes. The idle GPU spin-kernel thread and speculative pipeline prediction default off. Prediction scans can compile thousands of states that no draw uses; recorded startup pipelines still warm normally, and new states compile on demand. `TOTK_GPU_KEEPALIVE`, `TOTK_PSO_PREDICT`, `TOTK_ARG_BIND_CACHE`, `TOTK_POOL_QUERY_CACHE` and `TOTK_USNAP_INDEX` remain explicit environment controls for profiling; a microbenchmark win does not establish a gameplay win.
 
 `TOTK_NATIVE_4K144=0` enables upstream diagnostic behavior. Such a run cannot satisfy strict acceptance.
+
+Recorded pipeline warm-up compiles independent Metal states in bounded batches, keeping manifest priority. Descriptors and shader variants remain owned by one thread. `TOTK_WARM_THREADS` controls both library and pipeline workers (default up to eight, capped at two during play). New pipelines still compile before the draw that needs them; missing draws are never used to hide compilation delays.
 
 Capture actual drawable presentation timestamps by launching the app executable from a terminal:
 

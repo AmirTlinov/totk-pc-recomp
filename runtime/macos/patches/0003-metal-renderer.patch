@@ -78,7 +78,230 @@
      char buf[4096]; uint32_t n = sizeof buf;
      if (_NSGetExecutablePath(buf, &n)) return nil;
      char *dir = dirname(buf);
-@@ -9432,6 +9440,11 @@
+@@ -4557,6 +4565,15 @@
+ // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
+ @interface WarmItem : NSObject { @public int kind; NSString *key, *vs_key, *fs_key; NvShader *shader, *vs, *fs; pso_key pso; id<MTLFunction> fsfn; id object; } @end
+ @implementation WarmItem @end
++// Descriptors and shader variants are prepared by the warm-up owner. Workers
++// only compile immutable inputs and write their own job's result.
++@interface WarmPipeline : NSObject { @public
++    WarmItem *item;
++    MTLRenderPipelineDescriptor *render;
++    id<MTLFunction> compute;
++    NSError *error;
++} @end
++@implementation WarmPipeline @end
+ static NSMutableDictionary<NSString *, NvShader *> *g_shcache;
+ 
+ /* TOTK (2026-10-17): every c1 read of the shader stays inside its own data, so it can share a bank (c1_store). D2R decides
+@@ -6191,19 +6208,10 @@
+     if (sh) dict[key] = sh; else warm_fail(key);
+     return sh;
+ }
+-/* TOTK (2026-10-18): the warm-up compiles the shader libraries of each block of rows on several threads, then builds the
+-   pipelines of those rows one after another in list order, as before. A cold library takes about 48-92 ms, almost all of it
+-   in the system Metal compiler (one thread: 9,268 libraries 856 s, 3,459 pipelines under 1 s), and the compiler service runs
+-   requests side by side (8 threads: 188 s). That matters on a Mac whose Metal cache has never seen the prepared shaders: a
+-   new Mac, after the system purged the cache, or after the app moved. (Programs without an app bundle -- the game binary is
+-   one -- share one store, keyed by the source, the options and the length of the path of the folder the program runs
+-   from: rebuilding the app in the same place keeps it, moving it does not. The store evicts heavily when any such program
+-   compiles many new libraries, and what one compiles while another that opened it first is running is lost when that
+-   one quits. build_app.py compiles the seed once at packaging time from the game binary's folder, with no other program
+-   using the store: tools/warm_metal_cache.m.) Once the player is in the world (mtl_warm_wait returned) at most 2 threads go on, so the
+-   rest of the warm-up does not take the game's cores. TOTK_WARM_THREADS=<n> (1 = one thread as before); default 8 on the
+-   Mac (at most the core count minus 2), 1 on iOS (prebuilt libraries, nothing to compile). */
+-enum { WARM_BLOCK = 512 };   // rows per block: the shaders of a block load in parallel, then its rows run in order
++/* Keep manifest priority while compiling independent libraries and pipelines in bounded
++   batches. At most two workers continue once play starts. Descriptor creation stays on
++   the warm-up owner because it also updates mutable shader-variant caches. */
++enum { WARM_BLOCK = 512 };
+ static _Atomic int g_warm_in_play;
+ static int warm_threads(void) {
+     static int n; static dispatch_once_t once;
+@@ -6316,6 +6324,112 @@
+     if (runtime_warm_progress && (!(*done % 64) || *done == total))
+         runtime_warm_progress(*done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
+ }
++static void warm_compile_pipelines(NSArray<WarmPipeline *> *jobs) {
++    size_t n = jobs.count, workers = MIN(n, (size_t)warm_threads_now());
++    if (!n) return;
++    warm_par *wp = calloc(1, sizeof *wp);
++    if (!wp) MDIE("pipeline warm-up: out of memory");
++    dispatch_apply(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
++        for (;;) @autoreleasepool {
++            if (w && w >= (size_t)warm_threads_now()) break;
++            size_t i = atomic_fetch_add(&wp->next, 1);
++            if (i >= n) break;
++            WarmPipeline *job = jobs[i];
++            NSError *error = nil;
++            uint64_t started = bp_now();
++            job->item->object = job->render
++                ? [g_dev newRenderPipelineStateWithDescriptor:job->render error:&error]
++                : [g_dev newComputePipelineStateWithFunction:job->compute error:&error];
++            job->error = error;
++            atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - started);
++            atomic_fetch_add(&g_warm_pipeline_count, 1);
++        }
++    });
++    free(wp);
++}
++#ifdef TOTK_PROBE_BUILD
++// Exercise the same batch compiler with distinct render and compute pipelines,
++// then execute every state after the worker autorelease pools have drained.
++void mtl_probe_warm_pipelines(void) {
++    @autoreleasepool {
++        g_dev = MTLCreateSystemDefaultDevice();
++        if (!g_dev) MDIE("warm probe: no Metal device");
++        NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
++            "constant uint value [[function_constant(0)]];\n"
++            "vertex float4 vertex_main(uint i [[vertex_id]]) { "
++            "float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[i],0,1); }\n"
++            "fragment uint pixel_main() { return value; }\n"
++            "kernel void compute_main(device uint *out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = value ^ i; }\n";
++        NSError *error = nil;
++        id<MTLLibrary> lib = [g_dev newLibraryWithSource:source options:nil error:&error];
++        if (!lib) MDIE("warm probe: %s", error.localizedDescription.UTF8String);
++        id<MTLFunction> vertex = [lib newFunctionWithName:@"vertex_main"];
++        id<MTLCommandQueue> queue = [g_dev newCommandQueue];
++        enum { PAIRS = 32 };
++        for (unsigned round = 0; round < 2; ++round) @autoreleasepool {
++            atomic_store(&g_warm_in_play, round != 0);
++            NSMutableArray<WarmPipeline *> *jobs = [NSMutableArray array];
++            for (unsigned i = 0; i < PAIRS * 2; ++i) {
++                unsigned value = 100 + round * PAIRS * 2 + i;
++                MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
++                [constants setConstantValue:&value type:MTLDataTypeUInt atIndex:0];
++                WarmPipeline *job = [WarmPipeline new]; job->item = [WarmItem new];
++                id<MTLFunction> fn = [lib newFunctionWithName:i % 2 ? @"compute_main" : @"pixel_main"
++                    constantValues:constants error:&error];
++                if (!fn) MDIE("warm probe: function specialization failed");
++                if (i % 2) { job->item->kind = 2; job->compute = fn; }
++                else {
++                    job->item->kind = 1; job->render = [MTLRenderPipelineDescriptor new];
++                    job->render.vertexFunction = vertex; job->render.fragmentFunction = fn;
++                    job->render.colorAttachments[0].pixelFormat = MTLPixelFormatR32Uint;
++                }
++                [jobs addObject:job];
++            }
++            warm_compile_pipelines(jobs);
++            NSMutableArray<id<MTLTexture>> *textures = [NSMutableArray array];
++            id<MTLBuffer> result = [g_dev newBufferWithLength:PAIRS * sizeof(uint32_t) options:MTLResourceStorageModeShared];
++            memset(result.contents, 0, result.length);
++            id<MTLCommandBuffer> cb = [queue commandBuffer];
++            for (unsigned i = 0; i < jobs.count; ++i) {
++                WarmPipeline *job = jobs[i];
++                if (!job->item->object || job->error) MDIE("warm probe: pipeline %u failed", i);
++                // Drop the inputs before submission; the compiled state owns its dependencies.
++                job->render = nil; job->compute = nil;
++                if (i % 2) {
++                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++                    [enc setComputePipelineState:job->item->object];
++                    [enc setBuffer:result offset:(i / 2) * sizeof(uint32_t) atIndex:0];
++                    [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
++                    [enc endEncoding];
++                } else {
++                    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint width:1 height:1 mipmapped:NO];
++                    td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModeShared;
++                    id<MTLTexture> texture = [g_dev newTextureWithDescriptor:td]; [textures addObject:texture];
++                    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
++                    pass.colorAttachments[0].texture = texture;
++                    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
++                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
++                    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
++                    [enc setRenderPipelineState:job->item->object];
++                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++                    [enc endEncoding];
++                }
++            }
++            [cb commit]; [cb waitUntilCompleted];
++            if (cb.status != MTLCommandBufferStatusCompleted) MDIE("warm probe: GPU execution failed");
++            for (unsigned i = 0; i < PAIRS; ++i) {
++                uint32_t pixel = 0, expected = 100 + round * PAIRS * 2 + i * 2;
++                [textures[i] getBytes:&pixel bytesPerRow:sizeof pixel fromRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0];
++                if (pixel != expected || ((uint32_t *)result.contents)[i] != expected + 1)
++                    MDIE("warm probe: pipeline result mismatch at %u", i);
++            }
++        }
++        atomic_store(&g_warm_in_play, 0);
++        printf("{\"probe\":\"warm-pipelines\",\"status\":\"pass\",\"pipelines\":128,\"startup_workers\":%d,\"play_workers\":%d}\n",
++            warm_threads(), MIN(warm_threads(), 2));
++    }
++}
++#endif
+ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
+                         NSSet<NSString *> *eligible,
+                         NSMutableSet<NSString *> *planned_keys,uint64_t total,uint64_t shader_total,uint64_t pipeline_total) {
+@@ -6323,7 +6437,7 @@
+         NSMutableDictionary<NSString *, NvShader *> *dict = [NSMutableDictionary dictionary];
+         NSMutableSet<NSString *> *seen = [NSMutableSet set];
+         NSUInteger path_index = 0;
+-        MLOG("后台预热：着色器库用 %d 个线程编（TOTK_WARM_THREADS），进世界后最多 2 个", warm_threads());
++        MLOG("Pipeline warm-up: libraries and pipelines use up to %d workers (TOTK_WARM_THREADS), at most 2 during play", warm_threads());
+         uint64_t done = 0;
+         for (NSString *path in paths) {
+             NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+@@ -6336,7 +6450,8 @@
+             }
+             for (NSUInteger at = 0; at < todo.count; at += WARM_BLOCK) @autoreleasepool {
+                 NSArray<NSString *> *block = [todo subarrayWithRange:NSMakeRange(at, MIN((NSUInteger)WARM_BLOCK, todo.count - at))];
+-                warm_load_rows(block, dict);   // the block's shaders on several threads; its pipelines below, in list order
++                warm_load_rows(block, dict);
++                NSMutableArray<WarmPipeline *> *pipelines = [NSMutableArray array];
+                 for (NSString *line in block) {
+                     NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+                     if (!c.count) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+@@ -6357,22 +6472,30 @@
+                                                     if (!fsfn) { g_warm_skip_fz++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                         }
+                         pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
+-                        NSError *e = nil; uint64_t ps_started = bp_now();
+-                        id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
+-                        atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
+-                        if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+-                        WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
+-                        warm_enqueue(item); g_warm_rps++;
++                        WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k;
++                        WarmPipeline *job = [WarmPipeline new]; job->item = item;
++                        job->render = pso_desc(&k, vs, fs, fsfn, sk.merged);
++                        [pipelines addObject:job];
++                        continue; // Count the row only after its pipeline finishes.
+                     } else if ([c[0] isEqualToString:@"C"] && c.count >= 2) {
+                         NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                         NvShader *cs = warm_shader(dict, key, 5);
+                         if (!cs) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+-                        NSError *e = nil; uint64_t ps_started = bp_now(); id ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
+-                        atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
+-                        if (!ps) { MLOG("【红】后台建计算管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+-                        WarmItem *item = [WarmItem new]; item->kind = 2; item->key = key; item->shader = cs; item->object = ps;
+-                        warm_enqueue(item); g_warm_cps++;
++                        WarmItem *item = [WarmItem new]; item->kind = 2; item->key = key; item->shader = cs;
++                        WarmPipeline *job = [WarmPipeline new]; job->item = item; job->compute = cs->fn;
++                        [pipelines addObject:job];
++                        continue;
+                     }
++                    warm_task_done(&done,total,shader_total,pipeline_total,dict);
++                }
++                warm_compile_pipelines(pipelines);
++                // Publish in manifest order after workers release their inputs. The owner
++                // alone updates progress; a failed compilation still completes one task.
++                for (WarmPipeline *job in pipelines) {
++                    if (job->item->object) {
++                        warm_enqueue(job->item);
++                        if (job->item->kind == 1) g_warm_rps++; else g_warm_cps++;
++                    } else MLOG("pipeline warm-up failed: %s", job->error.localizedDescription.UTF8String);
+                     warm_task_done(&done,total,shader_total,pipeline_total,dict);
+                 }
+             }
+@@ -6428,7 +6551,7 @@
+         MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms（着色器库 %d 个线程%s）",
+              (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6, warm_threads(),
+              atomic_load(&g_warm_in_play) && warm_threads() > 2 ? "，进世界后 2 个" : "");
+-        MLOG("预热分段：着色器库 %llu 次 / %.1f ms（各线程用时相加），Metal 管线 %llu 次 / %.1f ms",
++        MLOG("预热分段：着色器库 %llu 次 / %.1f ms（各线程用时相加），Metal 管线 %llu 次 / %.1f ms (summed worker time)",
+              (unsigned long long)atomic_load(&g_warm_library_count),atomic_load(&g_warm_library_ns)/1e6,
+              (unsigned long long)atomic_load(&g_warm_pipeline_count),atomic_load(&g_warm_pipeline_ns)/1e6);
+     }
+@@ -9432,6 +9555,11 @@
          MLOG("[mfx-up] 主机模式放大点 %.8s（%s）：源 %lux%lu（格式 %lu）→ 画布 %lux%lu（格式 %lu）；常量 con0 %g %g %g %g、输出 %ux%u → 有效区域 %lux%lu%s",
               fs->key, hdr ? "HDR" : "perceptual", (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat, (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat,
               k[0], k[1], k[2], k[3], ow, oh, (unsigned long)cw, (unsigned long)ch, why ? "：常量不符，保留游戏自己的放大" : ""); } }
@@ -90,7 +313,7 @@
      // the scene's content, not its texture, must be smaller than the canvas: a reused scene texture can be allocated
      // larger than the content the game drew (dynamic resolution, a size changed while playing) (from PR #42)
      if (!why && (cw >= dst.width || ch >= dst.height)) why = 3;
-@@ -9460,6 +9473,20 @@
+@@ -9460,6 +9588,20 @@
     Returns 1 when the draw was replaced (not to be encoded). */
  static int mfxup_draw(NvProg *pr) {
      g_mfxup_src = nil; g_mfxup_out = nil; g_mfxup_sh = nil;
@@ -111,7 +334,7 @@
      if (!pr || !mfxup_enabled()) return 0;
      __unsafe_unretained NvShader *fs = pr->sh[1];
      if (!fs) return 0;
-@@ -9489,9 +9516,9 @@
+@@ -9489,9 +9631,9 @@
  static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
      if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
      __unsafe_unretained NvProg *pr = prog_get(S.prog);
@@ -123,7 +346,7 @@
      if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
      geometry_dump(pr, dw, di);
      if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
-@@ -9684,7 +9711,7 @@
+@@ -9684,7 +9826,7 @@
      if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
      if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
      __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
@@ -132,7 +355,7 @@
      if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
      static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
      if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
-@@ -11793,6 +11820,7 @@
+@@ -11793,6 +11935,7 @@
  
      CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
      if (!layer) return 0;
@@ -140,7 +363,7 @@
      if (g_present_layer_resident != layer) { if (!layer.residencySet) MDIE("present layer has no residency set (layer device %s)", layer.device ? "set" : "missing"); [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
  #if TARGET_OS_OSX
      if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // 窗口模式按显示器垂直同步，防撕裂 | Windowed mode follows the display's vsync to prevent tearing
-@@ -11813,6 +11841,10 @@
+@@ -11813,6 +11956,10 @@
      id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
      if (!supplied) g_drawable_ns += now_ns() - dt0;
      if (!dr) return 0;
@@ -151,7 +374,7 @@
      int alloc_i = (int)((ticket * 2 + (interp >= 0 ? 0 : 1)) % 3);   // the interpolated frame of a ticket and the ticket's own frame use different allocators
      pthread_mutex_lock(&g_pq_mu);
      while (g_present_alloc_busy[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
-@@ -11938,6 +11970,7 @@
+@@ -11938,6 +12085,7 @@
      uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
      [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
          CFTimeInterval tt = d.presentedTime;
@@ -159,7 +382,7 @@
          if (interp < 0) g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};   // statistics per game frame; the interpolated one is not a game frame
          cadence_note(tt, interp >= 0);
          front_frame_presented();
-@@ -12039,7 +12072,7 @@
+@@ -12039,7 +12187,7 @@
      if (mode == 2) return CAFrameRateRangeMake(60, 120, 120);
      const char *explicit_hz = getenv("DM_PRESENT_HZ"), *rt = getenv("TOTK_REALTIME");
      int hz = explicit_hz ? atoi(explicit_hz) : (rt && !strcmp(rt, "0")) ? 60 : mtl_display_hz();
@@ -168,7 +391,7 @@
      return CAFrameRateRangeMake(hz, hz, hz);
  }
  static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 省电模式 30 Hz | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
-@@ -12222,7 +12255,7 @@
+@@ -12222,7 +12370,7 @@
          else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL：放开显示节拍（帧 %llu）", (unsigned long long)atomic_load(&g_cur_frame)); }
      }
      pthread_mutex_lock(&g_pq_mu);
@@ -177,7 +400,7 @@
      pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0};
      if (crop) memcpy(it->crop, crop, sizeof it->crop);   // 当帧状态随票号入队，不在出图线程晚读可变window | The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
      uint64_t tk = ++g_pq_in;
-@@ -12485,7 +12518,7 @@
+@@ -12485,7 +12633,7 @@
          rp.renderTargetWidth = W; rp.renderTargetHeight = H;
          id<MTL4RenderCommandEncoder> re = enc_r_begin(rp);
          enc_r_pso(re, ps); enc_r_viewport(re, (MTLViewport){0, 0, W, H, 0, 1}); enc_r_scissor(re, (MTLScissorRect){0, 0, W, H});

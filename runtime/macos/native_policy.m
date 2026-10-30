@@ -44,7 +44,7 @@ void native_policy_init(void) {
     for (unsigned i = 0; i < sizeof settings / sizeof *settings; ++i)
         if (setenv(settings[i].key, settings[i].value, 1)) runtime_fail("set native render policy");
     unsetenv("TOTK_PRESENT_SKIP");
-    fprintf(stderr, "[totk] native profile: scene/output 3840x2160, 144 rendered fps, no scaling or interpolation\n");
+    fprintf(stderr, "[totk] native profile: scene/output 3840x2160, target 144 rendered fps, no scaling or interpolation\n");
 }
 
 int native_host_check(void) {
