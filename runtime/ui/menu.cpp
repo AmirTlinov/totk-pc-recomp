@@ -171,8 +171,13 @@ static ImGuiStyle g_base_style;   // the menu's style at 1080 lines
 static uint64_t g_last_ns;
 static uint64_t g_cost_ns, g_cost_frames;   // CPU time of layout and recording while open, logged per 600 frames
 
-// Sizes are tuned for 1080 lines and follow the window's height; under 720 lines they stay at the 720 size.
-static float menu_scale(uint32_t h) { return (h >= 720 ? h : 720) / 1080.0f; }
+// Sizes are tuned for 1080 lines and follow the window's height. Under 720 lines at 100% display scale they stay at the
+// 720 size; that floor grows with the window's DPI, so a small window on a 150% or 200% display (sizes are physical
+// pixels) still gets text as large as the display scale asks for.
+static float menu_scale(uint32_t h) {
+    float least = 720.0f * (float)gfx_window_dpi() / 96.0f;
+    return ((float)h >= least ? (float)h : least) / 1080.0f;
+}
 
 // SavageWindRecomp's colours: dark green panels, gold accents.
 static void style_init(ImGuiStyle &s) {
