@@ -85,9 +85,9 @@ def package(tree, out, version, probes):
         copy(icon, resources / 'AppIcon.icns')
         info['CFBundleIconFile'] = 'AppIcon'
     (stage / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
-    # Sign nested executables before sealing the outer bundle.
-    for binary in (macos / 'totk-native', macos / 'TotKRecomp'):
-        run(['codesign', '--force', '--sign', '-', binary])
+    # The bundle signature also signs its main launcher. Signing that path
+    # separately would seal and hash all game resources a second time.
+    run(['codesign', '--force', '--sign', '-', macos / 'totk-native'])
     run(['codesign', '--force', '--sign', '-', stage])
     run(['codesign', '--verify', '--deep', '--strict', stage])
     run([macos / 'TotKRecomp', '--check'])
