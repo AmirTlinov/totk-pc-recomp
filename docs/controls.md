@@ -35,6 +35,8 @@ Esc is unbound in the game; it opens the settings menu and releases the mouse cu
 
 `pad_layout = xbox_prompts` (*Xbox prompts (A right)* on the Controls tab) is for an Xbox pad played by position. The buttons work as with `nintendo`: the right button, labelled B, does Switch A (interact, confirm), and the bottom one, labelled A, does Switch B (run, cancel). The letters the game shows are swapped to match the labels, A with B and X with Y, so each prompt names the button to press. The other layouts leave the prompts alone: with `xbox` the Switch letters already match the labels.
 
+The swapped letters are part of the game's textures, fonts and messages, so they follow the layout and not the bindings. A button remapped with a `bind_` line or on the Controls tab keeps the letter the game draws for it, and the prompt then names the wrong button. Use `xbox_prompts` with the default bindings.
+
 The buttons change at once, but the game reads its UI archive and fonts once at boot, so the prompts change at the next start (the menu says *prompts change after restart*). `xbox_prompts` loads `romfs-patches-xbox` next to `romfs-index.bin` in place of `romfs-patches` (`runtime/romfs.c`, `overlay_init`): the same 60 fps patches, with the swap made from the game's own files by `tools/make_romfs_patches.py --xbox-prompts`, which the setup runs next to the plain one:
 
 - the action prompt (`DoCommand_00`) draws the letter images `Nt_KeyTexA/B/X/Y_00`, whose image data is swapped, in a diamond that names the other face buttons. The diamond's letters are text the game takes from `LayoutMsg/DoCommand_00.msbt` of each language's `Mals` archive (and the layout's own text panes behind it); both are swapped. The diamond's shape shows the button's position and stays.

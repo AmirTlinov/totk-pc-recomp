@@ -96,7 +96,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                 "labelled on an Xbox controller (cross on a PlayStation controller). Automatic picks "
                                 "Nintendo for controllers with Nintendo labels and Xbox for the others. Xbox prompts: "
                                 "A is the right one as with Nintendo, and the game shows the Xbox labels (B for A, A "
-                                "for B, Y for X, X for Y); the prompts change after a restart.",
+                                "for B, Y for X, X for Y); the prompts change after a restart. The letters are part of the "
+                                 "game's files, so a button you remap in Controls keeps the old letter on screen.",
     [UI_MENU_PAD_LAYOUT_AUTO] = "Automatic", [UI_MENU_PAD_LAYOUT_NINTENDO] = "Nintendo (A right)",
     [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A bottom)", [UI_MENU_PAD_LAYOUT_XBOX_PROMPTS] = "Xbox prompts (A right)",
     [UI_MENU_PAD_LAYOUT_IN_USE] = "in use: %s",
@@ -324,7 +325,9 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                 "подписано на контроллере Xbox (крест на контроллере PlayStation). Автоматически: "
                                 "Nintendo для контроллеров с подписями Nintendo, Xbox для остальных. Подсказки Xbox: "
                                 "A справа, как в Nintendo, а игра показывает надписи Xbox (B вместо A, A вместо B, Y "
-                                "вместо X, X вместо Y); подсказки меняются после перезапуска.",
+                                "вместо X, X вместо Y); подсказки меняются после перезапуска. Буквы записаны в файлах "
+                                 "игры, поэтому у кнопки, переназначенной на вкладке управления, на экране остаётся "
+                                 "прежняя буква.",
     [UI_MENU_PAD_LAYOUT_AUTO] = "Автоматически", [UI_MENU_PAD_LAYOUT_NINTENDO] = "Nintendo (A справа)",
     [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A снизу)", [UI_MENU_PAD_LAYOUT_XBOX_PROMPTS] = "Подсказки Xbox (A справа)",
     [UI_MENU_PAD_LAYOUT_IN_USE] = "сейчас: %s",
