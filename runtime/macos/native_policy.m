@@ -58,7 +58,7 @@ void native_policy_init(void) {
     if (!strict_mode) return;
     const struct { const char *key, *value; } settings[] = {
         {"TOTK_OUTPUT_RES", "3840x2160"}, {"TOTK_RENDER_RES", "3840x2160"},
-        {"DM_PRESENT_HZ", "144"}, {"DM_PRESENT_LINK", "1"}, {"DM_PRESENT_LATENCY", "1"},
+        {"DM_PRESENT_HZ", "144"}, {"DM_PRESENT_LINK", "0"},
         {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"}, {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"},
         {"TOTK_MFX", "0"}, {"TOTK_MFX_UPSCALE", "0"}, {"TOTK_MFX_OUTPUT", "0"},
         {"TOTK_GPU_ALLOW_SUBMIT", "1"}, {"TOTK_GPU_WIDEN", "1"},
