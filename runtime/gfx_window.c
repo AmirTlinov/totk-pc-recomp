@@ -12,6 +12,10 @@
 // The in-game menu (ui/menu.h) draws over the game image in the present's command buffer, after the blit; its keyboard
 // and mouse come from the window procedure (ui/menu_win.cpp). The window's size and fullscreen state are the settings
 // TOTK_WINDOW_SIZE and TOTK_FULLSCREEN, applied at start and whenever a cfg_set changes them (window_settings_live).
+//
+// The process is per-monitor DPI aware (totk.manifest): every size here is physical pixels, TOTK_WINDOW_SIZE included,
+// and the swapchain matches the screen pixel for pixel. A window moved to a monitor at another display scale keeps its
+// client size (WM_GETDPISCALEDSIZE); the menu takes its text size floor from the window's DPI (gfx_window_dpi).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +52,7 @@ static CRITICAL_SECTION g_start_lock;       // gfx_window_start / vsync start
 static int g_started, g_wnd_failed;
 static int g_background;                   // TOTK_BACKGROUND_WINDOW: the window stays behind the user's windows
 static int g_fs_pending;                   // window thread: TOTK_FULLSCREEN waits for the first activation
+static volatile LONG g_dpi = USER_DEFAULT_SCREEN_DPI;   // the window's DPI, set by the window thread
 
 // ---- swapchain and present state (g_pl)
 static CRITICAL_SECTION g_pl;
@@ -189,6 +194,18 @@ static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window b
 
 static int is_fullscreen(HWND h) { return !(GetWindowLongW(h, GWL_STYLE) & WS_OVERLAPPEDWINDOW); }
 
+unsigned gfx_window_dpi(void) { return (unsigned)InterlockedCompareExchange(&g_dpi, 0, 0); }
+
+// The outer size of a framed window whose client area is cw x ch. The frame is measured at the window's DPI, or the
+// system DPI before the window exists: plain AdjustWindowRect always takes the system DPI, which is wrong on a monitor
+// at another display scale.
+static void outer_size(HWND h, int cw, int ch, int *ow, int *oh) {
+    RECT r = {0, 0, cw, ch};
+    AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, h ? GetDpiForWindow(h) : GetDpiForSystem());
+    *ow = r.right - r.left;
+    *oh = r.bottom - r.top;
+}
+
 // TOTK_FULLSCREEN=1: borderless window over the monitor. TOTK_WINDOW_SIZE=<w>x<h>: client area of the window (the
 // swapchain follows the window; the game image is scaled to it).
 static int cfg_fullscreen(void) {
@@ -201,6 +218,16 @@ static void cfg_window_size(int *w, int *h) {
         sscanf(cfg_meta("WINDOW_SIZE")->def, "%dx%d", &x, &y);   // unparsable or out of range: the default
     *w = x;
     *h = y;
+}
+
+// Windows turns the display off and sleeps after the idle timeout, and gamepad input does not count as activity. While
+// the window is up and not minimized it holds the display and the system on, as other games do. The state belongs to
+// the calling thread, so only the window thread (window_main and wnd_proc) calls this; the process exit releases it.
+static void keep_awake(int on) {
+    static int cur = -1;
+    if (on == cur) return;
+    cur = on;
+    SetThreadExecutionState(on ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
 }
 
 // F11: borderless window over the whole monitor, and back to the saved window. The swapchain follows through WM_SIZE.
@@ -242,20 +269,18 @@ static void apply_settings(HWND h) {
     int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
     note_applied();
     if (size_changed) {
-        int cw, ch;
+        int cw, ch, ow, oh;
         cfg_window_size(&cw, &ch);
-        RECT r = {0, 0, cw, ch};
-        AdjustWindowRect(&r, WND_STYLE, FALSE);
+        outer_size(h, cw, ch, &ow, &oh);
         if (is_fullscreen(h)) {
             RECT *n = &g_saved_place.rcNormalPosition;
-            n->right = n->left + (r.right - r.left);
-            n->bottom = n->top + (r.bottom - r.top);
+            n->right = n->left + ow;
+            n->bottom = n->top + oh;
         } else {
             RECT have;
             if (GetClientRect(h, &have) && (have.right != cw || have.bottom != ch)) {
                 if (IsZoomed(h)) ShowWindow(h, SW_RESTORE);
-                SetWindowPos(h, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(h, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
     }
@@ -372,6 +397,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_SIZE:
+        keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) InterlockedExchange(&g_dirty, 1);
         refresh_rate_update(h, 0);
         return 0;
@@ -381,6 +407,32 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DISPLAYCHANGE:
         refresh_rate_update(h, 1);
         break;
+    case WM_GETDPISCALEDSIZE:   // a framed window keeps its client size in pixels on a monitor at another scale
+        if (!is_fullscreen(h) && !IsZoomed(h)) {
+            RECT c, r;
+            if (GetClientRect(h, &c)) {
+                r = (RECT){0, 0, c.right, c.bottom};
+                if (AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, LOWORD(w))) {
+                    *(SIZE *)l = (SIZE){r.right - r.left, r.bottom - r.top};
+                    return TRUE;
+                }
+            }
+        }
+        break;   // DefWindowProc: Windows scales the size with the DPI
+    case WM_DPICHANGED: {   // display scale changed, or the window reached a monitor at another scale
+        const RECT *s = (const RECT *)l;
+        InterlockedExchange(&g_dpi, LOWORD(w));
+        rt_log("gfx: window DPI %u (%u%%)", LOWORD(w), LOWORD(w) * 100u / USER_DEFAULT_SCREEN_DPI);
+        if (is_fullscreen(h)) {   // keep covering the monitor the suggested rect lies on
+            MONITORINFO mi = {sizeof mi};
+            if (GetMonitorInfoW(MonitorFromRect(s, MONITOR_DEFAULTTONEAREST), &mi))
+                SetWindowPos(h, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            SetWindowPos(h, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    }
     case WM_ACTIVATEAPP: {
         int in = w != 0;
         InterlockedExchange(&g_focused, in);
@@ -417,23 +469,25 @@ static DWORD WINAPI window_main(void *arg) {
                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
                       .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
     RegisterClassExW(&wc);
-    int cw, ch;
+    int cw, ch, ow, oh;
     cfg_window_size(&cw, &ch);
-    RECT r = {0, 0, cw, ch};
-    AdjustWindowRect(&r, WND_STYLE, FALSE);
+    outer_size(NULL, cw, ch, &ow, &oh);
     // The window opens behind the user's windows without taking focus: it shows the game's blank loading frames for a
     // while, and must not cover what the player works on meanwhile. The game still counts itself in focus until the
     // first WM_ACTIVATEAPP, so loading goes on, and keyboard input waits for the foreground (input_win.c). Its taskbar
     // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
     // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
     int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT,
-                             r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
+                             NULL, inst, NULL);
     if (!g_hwnd) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
         g_wnd_failed = 1;
     } else {
-        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // The frame was measured at the system DPI; the window may have opened on a monitor at another scale.
+        InterlockedExchange(&g_dpi, (LONG)GetDpiForWindow(g_hwnd));
+        outer_size(g_hwnd, cw, ch, &ow, &oh);
+        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (!background) {
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
@@ -441,6 +495,7 @@ static DWORD WINAPI window_main(void *arg) {
         }
         note_applied();
         refresh_rate_update(g_hwnd, 1);
+        keep_awake(1);
     }
     SetEvent(g_wnd_ready);
     if (g_wnd_failed) return 1;
@@ -490,6 +545,7 @@ static void flip_locked(void) {
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
+    vk_device_fault_report(r);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&g_dirty, 1);
 }
 
@@ -740,6 +796,27 @@ static void save_capture(const char *path) {
     rt_log("gfx: menu test shot %s (%dx%d)", path, g_cap_w, g_cap_h);
 }
 
+// Where the game's picture (cw x ch) goes on the sw x sh swapchain: TOTK_ASPECT=fit (default) keeps its shape and centres
+// it, with black bars at the sides (a 16:9 picture in a 21:9 window) or above and below; stretch fills the swapchain.
+// Bars under a pixel are not drawn. Returns 1 when the rectangle leaves bars to clear.
+static int fit_rect(int cw, int ch, int sw, int sh, int out[4]) {
+    out[0] = 0, out[1] = 0, out[2] = sw, out[3] = sh;
+    if (cw <= 0 || ch <= 0 || strcmp(cfg_value("TOTK_ASPECT"), "fit")) return 0;
+    long long a = (long long)cw * sh, b = (long long)ch * sw;
+    if (a < b) {   // narrower than the window: bars at the sides
+        int fw = (int)((a + ch / 2) / ch);
+        if (fw >= sw - 1) return 0;
+        out[0] = (sw - fw) / 2, out[2] = fw;
+    } else if (a > b) {   // wider: bars above and below
+        int fh = (int)(((long long)ch * sw + cw / 2) / cw);
+        if (fh >= sh - 1) return 0;
+        out[1] = (sh - fh) / 2, out[3] = fh;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer) {
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     gfx_window_start();
@@ -763,6 +840,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         if (!create_swapchain()) goto out;
         r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     }
+    vk_device_fault_report(r);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;     // lost, not ready: skip the frame
     if (r == VK_SUBOPTIMAL_KHR) InterlockedExchange(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
@@ -792,20 +870,32 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(cb, &bi);
+    uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
     VkImage dst = g_sc_img[idx];
     sync_barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     const int rect[4] = {cx, cy, cw, ch};
-    // FSR (TOTK_UPSCALER) when the swapchain is larger than the crop; else the bilinear blit
-    int fsr = general && vk_fsr_record(cb, slot, src, fmt, w, h, rect, dst, g_sc_ext.width, g_sc_ext.height);
-    g_scaler = fsr ? 2 : (uint32_t)cw != g_sc_ext.width || (uint32_t)ch != g_sc_ext.height;
+    int to[4];
+    if (fit_rect(cw, ch, (int)g_sc_ext.width, (int)g_sc_ext.height, to)) {
+        // black bars: clear the whole image, then the picture's writes below wait for the clear
+        VkClearColorValue black = {{0, 0, 0, 1}};
+        VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+        sync_barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                     VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+    // FSR (TOTK_UPSCALER) when the picture's place on the swapchain is larger than the crop; else the bilinear blit
+    int fsr = general && vk_fsr_record(cb, slot, src, fmt, w, h, rect, dst, to);
+    g_scaler = fsr ? 2 : cw != to[2] || ch != to[3];
     if (!fsr) {
         if (general)   // a GENERAL source (vk_texture.c images): earlier submissions' writes become visible to the blit here
             sync_barrier(cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                          VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         VkImageBlit region = {
             .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{cx, cy, 0}, {cx + cw, cy + ch, 1}},
-            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int)g_sc_ext.width, (int)g_sc_ext.height, 1}}};
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{to[0], to[1], 0}, {to[0] + to[2], to[1] + to[3], 1}}};
         vkCmdBlitImage(cb, src, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
         if (general)   // later submissions that write the source wait for the blit's read
@@ -852,6 +942,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         record_thumb(cb, dst, slot);
     }
     sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
+    vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     vkEndCommandBuffer(cb);
 
     VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
@@ -870,6 +961,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_flip_idx = idx;
         if (!defer) flip_locked();
     } else {
+        vk_device_fault_report(r);
         rt_log("gfx: present submit failed (%d)", (int)r);
     }
     g_frame++;
@@ -901,9 +993,9 @@ void vk_present_flip(void) {
 
 void gfx_window_resize(int cw, int chh) {
     gfx_window_start();
-    RECT r = {0, 0, cw, chh};
-    AdjustWindowRect(&r, WND_STYLE, FALSE);
-    SetWindowPos(g_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    int ow, oh;
+    outer_size(g_hwnd, cw, chh, &ow, &oh);
+    SetWindowPos(g_hwnd, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     EnterCriticalSection(&g_pl);
     create_swapchain();
     LeaveCriticalSection(&g_pl);
@@ -979,8 +1071,8 @@ void gfx_window_start(void) {
         LeaveCriticalSection(&g_pl);
         RECT rc = {0};
         GetClientRect(g_hwnd, &rc);
-        rt_log("gfx: window %ldx%ld, swapchain %ux%u format %d", rc.right, rc.bottom, g_sc_ext.width, g_sc_ext.height,
-               (int)g_sc_fmt);
+        rt_log("gfx: window %ldx%ld at DPI %u, swapchain %ux%u format %d", rc.right, rc.bottom, gfx_window_dpi(),
+               g_sc_ext.width, g_sc_ext.height, (int)g_sc_fmt);
     }
     LeaveCriticalSection(&g_start_lock);
     vsync_ensure();

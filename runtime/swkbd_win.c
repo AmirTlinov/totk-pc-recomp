@@ -217,8 +217,12 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     Entry e = {.req = req, .armed = 0};
     const char *test = cfg_get("TOTK_SWKBD_TEST");
     if (test && *test) e.test = !strcmp(test, "cancel") ? -1 : 1;
+    // The process is per-monitor DPI aware: the font and the layout below are measured at the game window's DPI, the
+    // monitor the dialog opens on, not at the system DPI that plain SystemParametersInfo and AdjustWindowRectEx use.
+    HWND owner = gfx_window_handle();
+    UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     NONCLIENTMETRICSW ncm = {.cbSize = sizeof ncm};
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0, dpi);
     HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
     HDC dc = GetDC(NULL);
     HGDIOBJ old = SelectObject(dc, font);
@@ -230,10 +234,9 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     int y_prompt = pad, h_prompt = u * 5 / 2, y_edit = y_prompt + h_prompt + u / 4, h_edit = u * 9 / 5;
     int y_hint = y_edit + h_edit + u / 2, y_btn = y_hint + u * 3 / 2, ch = y_btn + bh + pad;
 
-    HWND owner = gfx_window_handle();
     RECT wr = {0, 0, cw + 2 * pad, ch};
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
-    AdjustWindowRectEx(&wr, style, FALSE, ex);
+    AdjustWindowRectExForDpi(&wr, style, FALSE, ex, dpi);
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top, x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     RECT orc;
     if (owner && GetWindowRect(owner, &orc)) {

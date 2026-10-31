@@ -316,7 +316,8 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     ReleaseSRWLockExclusive(&r->lock);
 }
 
-// ---- render tick: one frame every sample_count / sample_rate seconds, on a host thread
+// ---- render tick: one frame each time the output device has taken the ring below its target (audio_mixer_pace_ns),
+// or every sample_count / sample_rate seconds of the host clock without a device, while stopped or while it stalls
 static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) {
     if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate) return;
     double want = v->fraction + out_seconds * v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0);
@@ -348,6 +349,12 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) 
     }
 }
 
+static void wait_ns(HANDLE timer, uint64_t ns) {
+    LARGE_INTEGER due = {.QuadPart = -(LONGLONG)((ns + 99) / 100)};   // relative, 100 ns units
+    if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) rt_fatal("audren: SetWaitableTimer failed (error %lu)", GetLastError());
+    WaitForSingleObject(timer, INFINITE);
+}
+
 static DWORD WINAPI render_thread(void *p) {
     AudioRenderer *r = p;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -358,6 +365,19 @@ static DWORD WINAPI render_thread(void *p) {
     const double frame = (double)r->param.sample_count / r->param.sample_rate;
     uint64_t next = kern_now_ns();
     while (InterlockedCompareExchange(&r->running, 0, 0)) {
+        uint64_t now = kern_now_ns();
+        int64_t pace = audio_mixer_pace_ns(r, now);
+        if (pace > 0) {
+            wait_ns(timer, (uint64_t)pace);
+            continue;
+        }
+        if (pace == 0) {
+            next = now + frame_ns;   // where the timer goes on if the device stops pacing
+        } else {
+            if (next > now) wait_ns(timer, next - now);
+            else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
+            next += frame_ns;
+        }
         AcquireSRWLockExclusive(&r->lock);
         if (r->state == 0) {
             voices_prepare(r);
@@ -374,15 +394,6 @@ static DWORD WINAPI render_thread(void *p) {
         }
         ReleaseSRWLockExclusive(&r->lock);
         kern_event_signal(r->event);
-        next += frame_ns;
-        uint64_t now = kern_now_ns();
-        if (next > now) {
-            LARGE_INTEGER due = {.QuadPart = -(LONGLONG)((next - now + 99) / 100)};   // relative, 100 ns units
-            if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
-                rt_fatal("audren: SetWaitableTimer failed (error %lu)", GetLastError());
-            WaitForSingleObject(timer, INFINITE);
-        } else if (now - next > 100000000ull)
-            next = now;   // fell far behind (debugger, sleep): resynchronise
     }
     CloseHandle(timer);
     return 0;
