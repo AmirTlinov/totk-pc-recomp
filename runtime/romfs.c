@@ -410,12 +410,13 @@ static void heapdef_overlay(void) {
 static void overlay_init(void) {
     // TOTK_ROMFS_PATCHES unset: romfs-patches next to romfs-index.bin if it has a manifest (tools/make_romfs_patches.py).
     // A game resolution that is not 16:9 takes romfs-patches-<w>x<h> instead when it is there: the same overlay with
-    // the UI laid out for that shape (make_romfs_patches.py --aspect).
+    // the UI laid out for that shape (make_romfs_patches.py --aspect). 1.2.1 has no camera aspect patch, so it keeps
+    // the 16:9 layout (res_wants_wide_overlay).
     char def[2100];
     const char *patches = cfg_get("TOTK_ROMFS_PATCHES");
     unsigned out[2];
     res_wanted(out);
-    if (!patches && (unsigned long long)out[0] * 9 != (unsigned long long)out[1] * 16) {
+    if (!patches && res_wants_wide_overlay(out)) {
         if (snprintf(def, sizeof def, "%s/romfs-patches-%ux%u/manifest.tsv", index_dir, out[0], out[1]) < (int)sizeof def &&
             GetFileAttributesA(def) != INVALID_FILE_ATTRIBUTES) {
             def[strlen(def) - strlen("/manifest.tsv")] = 0;

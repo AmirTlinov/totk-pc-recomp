@@ -622,11 +622,14 @@ class Prepare(Step):
         if code:
             raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
         # The same overlay with the UI laid out for the 21:9 game resolutions the settings menu offers (runtime/romfs.c
-        # overlay_init picks the one that matches)
+        # overlay_init picks the one that matches). Only 1.4.3 has the camera aspect patch (recomp/patches-v143.txt) the
+        # layouts go with, and ultrawide_layout.py is checked against 1.4.3's layout archive: 1.2.1 builds none.
         for size in WIDE_SIZES:
             remove(dest / f'romfs-patches-{size}')
+            if version_tag(game_version(ctx)) != 'v143':
+                continue
             code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
-                                 ['--version', version_tag(game_version(ctx)), '--romfs', dest / 'romfs', '--out',
+                                 ['--version', 'v143', '--romfs', dest / 'romfs', '--out',
                                   dest / f'romfs-patches-{size}', '--aspect', size])
             if code:
                 raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))

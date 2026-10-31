@@ -224,7 +224,7 @@ void res_init(void) {
     // for that shape come from romfs-patches-<w>x<h> (romfs.c overlay_init, tools/make_romfs_patches.py --aspect).
     double ratio = (double)R.ow / R.oh, game = (double)BASE_W / BASE_H;
     int aspect = rt_patch_set("aspect");
-    if (ratio / game < 0.99 || ratio / game > 1.01) {
+    if (!res_is_16x9(R.ow, R.oh)) {
         if (aspect < 0) {
             rt_log("resolution: output %ux%u is not 16:9 and this game version has no camera aspect patch; the view "
                    "is stretched", R.ow, R.oh);
@@ -239,6 +239,18 @@ void res_init(void) {
     }
     rt_log("resolution: output %ux%u, scene %ux%u%s; texture heap +%llu KiB", R.ow, R.oh, R.sw, R.sh,
            scene_on ? "" : " (the game's own 5/6 of the output)", (unsigned long long)res_heap_extra_kib());
+}
+
+// 16:9 within 1% (1366x768 counts): the shape the game's own layouts and camera are made for.
+int res_is_16x9(unsigned w, unsigned h) {
+    double rel = ((double)w / h) / ((double)BASE_W / BASE_H);
+    return rel >= 0.99 && rel <= 1.01;
+}
+
+// The game resolution asks for a romfs-patches-<w>x<h> overlay: it is not 16:9 and the game version has the camera
+// aspect patch (set aspect, 1.4.3 only); the wide UI layouts only fit a camera that follows the same shape.
+int res_wants_wide_overlay(const unsigned out[2]) {
+    return !res_is_16x9(out[0], out[1]) && rt_patch_set("aspect") >= 0;
 }
 
 void res_wanted(unsigned out[2]) {
