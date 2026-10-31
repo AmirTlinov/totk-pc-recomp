@@ -1,17 +1,15 @@
 # Adapted from MacNativeGames games/totk/scripts/ultrawide_layout.py @ 933b6a0 (MIT, Copyright (c) 2026
-# MacNativeGames contributors). Used by tools/make_romfs_patches.py --aspect; the runtime has no UI squeeze of its own, so
-# the note below about nvn_mtl.m does not apply here.
-"""The game's UI layouts for a canvas wider than 16:9 (TOTK_OUTPUT_RES=3440x1440 with TOTK_ASPECT), edited in place in
-the decompressed UI/LayoutArchive/Common.Product.*.blarc (scripts/make_romfs_patches.py --aspect).
+# MacNativeGames contributors). Used by tools/make_romfs_patches.py --aspect.
+"""The game's UI layouts for a canvas wider than 16:9 (output_res = 3440x1440 in totk.ini), edited in place in the
+decompressed UI/LayoutArchive/Common.Product.*.blarc (tools/make_romfs_patches.py --aspect).
 
 The game lays its UI out on a 1920x1080 grid and maps that grid onto the canvas, so on a 21:9 canvas every layout comes
 out 34% too wide. Here each layout's root pane is narrowed to 16:9 (scale x = 16/9 over the aspect), backgrounds that
 must cover the whole screen are widened back, and the HUD's parts move out to the screen's corners. The pane list and
-the distances are the ones the community TOTK-Ultrawide mod for emulators found for 1.0.0 .. 1.2.1; this is an
-independent implementation (none of the mod's code), checked against 1.4.3's Common.Product.140: every pane is found by
-name and every pane field and animation key holds the value the edit expects before it is written.
-
-The runtime's own UI squeeze (nvn_mtl.m, TOTK_UI_SQUEEZE) must be off with these layouts, or the UI is narrowed twice.
+the distances are the ones the community TOTK-Ultrawide mod for emulators found for 1.0.0 .. 1.2.1 (GPL; only those
+values are taken, no code; THIRD_PARTY_NOTICES.md). This is an independent implementation, checked against 1.4.3's
+Common.Product.140: every pane is found by name and every pane field and animation key holds the value the edit
+expects before it is written.
 """
 import struct
 
@@ -119,12 +117,16 @@ def apply(blarc, members, width, height, hud_corner=True):
     if unknown: raise SystemExit(f'KEEP_ROOT names no layout: {unknown}')
     def pane_offset(layout, pane):
         member = f'blyt/{layout}.bflyt'
+        if member not in members: raise SystemExit(f'{layout}: no layout {member} in the archive')
         if member not in layouts: layouts[member] = panes(blarc, *members[member])
         changed.add(member)
         return find_pane(layouts[member], layout, pane)
     for member in sorted(m for m in members if m.startswith('blyt/') and m.endswith('.bflyt')):
         if member[5:-6] in KEEP_ROOT: continue
-        struct.pack_into('<f', blarc, pane_offset(member[5:-6], 'RootPane') + FIELD['scale_x'], k)
+        at = pane_offset(member[5:-6], 'RootPane') + FIELD['scale_x']
+        have = struct.unpack_from('<f', blarc, at)[0]
+        if abs(have - 1.0) > 1e-3: raise SystemExit(f'{member[5:-6]} RootPane scale_x: {have}, expected 1.0')
+        struct.pack_into('<f', blarc, at, k)
     # Every edit's value at k = 1 is the value the game ships (a scale of 1, the 16:9 position): checked before writing,
     # so a version with other numbers stops here instead of getting wrong positions. OFF moves a pane away: not checked.
     for (layout, pane, field, value), (_, _, _, shipped) in zip(edits(k, hud_corner), edits(1.0, hud_corner)):
@@ -133,7 +135,9 @@ def apply(blarc, members, width, height, hud_corner=True):
         if value != 10000.0 and abs(have - shipped) > 1e-3: raise SystemExit(f'{layout} {pane} {field}: {have}, expected {shipped}')
         struct.pack_into('<f', blarc, at, value)
     for anim, offset, shipped, value in anim_edits(k, hud_corner):
-        member = f'anim/{anim}.bflan'; lo, hi = members[member]
+        member = f'anim/{anim}.bflan'
+        if member not in members: raise SystemExit(f'{anim}: no animation {member} in the archive')
+        lo, hi = members[member]
         if offset + 4 > hi - lo: raise SystemExit(f'{anim}: too short for +{offset}')
         have = struct.unpack_from('<f', blarc, lo + offset)[0]
         if abs(have - shipped) >= 1e-4: raise SystemExit(f'{anim} +{offset}: {have}, expected {shipped}')
