@@ -54,6 +54,7 @@ jobs:
           python tests/macos_prompts_test.py
           python tests/macos_prompt_assets_test.py
           python tests/macos_game_input_test.py
+          python tests/macos_thread_test.py
           python tests/macos_cache_register_test.py
           python tests/macos_trace_test.py -v
           build/macos-arm64/probes-v143/totk-native --probe-policy
