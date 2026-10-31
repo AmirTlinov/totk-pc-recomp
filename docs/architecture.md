@@ -93,7 +93,14 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 - Resolution. Patch sets make the game read its output, swapchain and scene sizes from the patch page
   (MacNativeGames' sites); `resolution.c` sets them from `output_res` and `render_scale` and grows the texture heap
   and the application pool to match. When the window is larger than the output, `vk_fsr.c` runs AMD FSR 1 (EASU,
-  RCAS) on the present.
+  RCAS) on the present. An `output_res` that is not 16:9 (more than 1% off, `res_is_16x9`) also switches on the
+  `aspect` patch set (1.4.3 only), which hands the output's ratio to the camera, and `romfs.c` `overlay_init` loads the
+  `romfs-patches-<w>x<h>` overlay for it when it exists (`tools/make_romfs_patches.py --aspect`, laid out by
+  `tools/ultrawide_layout.py`; the installer builds four sizes: 2560x1080, 3440x1440, 3840x1600, 5120x2160). Other
+  shapes, such as 16:10 or 32:9, get the wide camera and the 16:9 HUD stretched over it. 1.2.1 has no camera patch: a
+  wide size there keeps the 16:9 view. The `aspect` setting (`fit`, the default; `stretch`) decides what the present does
+  when the window's shape differs from the output's: `fit` letterboxes, where a 16:9 game in a wider window used to be
+  stretched.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
 - ASTC textures are uploaded as they are where the device reports `textureCompressionASTC_LDR`, and decoded by a compute shader everywhere else (`vk_astc.c`, `TOTK_ASTC`). The CPU decoder (`tex_astc*.c`) is the fallback and the test oracle.
 - Draw state. A draw whose program, bound state and textures repeat reuses the previous draw's shaders and skips rebuilding its descriptor sets; descriptor sets are written through update templates (`vk_exec_draw.c`, `vk_pipeline.c`).

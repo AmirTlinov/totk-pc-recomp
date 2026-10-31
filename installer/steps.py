@@ -581,6 +581,9 @@ class Compile(Step):
 TRANSLATED = re.compile(r'gfx_shader: prepare: (\d+) of (\d+) pairs')
 
 
+WIDE_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160')   # runtime/ui/menu.cpp row_output_res
+
+
 class Prepare(Step):
     id = 'prepare'
 
@@ -588,7 +591,7 @@ class Prepare(Step):
         layout = ctx.layout
         xlate_id = layout.xlate.with_suffix('.id')
         tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py',
-                                            'pack_shader_cache.py')]
+                                            'pack_shader_cache.py', 'ultrawide_layout.py')]
         return fingerprint('prepare-1', ctx.keys['compile'], layout.xlate, xlate_id, shader_list_text(layout), *tools)
 
     def current(self, ctx, record):
@@ -618,6 +621,18 @@ class Prepare(Step):
                               dest / 'romfs-patches'])
         if code:
             raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
+        # The same overlay with the UI laid out for the 21:9 game resolutions the settings menu offers (runtime/romfs.c
+        # overlay_init picks the one that matches). Only 1.4.3 has the camera aspect patch (recomp/patches-v143.txt) the
+        # layouts go with, and ultrawide_layout.py is checked against 1.4.3's layout archive: 1.2.1 builds none.
+        for size in WIDE_SIZES:
+            remove(dest / f'romfs-patches-{size}')
+            if version_tag(game_version(ctx)) != 'v143':
+                continue
+            code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
+                                 ['--version', 'v143', '--romfs', dest / 'romfs', '--out',
+                                  dest / f'romfs-patches-{size}', '--aspect', size])
+            if code:
+                raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
 
         shader_list = layout.shader_list
         if not shader_list:
