@@ -587,7 +587,8 @@ class Prepare(Step):
     def key(self, ctx):
         layout = ctx.layout
         xlate_id = layout.xlate.with_suffix('.id')
-        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py')]
+        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py',
+                                            'pack_shader_cache.py')]
         return fingerprint('prepare-1', ctx.keys['compile'], layout.xlate, xlate_id, shader_list_text(layout), *tools)
 
     def current(self, ctx, record):
@@ -638,6 +639,12 @@ class Prepare(Step):
                               dest / 'exefs', '--list', shader_list], parse)
         if code or not (dest / 'shader-prepared.bin').is_file():
             raise InstallError('prepare.shaders_failed', code=code, log=str(log))
+
+        # One shader-cache.pack instead of four files per shader (~117,000): totk.exe reads the pack first.
+        rep.progress('prepare', 'pack', force=True)
+        code, log = run_tool(ctx, 'prepare', layout.tools / 'pack_shader_cache.py', [dest / 'shader-cache'])
+        if code:
+            raise InstallError('prepare.pack_failed', code=code, log=str(log))
         return {'xlate_sha256': file_sha256(xlate)}
 
 

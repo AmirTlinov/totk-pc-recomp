@@ -26,6 +26,7 @@
  "phase.prepare.seed": "Reading the shaders from the game data",
  "phase.prepare.translate": "Translating the shaders",
  "phase.prepare.libraries": "Building the shaders for the graphics driver",
+ "phase.prepare.pack": "Packing the shader cache into one file",
  "phase.cleanup.ini": "Writing totk.ini",
  "phase.cleanup.temp": "Removing temporary files",
 
@@ -76,6 +77,7 @@
  "prepare.romfs_patches_failed": "Writing the game data patches failed (exit code {code}). Details: {log}",
  "prepare.shaders_failed": "Preparing the shaders failed (exit code {code}). Details: {log}",
  "cleanup.romfs_unreadable": "The game data in {path} is missing or cannot be read after the install. Restart Windows, then run the installer again on the same folder: it extracts the game data again and keeps the rest.",
+ "prepare.pack_failed": "Packing the shader cache failed (exit code {code}). Details: {log}",
  "cleanup.ini_failed": "totk.ini cannot be written: {detail}",
 
  "warn.lang_needs_fonts": "Text in {lang} needs the Switch system fonts, which the installer does not extract; some text may not show.",
