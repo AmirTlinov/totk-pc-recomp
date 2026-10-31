@@ -4,8 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef TOTK_PROBE_BUILD
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <time.h>
 #include "nvn_pool_index.h"
 extern void runtime_fail(const char *message);
@@ -16,6 +19,24 @@ extern void mtl_probe_warm_pipelines(void);
 extern void mtl_probe_attachment_ledger(void);
 extern void mtl_probe_attachment_feedback(void);
 extern uint64_t runtime_now_ns(void);
+
+static void *probe_frame_thread(void *unused) {
+    (void)unused;
+    if (pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0)) runtime_fail("set initial probe QoS");
+    native_frame_thread_init();
+    native_frame_thread_init();
+    qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+    int relative = 0;
+    if (pthread_get_qos_class_np(pthread_self(), &qos, &relative) || qos != QOS_CLASS_USER_INTERACTIVE)
+        runtime_fail("frame thread lost interactive QoS");
+    thread_time_constraint_policy_data_t policy;
+    mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t is_default = FALSE;
+    if (thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                          (thread_policy_t)&policy, &count, &is_default) != KERN_SUCCESS || !is_default)
+        runtime_fail("frame thread has an unbounded real-time policy");
+    return NULL;
+}
 
 static mach_timebase_info_data_t reference_timebase;
 static pthread_once_t reference_once = PTHREAD_ONCE_INIT;
@@ -132,6 +153,11 @@ int native_run_probe(const char *name) {
         extern void mfx_set(int), mfxup_set(int), mfxup_output_set(int);
         setenv("TOTK_NATIVE_4K144", "1", 1);
         native_policy_init();
+        pthread_t frame_threads[2];
+        for (unsigned i=0; i<2; ++i)
+            if (pthread_create(&frame_threads[i], NULL, probe_frame_thread, NULL)) runtime_fail("start frame policy probe");
+        for (unsigned i=0; i<2; ++i)
+            if (pthread_join(frame_threads[i], NULL)) runtime_fail("join frame policy probe");
         if (mfx_enabled() || mfxup_enabled() || mfxup_output_enabled()) runtime_fail("native policy initial scaling");
         mfx_set(1); mfxup_set(1); mfxup_output_set(1);
         if (mfx_enabled() || mfxup_enabled() || mfxup_output_enabled()) runtime_fail("native policy runtime scaling");

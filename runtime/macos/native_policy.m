@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 
 extern void runtime_fail(const char *message);
 
@@ -18,6 +20,16 @@ static id<NSObject> activity_token;
 static _Atomic uint64_t scene_frames[64];
 
 int native_policy_strict(void) { return strict_mode; }
+
+void native_frame_thread_init(void) {
+    static _Thread_local int configured;
+    if (configured) return;
+    // Frame work includes loading and waits on guest workers. Its CPU cost has
+    // no fixed deadline budget. QoS also propagates urgency to framework work.
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0))
+        runtime_fail("set frame thread QoS");
+    configured = 1;
+}
 
 void native_policy_init(void) {
     if (!activity_token) {

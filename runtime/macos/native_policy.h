@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 void native_policy_init(void);
+void native_frame_thread_init(void);
 void native_patch_main(void *image, size_t size);
 int native_policy_strict(void);
 int native_host_check(void);
