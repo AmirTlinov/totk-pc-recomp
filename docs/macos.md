@@ -35,7 +35,7 @@ When verified extraction already exists, use `--prepare-game --package` instead 
 
 The host uses `-O3`, ThinLTO with an incremental linker cache, and dead stripping. Diagnostic entry points and probe objects are excluded from the game build. Source exports preserve timestamps only for unchanged bytes, so editing one patch does not rebuild unrelated objects. Static-library and compiler changes invalidate their consumers.
 
-Shader preparation deduplicates identical MSL and reuses atomically published metallibs under a compiler/toolchain identity. These assets live outside the replaceable source export. An unchanged shader does not start the Metal compiler again. Offline and runtime compilation both target Metal 3.2 with safe arithmetic. Precise multiply/add helpers use local contraction controls so the compiler can inline them without fusing separately rounded operations.
+Shader preparation deduplicates identical MSL and reuses atomically published metallibs under a compiler/toolchain identity. These assets live outside the replaceable source export. An unchanged shader does not start the Metal compiler again. Temporary Cryptex installation paths are excluded from the compiler identity, so remounting the same Metal toolchain does not invalidate its libraries. Offline and runtime compilation both target Metal 3.2 with safe arithmetic. Precise multiply/add helpers use local contraction controls so the compiler can inline them without fusing separately rounded operations.
 
 The signature is ad hoc for local use. Public distribution/notarization is a separate signing process. The playable app contains the player's game data and stays local.
 

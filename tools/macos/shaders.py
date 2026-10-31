@@ -20,9 +20,18 @@ SPIRV_SOURCES = ('main.cpp spirv_cfg.cpp spirv_cpp.cpp spirv_cross.cpp spirv_cro
                  'spirv_cross_util.cpp spirv_glsl.cpp spirv_hlsl.cpp spirv_msl.cpp spirv_parser.cpp spirv_reflect.cpp').split()
 
 
+def metal_version():
+    output = subprocess.check_output(['xcrun', 'metal', '--version'], text=True)
+    # Xcode mounts the Metal toolchain under a temporary Cryptex directory.
+    # Its location can change after reboot without changing the compiler.
+    version = '\n'.join(line for line in output.splitlines() if not line.startswith('InstalledDir:')).strip()
+    if not version:
+        raise RuntimeError('Metal compiler did not report a version')
+    return version
+
+
 def metal_compiler_identity():
-    version = subprocess.check_output(['xcrun', 'metal', '--version'], text=True)
-    return hashlib.sha256(json.dumps([METAL_FLAGS, version]).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([METAL_FLAGS, metal_version()]).encode()).hexdigest()
 
 
 def build_tools(tree, jobs):
@@ -102,7 +111,7 @@ def build_tools(tree, jobs):
         dependencies = subprocess.check_output(['otool', '-L', executable], text=True).splitlines()[1:]
         if any(not line.strip().startswith(('/usr/lib/', '/System/Library/')) for line in dependencies):
             raise RuntimeError(f'Native helper has an unbundled dependency: {executable}')
-    metal = subprocess.check_output(['xcrun', 'metal', '--version'], text=True)
+    metal = metal_version()
     cache_id = hashlib.sha256((identity.hexdigest() + digest(service) + digest(binary) + metal).encode()).hexdigest()
     write(service.with_suffix('.id'), cache_id + '\n')
     return service, binary
