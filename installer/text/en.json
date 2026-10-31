@@ -75,6 +75,7 @@
  "prepare.shader_list_missing": "The shader list is missing.",
  "prepare.romfs_patches_failed": "Writing the game data patches failed (exit code {code}). Details: {log}",
  "prepare.shaders_failed": "Preparing the shaders failed (exit code {code}). Details: {log}",
+ "cleanup.romfs_unreadable": "The game data in {path} is missing or cannot be read after the install. Restart Windows, then run the installer again on the same folder: it extracts the game data again and keeps the rest.",
  "cleanup.ini_failed": "totk.ini cannot be written: {detail}",
 
  "warn.lang_needs_fonts": "Text in {lang} needs the Switch system fonts, which the installer does not extract; some text may not show.",

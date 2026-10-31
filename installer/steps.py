@@ -661,7 +661,23 @@ class Cleanup(Step):
             remove(stale)
         for name in ('gen', 'build', 'check', 'shader_list.tsv'):
             remove(ctx.temp / name)
+        romfs_problem(dest / 'romfs', expected_update(ctx))
         return {}
+
+
+def romfs_problem(romfs, expected):
+    """Raise cleanup.romfs_unreadable unless romfs/ still holds the verified image. The game opens romfs.bin at start;
+    an install whose romfs/ went empty and unreadable after the extraction verified it (a folder Windows was still
+    deleting, #107) reported success and the game stopped at its first file read."""
+    try:
+        ok = extract.romfs_verified(romfs, expected) and (romfs / 'romfs.bin').stat().st_size == expected['romfs']['size']
+        if ok:
+            with open(romfs / 'romfs.bin', 'rb') as f:
+                f.read(1)
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        raise InstallError('cleanup.romfs_unreadable', path=str(romfs))
 
 
 def all_steps():
