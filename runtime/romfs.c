@@ -244,7 +244,11 @@ static uint32_t overlay_slot(uint64_t i) {
 }
 
 // ---- overlays
-static void overlay_load(const char *dir) {
+// Loads and checks one overlay folder. A failed check stops the game, except with optional set (the Xbox prompts
+// folder): the folder is dropped, the reason logged, and 0 returned. Returns 1 when the folder is loaded or has no
+// manifest.
+static int overlay_load(const char *dir, int optional) {
+#define BAD(...) do { if (!optional) rt_fatal(__VA_ARGS__); rt_log(__VA_ARGS__); goto bad; } while (0)
     char path[2100];
     need(snprintf(path, sizeof path, "%s/manifest.tsv", dir) < (int)sizeof path, "overlay path");
     wchar_t *w = fs_wide(path);
@@ -252,7 +256,7 @@ static void overlay_load(const char *dir) {
     free(w);
     if (!m) {
         rt_log("RomFS overlay: none (%s)", path);
-        return;
+        return 1;
     }
     char line[8192];
     size_t first = noverlay;
@@ -268,30 +272,32 @@ static void overlay_load(const char *dir) {
         uint64_t i = lower(name);
         int known = i < file_count && !strcmp(entry_name(entry(i)), name), add = !strcmp(orig, "-");
         if (!known && !add)
-            rt_fatal("RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its "
-                     "original's SHA-256", dir, name);
+            BAD("RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its "
+                "original's SHA-256", dir, name);
         if (known && add)
-            rt_fatal("RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256",
-                     dir, name);
+            BAD("RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256",
+                dir, name);
         Entry e = {0};
         if (known) {
             e = entry(i);
             sha_range(image, e.offset, e.size, hex, 0);
-            if (strcmp(hex, orig)) rt_fatal("RomFS overlay: the original of %s has SHA-256 %s, %s/manifest.tsv says %s",
-                                            name, hex, dir, orig);
+            if (strcmp(hex, orig)) BAD("RomFS overlay: the original of %s has SHA-256 %s, %s/manifest.tsv says %s",
+                                       name, hex, dir, orig);
         } else {
             i = ADDED;
         }
         char file[8200];
         need(snprintf(file, sizeof file, "%s/%s", dir, name) < (int)sizeof file, "overlay file path");
         HANDLE f = open_read(file, 1);
-        if (f == INVALID_HANDLE_VALUE) rt_fatal("RomFS overlay: %s missing", file);
+        if (f == INVALID_HANDLE_VALUE) BAD("RomFS overlay: %s missing", file);
         Identity id = identity_of(f);
-        if (id.size != size) rt_fatal("RomFS overlay: %s has %llu bytes, its manifest says %llu", file,
-                                      (unsigned long long)id.size, size);
+        if (id.size != size) {
+            CloseHandle(f);
+            BAD("RomFS overlay: %s has %llu bytes, its manifest says %llu", file, (unsigned long long)id.size, size);
+        }
         sha_range(f, 0, size, hex, 0);
         CloseHandle(f);
-        if (strcmp(hex, sha)) rt_fatal("RomFS overlay: %s has SHA-256 %s, its manifest says %s", file, hex, sha);
+        if (strcmp(hex, sha)) BAD("RomFS overlay: %s has SHA-256 %s, its manifest says %s", file, hex, sha);
         hashed += e.size + size;
         if (noverlay == overlay_cap) {
             overlay_cap = overlay_cap ? overlay_cap * 2 : 16;
@@ -309,6 +315,16 @@ static void overlay_load(const char *dir) {
                                       noverlay - first - 16);
     if (noverlay > first) rt_log("RomFS overlay: %s checked, %zu files, %.1f MiB hashed in %.2f s", dir,
                                  noverlay - first, hashed / 1048576.0, now_s() - t0);
+    return 1;
+bad:
+    fclose(m);
+    for (size_t k = first; k < noverlay; k++) {
+        free((void *)overlays[k].path);
+        free((void *)overlays[k].name);
+    }
+    noverlay = first;
+    return 0;
+#undef BAD
 }
 
 static int overlay_order(const void *a, const void *b) {
@@ -426,21 +442,21 @@ static void overlay_init(void) {
     int want_xbox = !_stricmp(cfg_value("TOTK_PAD_LAYOUT"), "xbox_prompts");
     if (!patches && want_xbox && xbox_prompts_ready) {
         xbox[strlen(xbox) - strlen("/manifest.tsv")] = 0;
-        patches = xbox;
-        xbox_prompts_active = 1;
-        rt_log("RomFS overlay: Xbox button prompts (%s)", xbox);
+        xbox_prompts_active = overlay_load(xbox, 1);
+        if (xbox_prompts_active) rt_log("RomFS overlay: Xbox button prompts (%s)", xbox);
+        else rt_log("RomFS overlay: %s failed its check (run the setup again); romfs-patches loads instead", xbox);
     } else if (want_xbox) {
         rt_log("RomFS overlay: pad_layout = xbox_prompts, but %s; Switch prompts stay",
                patches ? "TOTK_ROMFS_PATCHES is set" : "romfs-patches-xbox has no manifest.tsv (run the setup again)");
     }
-    if (!patches && snprintf(def, sizeof def, "%s/romfs-patches/manifest.tsv", index_dir) < (int)sizeof def &&
+    if (!patches && !xbox_prompts_active && snprintf(def, sizeof def, "%s/romfs-patches/manifest.tsv", index_dir) < (int)sizeof def &&
         GetFileAttributesA(def) != INVALID_FILE_ATTRIBUTES) {
         def[strlen(def) - strlen("/manifest.tsv")] = 0;
         patches = def;
     }
     const char *dirs[2] = {patches, cfg_get("TOTK_ROMFS_MODS")};
     for (int i = 0; i < 2; i++)
-        if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i]);
+        if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i], 0);
     heapdef_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
