@@ -35,7 +35,7 @@ When verified extraction already exists, use `--prepare-game --package` instead 
 
 The host uses `-O3`, ThinLTO with an incremental linker cache, and dead stripping. Diagnostic entry points and probe objects are excluded from the game build. Source exports preserve timestamps only for unchanged bytes, so editing one patch does not rebuild unrelated objects. Static-library and compiler changes invalidate their consumers.
 
-Shader preparation deduplicates identical MSL and reuses atomically published metallibs under a compiler/toolchain identity. These assets live outside the replaceable source export. An unchanged shader does not start the Metal compiler again.
+Shader preparation deduplicates identical MSL and reuses atomically published metallibs under a compiler/toolchain identity. These assets live outside the replaceable source export. An unchanged shader does not start the Metal compiler again. Offline and runtime compilation both target Metal 3.2 with safe arithmetic. Precise multiply/add helpers use local contraction controls so the compiler can inline them without fusing separately rounded operations.
 
 The signature is ad hoc for local use. Public distribution/notarization is a separate signing process. The playable app contains the player's game data and stays local.
 
@@ -46,6 +46,8 @@ The signature is ad hoc for local use. Public distribution/notarization is a sep
 PYTHONPATH=tools .venv-py314/bin/python -m macos.check
 PYTHONPATH=tools .venv-py314/bin/python -m macos.shaders
 .venv-py314/bin/python tests/macos_shader_test.py
+.venv-py314/bin/python tests/macos_shader_math_test.py
+.venv-py314/bin/python tests/macos_shader_cache_test.py
 .venv-py314/bin/python tests/macos_save_test.py -v
 .venv-py314/bin/python tests/macos_layout_test.py -v
 .venv-py314/bin/python tests/macos_benchmark_test.py -v
@@ -53,7 +55,9 @@ PYTHONPATH=tools .venv-py314/bin/python -m macos.shaders
 .venv-py314/bin/python tests/macos_build_test.py -v
 ```
 
-`TotK Recomp Diagnostics.app` contains the real compiled host and renderer with explicit empty game tables. It refuses game boot. `--selftest` checks native execution and Metal 4 capability. The GPU runner tests masked clears, depth/stencil, resource aliasing/lifetimes, uniform snapshots, bindings and render-stream behavior under Metal validation; each run keeps separate logs. `--probe-warm-pipelines` compiles and executes 128 distinct render/compute pipelines with the startup and in-play worker limits. The shader test uses a synthetic Maxwell kernel through the native translator, SPIRV-Cross and Apple's Metal compiler. It contains no game shader.
+`TotK Recomp Diagnostics.app` contains the real compiled host and renderer with explicit empty game tables. It refuses game boot. `--selftest` checks native execution and Metal 4 capability. The GPU runner tests masked clears, depth/stencil, resource aliasing/lifetimes, uniform snapshots, bindings and render-stream behavior under Metal validation; each run keeps separate logs. `--probe-warm-pipelines` compiles and executes 128 distinct render/compute pipelines with the startup and in-play worker limits. The shader test uses a synthetic Maxwell kernel through the native translator, SPIRV-Cross and Apple's Metal compiler. It contains no game shader. The shader arithmetic test uses `glslangValidator` to generate precise SPIR-V operations and compares MSL 2.3 and 3.2 helpers on the GPU, including signed zero and separate-rounding controls. The attachment-ledger probe exercises all eight color targets plus depth and stencil.
+
+The attachment-feedback probe reads pixels back after pending clears, barriers with intervening draws, storage aliases, nested texture views and MSAA copies. Writable images retain their original destination. The resolution test also compares both runtimes' allocation budgets against the RomFS heap generator, including diagnostic 4K runs.
 
 The native call-window test and hardware probe can also run without game data:
 
@@ -94,6 +98,41 @@ Presentation callbacks enqueue immutable records; a dedicated writer formats and
 
 These timing and dimension checks still need visual acceptance at a physical 4K/144 display mode: fixed allocation dimensions alone do not prove viewport coverage or image fidelity. Check the same saves/routes for terrain, transparencies, shadows, UI, physics, cloth, input latency and audio. Dynamic resolution, frame generation and reused frames cannot count toward the target. No target result is inferred from GPU probes or from another machine.
 
+Use View > Enter Full Screen (Control-Command-F) for fullscreen presentation. The diagnostic input stream accepts `fullscreen 0|1` through the same window transition. Windowed composition can discard submitted drawables; only actual presentation timestamps count.
+
+Click the game picture to capture the mouse; the capture click performs no game action. Escape goes back and releases it. Switching applications, minimising, resizing, changing fullscreen mode or opening text entry also releases it. Click again to resume. Controls > Mouse Sensitivity and Invert Mouse Y persist between launches. Control-Command-M toggles capture.
+
+The default keyboard layout uses physical key positions, so switching the macOS text language does not move WASD or the action keys.
+
+| Input | Action |
+|---|---|
+| WASD | Move |
+| Mouse motion | Camera; right-stick selection in quick menus |
+| E / Return | Interact / confirm |
+| Space | Jump |
+| Shift | Run / put away |
+| Left mouse button | Attack |
+| Right mouse button / Ctrl | Shield / target |
+| Q | Ability |
+| R / middle mouse button | Bow |
+| F | Throw |
+| C | Crouch |
+| V | Scope |
+| Tab | Inventory / pause menu |
+| M | Map |
+| 1 / 2 / 3 / 4 | Shield / materials / weapon / whistle shortcuts |
+| Escape | Back and release mouse |
+| Mouse back / forward buttons | Interact / cancel aliases |
+| F10 | Show or hide the performance overlay |
+
+The 1.2.1 normal camera consumes mouse displacement directly, without the analog stick's dead zone, speed limit or frame-time multiplier. It retains the game's collision correction and pitch limits. Targeting, aiming and quick menus retain their right-stick input path. A stopped normal camera releases mouse movement to the menu; each delta is consumed once. The mouse uses GameController device deltas where available and AppKit relative events otherwise. 1.4.3 currently uses the analog mouse path; its direct-camera and font-cache adapters need separate version validation.
+
+Prompt labels come from the same bindings as input. Keyboard or mouse use selects PC glyphs; controller use selects Xbox, PlayStation, Switch or generic controller glyphs. Disconnecting the last controller returns to PC prompts. Physical controller assignments from `controls.txt` are reflected in the labels. Existing cached font glyphs refresh when the active device changes, and bitmap prompts use immutable, cached Metal variants. The controller reference diagram uses the same mapping. Font-cache replacement is currently validated for 1.2.1.
+
+`TOTK_MOUSE_SENS` sets initial sensitivity (0 to 10, default 1; zero disables capture), and `TOTK_MOUSE_INVERT_Y=1` reverses vertical camera input. The diagnostic input stream accepts `capture 0|1`, `mouse <dx> <dy>` (positive Y is up), `mousebutton <0..4> <0|1>` and `prompts <0..4>` (keyboard, Xbox, PlayStation, Switch, generic). Mouse buttons are left, right, middle, back and forward. These commands are disabled unless `TOTK_INPUT_FILE` is explicitly configured.
+
+`tests/macos_mouse_test.py` checks delta ownership, frame-rate independence, brief clicks and focus changes. `tests/macos_game_input_test.py` checks hook installation, camera direction and protected modes. `tests/macos_prompts_test.py` checks actual bindings, device families and atlas replacement, including allocation failures; `tests/macos_prompt_assets_test.py` checks archive bounds and isolated layout changes. The C checks use AddressSanitizer and UndefinedBehaviorSanitizer.
+
 ## Player files and saves
 
 | Data | Location |
@@ -101,6 +140,8 @@ These timing and dimension checks still need visual acceptance at a physical 4K/
 | Versioned profiles | `~/Library/Application Support/TotKRecomp/<version>/` |
 | Shader cache | `~/Library/Caches/TotKRecomp/<version>/<toolchain-OS-GPU identity>/` |
 | Logs | `~/Library/Logs/TotKRecomp/` |
+
+Fixed `TOTK_SHADER_CACHE` development overrides also receive the toolchain/OS/GPU namespace. Changing translator settings requires rebuilding the native toolchain; alternate Python/DLL/debug translators cannot reuse its cache.
 
 Only one local app instance can own the player profile. A save writes to `save-tx/work`. Commit snapshots it with APFS copy-on-write, calls `fsync` on the files, atomically exchanges the committed directory, flushes publication metadata and completes one checked `F_FULLFSYNC` drive barrier before returning success. This barrier also persists every preceding file sync on the device. Failures return to the game and retain working data. Last writable-mount unmount rolls back to the committed generation; dirty work is kept in a recovery directory. Read-only mounts cannot modify either generation. Clean restarts do not accumulate recovery copies.
 

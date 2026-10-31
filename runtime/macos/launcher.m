@@ -1,14 +1,13 @@
 // Finder entry point. The signed bundle is read-only throughout a play session.
 #import <AppKit/AppKit.h>
-#import <Metal/Metal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
+#include "native_shader_cache.h"
 
 static int error(NSString *text) {
     fprintf(stderr, "%s\n", text.UTF8String);
@@ -53,15 +52,9 @@ int main(int argc, char **argv) {
         NSString *support = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/TotKRecomp"];
         NSString *profile = [support stringByAppendingPathComponent:version];
         NSString *logs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/TotKRecomp"];
-        NSString *identity = [[NSString stringWithContentsOfFile:[root stringByAppendingPathComponent:@"build/shader-service/totk_xlate.id"]
-                                                      encoding:NSUTF8StringEncoding error:nil]
-                             stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (identity.length != 64) return error(@"The shader translator identity is missing.");
-        char osbuild[64] = {0}; size_t osbytes = sizeof osbuild;
-        if (sysctlbyname("kern.osversion", osbuild, &osbytes, NULL, 0)) return error(@"Cannot identify the macOS graphics cache.");
-        id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();
-        NSString *cache = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/TotKRecomp"]
-            stringByAppendingFormat:@"/%@/%@-%s-%llx", version, identity, osbuild, (unsigned long long)gpu.registryID];
+        NSString *cache = native_shader_cache_path(root, [[NSHomeDirectory()
+            stringByAppendingPathComponent:@"Library/Caches/TotKRecomp"] stringByAppendingPathComponent:version]);
+        if (!cache) return error(@"Cannot identify the shader translator or macOS graphics cache.");
         NSString *slot = [support stringByAppendingPathComponent:@"game-slot"];
         if (!directory(profile) || !directory(logs) || !directory(cache) || !directory(slot))
             return error(@"Cannot create the saves, logs or shader cache folders.");

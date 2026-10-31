@@ -177,6 +177,8 @@ static Module modules[1] = {{.name="probe-only"}};
           '#define SHARED_FONT_ROWS {"",0,0,""}\n')
     write(out / 'native_layout.h', marker + 'static const struct { const char *name; uint64_t base, size; } '
           'native_modules[] = {{"probe-only", 0, 0}};\n')
+    write(out / 'native_prompt_textures.h', marker +
+          'static const NativePromptTextureIdentity prompt_textures[] = {{0,0,0,0,{0}}};\n')
 
 
 def compile_runtime(tree, out, version, jobs, probes):
@@ -188,21 +190,23 @@ def compile_runtime(tree, out, version, jobs, probes):
         if not proof.is_file():
             raise RuntimeError('Verified game tables are missing; run with --prepare-game first')
         prepared = json.loads(proof.read_text())
-        required = {'runtime_tables.h','romfs_config.h','shared_fonts_config.h','native_layout.h'}
+        required = {'runtime_tables.h','romfs_config.h','shared_fonts_config.h','native_layout.h','native_prompt_textures.h'}
         if (prepared.get('version') != version or
             prepared.get('source_id') != (tree.parent.parent / '.source-id').read_text() or
             prepared.get('layout_sha256') != digest(ROOT / 'recomp/layout.py') or
             set(prepared.get('headers', {})) != required or
             any(not (out / name).is_file() or digest(out / name) != sha for name, sha in prepared['headers'].items())):
             raise RuntimeError('Native preparation is stale or changed; run --prepare-game again')
-    includes = [tree / 'third_party/d2r_gfx/gfx/nvn/include', tree / 'third_party/d2r_gfx/gfx/nvn', out, INTEGRATION]
+    includes = [tree / 'runtime', tree / 'third_party/d2r_gfx/gfx/nvn/include', tree / 'third_party/d2r_gfx/gfx/nvn', out, INTEGRATION]
     libs = []
     for name, inc in [('opus', 'include/opus'), ('libvpx', 'include')]:
         archive = 'libopus.a' if name == 'opus' else 'libvpx.a'
         prefix = library_prefix(name, archive)
         includes.append(prefix / inc)
         libs.append(prefix / 'lib' / archive)
-    flags = ['-arch', 'arm64', '-mmacosx-version-min=26.0', '-std=gnu11', '-O3', '-flto=thin', '-g',
+    sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+    sdk_build = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-build-version'], text=True).strip()
+    flags = ['-arch', 'arm64', '-isysroot', sdk, '-mmacosx-version-min=26.0', '-std=gnu11', '-O3', '-flto=thin', '-g',
              '-fno-strict-aliasing', '-Wall', '-Wextra', '-Wno-deprecated-declarations',
              '-Wno-unused-function', '-Wno-unused-parameter', '-fobjc-arc', f'-DTOTK_GAME_{version.upper()}=1']
     flags += [f'-I{p}' for p in includes]
@@ -218,14 +222,14 @@ def compile_runtime(tree, out, version, jobs, probes):
         raise RuntimeError('Native source basenames must be unique')
     compiler = subprocess.check_output(['xcrun', 'clang', '--version'], text=True).strip()
     compiler_stamp = out / 'compiler.id'
-    write(compiler_stamp, compiler + '\n')
+    write(compiler_stamp, compiler + '\n' + sdk + '\n' + sdk_build + '\n')
     lto_cache = out / 'lto-cache'
     lto_cache.mkdir(exist_ok=True)
     lines = ['ninja_required_version = 1.10',
              f'flags = {" ".join(quote(x) for x in flags)}',
              'rule cc', '  command = xcrun clang $flags -MMD -MF $out.d -c $in -o $out',
              '  depfile = $out.d', '  deps = gcc', '  description = CC $in', 'rule link',
-             '  command = xcrun clang -arch arm64 -mmacosx-version-min=26.0 -flto=thin -Wl,-dead_strip ' +
+             '  command = xcrun clang -arch arm64 -isysroot ' + quote(sdk) + ' -mmacosx-version-min=26.0 -flto=thin -Wl,-dead_strip ' +
              quote(f'-Wl,-cache_path_lto,{lto_cache}') + ' $in ' +
              ' '.join(quote(p) for p in libs) + ' ' +
              ' '.join(f'-framework {f}' for f in FRAMEWORKS) +
@@ -247,7 +251,7 @@ def compile_runtime(tree, out, version, jobs, probes):
     inputs['recomp/layout.py'] = digest(ROOT / 'recomp/layout.py')
     write(out / 'build-info.json', json.dumps({'target': 'macos-arm64', 'version': version, 'inputs': inputs,
           'libraries': {str(p): digest(p) for p in libs},
-          'compiler': compiler.splitlines()[0],
+          'compiler': compiler.splitlines()[0], 'sdk': sdk, 'sdk_build': sdk_build,
           'upstream': mng_pin(), 'source_id': (tree.parent.parent / '.source-id').read_text(),
           'probe_only': probes, 'binary_sha256': digest(binary)}, indent=2) + '\n')
     return binary

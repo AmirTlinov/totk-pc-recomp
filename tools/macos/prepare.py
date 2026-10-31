@@ -94,6 +94,8 @@ def prepare_game(tree, out, version, jobs, extracted):
     for command in commands:
         run([sys.executable, *command], cwd=tree, env=env)
     write_layout(tree, out, version)
+    from macos.prompts import prepare_prompts
+    prepare_prompts(extracted, out, version)
     run([sys.executable, 'scripts/prepare_shared_fonts.py'], cwd=tree, env=env)
     shutil.copy2(tree / 'build/shared_fonts_config.h', out / 'shared_fonts_config.h')
     for name in ('runtime_tables.h', 'romfs_config.h', 'shared_fonts_config.h'):
@@ -112,4 +114,4 @@ def prepare_game(tree, out, version, jobs, extracted):
           'source_id': (tree.parent.parent / '.source-id').read_text(),
           'layout_sha256': digest(ROOT / 'recomp/layout.py'),
           'headers': {name: digest(out / name) for name in
-                      ('runtime_tables.h','romfs_config.h','shared_fonts_config.h','native_layout.h')}}, indent=2) + '\n')
+                      ('runtime_tables.h','romfs_config.h','shared_fonts_config.h','native_layout.h','native_prompt_textures.h')}}, indent=2) + '\n')

@@ -1,3 +1,4 @@
+diff --git a/runtime/game_patches.c b/runtime/game_patches.c
 --- a/runtime/game_patches.c
 +++ b/runtime/game_patches.c
 @@ -1,3 +1,4 @@
@@ -21,15 +22,16 @@
      if (dt > 1.0 / 15.0) dt = 1.0 / 15.0;
      frame_samples[frame_sample_next++ % 5] = dt;
      if (frame_sample_count < 5) frame_sample_count++;
-@@ -278,6 +279,7 @@
+@@ -278,6 +279,8 @@
      unsigned w, h;
      if (!runtime_output_res(&w, &h)) return 0;
      double ratio = (double)w * h / (1920.0 * 1080.0);
-+    if(native_policy_strict())ratio += ((double)w*h/(1600.0*900.0)-1.0);
++    // Match the generated HeapDef overlay in both gameplay and diagnostics.
++    if(w==3840 && h==2160)ratio += ((double)w*h/(1600.0*900.0)-1.0);
      if (ratio <= 1.0) return 0;
      uint64_t kib = (uint64_t)ceil(113664.0 * ratio / 1024.0) * 1024 - 113664;
      return kib << 10;
-@@ -320,6 +322,7 @@
+@@ -320,6 +323,7 @@
  /* Two-state output-size helper retained for internal use: switch between the largest size and 1920x1080. The renderer
     lays out again at the next frame (see patch_output_res). */
  int runtime_output_res_toggle(void) {
@@ -37,7 +39,7 @@
      if (!output_page) { fprintf(stderr, "[totk] key 3: switching the output size needs a 2K-capable start (TOTK_OUTPUT_RES auto with the HeapDef overlay, or <w>x<h>)\n"); return 0; }
      _Atomic uint64_t *size = (_Atomic uint64_t *)(void *)(output_page + DP_OUTPUT_SIZE);
      int full = atomic_load(size) != pack_size(output_w, output_h);
-@@ -339,6 +342,7 @@
+@@ -339,6 +343,7 @@
  /* Key 3: cycle the active 2K presentation path. The normal startup is 1080p game output with the MetalFX output scaler
     enabled; native 2K switches the game's canvas/UI to 2560x1440; off returns to 1080p and disables the output scaler. */
  int runtime_output_mode_cycle(void) {
@@ -45,6 +47,24 @@
      if (!output_page) {
          fprintf(stderr, "[totk] key 3: 2K mode cycling needs a 2K-capable start (TOTK_OUTPUT_RES=auto with the HeapDef overlay, or <w>x<h>)\n");
          return 0;
+@@ -422,6 +427,8 @@
+     fprintf(stderr, "[totk] TOTK_PCHTXT %s: %u patches, %u bytes in main (build id %s)\n", path, count, bytes, want);
+ }
+ 
++extern void native_game_input_install(Module *m);
++
+ void runtime_game_patches(Module *m) {
+     runtime_survey_init(m);
+     const size_t n = sizeof fps60_sites / sizeof fps60_sites[0];
+@@ -455,6 +462,7 @@
+ #else
+     if (aspect_requested()) runtime_fail("TOTK_ASPECT: only 1.2.1 and 1.4.3 so far");
+ #endif
++    native_game_input_install(m);
+     if (!fps60_enabled()) {
+         fprintf(stderr, "[totk] 60 FPS patch off (TOTK_FPS60=0): shipping present interval range 2..3\n");
+         return;
+diff --git a/runtime/game_patches_v143.c b/runtime/game_patches_v143.c
 --- a/runtime/game_patches_v143.c
 +++ b/runtime/game_patches_v143.c
 @@ -1,3 +1,4 @@
@@ -69,17 +89,32 @@
      frame_samples[frame_sample_next++%5]=dt;if(frame_sample_count<5)frame_sample_count++;
      double sum=0;for(unsigned i=0;i<frame_sample_count;i++)sum+=frame_samples[i];
      frame_step_store((float)(sum/frame_sample_count));
-@@ -182,7 +184,8 @@
+@@ -107,12 +109,14 @@
+ }
+ static void patch_output_res(Module *m);
+ static void patch_render_res(Module *m);
++extern void native_game_input_install(Module *m);
+ void runtime_game_patches(Module *m) {
+     runtime_survey_init(m);
+     if (strcmp(m->name, "main")) runtime_fail("1.4.3 game patches expect main");
+     patch_realtime(m);
+     patch_output_res(m);
+     patch_render_res(m);
++    native_game_input_install(m);
+     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
+       aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
+                      (m->file_size + 0x3fff) & ~0x3fffULL); }
+@@ -182,7 +186,8 @@
  }
  uint64_t runtime_output_res_extra_bytes(void){
      unsigned w,h;if(!runtime_output_res(&w,&h))return 0;
 -    double ratio=(double)w*h/(1920.0*1080.0);if(ratio<=1)return 0;
 +    double ratio=(double)w*h/(1920.0*1080.0);
-+    if(native_policy_strict())ratio+=((double)w*h/(1600.0*900.0)-1.0);if(ratio<=1)return 0;
++    if(w==3840 && h==2160)ratio+=((double)w*h/(1600.0*900.0)-1.0);if(ratio<=1)return 0;
      uint64_t kib=(uint64_t)ceil(113664.0*ratio/1024.0)*1024-113664;return kib<<10;
  }
  static void patch_output_res(Module *m){
-@@ -282,12 +285,15 @@
+@@ -282,12 +287,15 @@
      }
      for(unsigned i=0;i<sizeof sites/sizeof *sites;i++)memcpy(m->base+sites[i].off,&want[i],4);
  #endif
@@ -96,7 +131,7 @@
      if(!output_page)return 0;
      _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(output_page+32);
      int full=atomic_load(size)!=pack_size(output_w,output_h);
-@@ -298,6 +304,7 @@
+@@ -298,6 +306,7 @@
      return 1;
  }
  int runtime_output_mode_cycle(void){
@@ -104,6 +139,7 @@
      if(!output_page)return 0;
      extern int mfxup_output_enabled(void);extern void dm_gfx_set_flag(const char *,int);
      int full=atomic_load((_Atomic uint64_t *)(void *)(output_page+32))==pack_size(output_w,output_h);
+diff --git a/runtime/loader.c b/runtime/loader.c
 --- a/runtime/loader.c
 +++ b/runtime/loader.c
 @@ -1,5 +1,6 @@
@@ -183,7 +219,26 @@
   }
   runtime_fail("unknown gate return address");
  }
-@@ -424,21 +449,6 @@
+@@ -308,8 +333,7 @@
+  char b[128];size_t n=0;while(*label)b[n++]=*label++;b[n++]='0';b[n++]='x';
+  for(int i=15;i>=0;i--)b[n++]="0123456789abcdef"[(value>>(i*4))&15];b[n++]='\n';write(2,b,n);
+ }
+-/* CTR_EL0 for 128-byte host cache lines: DminLine=IminLine=5 (32 words), ERG=CWG=5, PIPT I-cache, IDC/DIC clear. */
+-#define HOST_CTR_EL0 0x8555c005ULL
++#include "native_cache_register.h"
+ /* #57: the same optional reference as below (object+0x6b0, a holder whose first word is the target) can outlive its
+    holder: after long play the freed holder's memory held other data (the low region's base, two floats 1.0), the caller
+    at GAME_ADDR(0x15ecb0c) passed that word as the target, and the callee faulted reading the target's id (+0x10). The
+@@ -369,7 +393,7 @@
+  }
+  /* EL0 cache maintenance that Darwin traps but Horizon allows: emulate exactly two encodings (SDK only). */
+  if(num==SIGILL){uint32_t insn=*(const uint32_t *)(uintptr_t)u->uc_mcontext->__ss.__pc;unsigned rt=insn&31;
+-  if((insn&~31u)==0xd53b0020u){if(rt!=31)u->uc_mcontext->__ss.__x[rt]=HOST_CTR_EL0;u->uc_mcontext->__ss.__pc+=4;return;}   /* mrs Xt, CTR_EL0 */
++  if((insn&~31u)==0xd53b0020u){if(rt!=31)u->uc_mcontext->__ss.__x[rt]=NATIVE_CTR_EL0;u->uc_mcontext->__ss.__pc+=4;return;}   /* mrs Xt, CTR_EL0 */
+   if((insn&~31u)==0xd50b7e20u){uintptr_t a=rt==31?0:(uintptr_t)u->uc_mcontext->__ss.__x[rt];sys_dcache_flush((void *)(a&~(uintptr_t)127),128);u->uc_mcontext->__ss.__pc+=4;return;}   /* dc civac, Xt */
+  }
+  if((num==SIGBUS||num==SIGSEGV)&&runtime_fault_guard){sigjmp_buf *g=runtime_fault_guard;runtime_fault_guard=NULL;siglongjmp(*g,1);}   /* guarded host read of guest memory (uniform snapshot copies) */
+@@ -424,21 +448,6 @@
      if(mach_vm_read_overwrite(mach_task_self(),hp+done,n,(uintptr_t)buf,&got)!=KERN_SUCCESS||got!=n)break;if(write(fd,buf,(size_t)n)!=(ssize_t)n)break;done+=n;}close(fd);signal_hex("heapdump bytes=",done);}}}}
   _exit(128+num);
  }
@@ -205,7 +260,7 @@
  int runtime_module_offset(uint64_t pc,const char **name,uint64_t *off) {
   for(unsigned i=0;i<NM;i++)if(pc>=(uintptr_t)modules[i].base&&pc<(uintptr_t)modules[i].base+modules[i].size){*name=modules[i].name;*off=pc-(uintptr_t)modules[i].base;return 1;}
   return 0;
-@@ -481,25 +491,33 @@
+@@ -481,25 +490,42 @@
   (void)num;void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
   signal(SIGABRT,SIG_DFL);raise(SIGABRT);
  }
@@ -245,6 +300,15 @@
 + for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,"main")) {
 +  runtime_game_patches(&modules[i]);native_patch_main(modules[i].base,modules[i].size);
 + }
++ for(unsigned i=0;i<NM;i++) {
++  Module *m=&modules[i];size_t end=(m->text_end+0x3fff)&~(size_t)0x3fff;
++  if(end>m->ro_off)end=m->ro_off;if(end>m->file_size)end=m->file_size;
++  size_t begin=(m->text_end+15)&~(size_t)15;
++  if(!strcmp(m->name,"main"))begin+=NATIVE_MAIN_TEXT_RESERVE;
++  ptrdiff_t count=native_fold_ctr(m->base,m->text_end,begin,end,NATIVE_CTR_EL0);
++  if(count>0)fprintf(stderr,"[totk] %s: %td cache-register reads use native constants\n",m->name,count);
++  if(count<0)fprintf(stderr,"[totk] %s: cache-register reads retain signal fallback (no free veneer range)\n",m->name);
++ }
 + verify_identity(0);
   for(unsigned i=0;i<NM;i++){seal(&modules[i]);check_permissions(&modules[i]);}
 - if(!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
@@ -252,3 +316,37 @@
 + if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);
 + return 0;
 +}
+diff --git a/runtime/services.c b/runtime/services.c
+--- a/runtime/services.c
++++ b/runtime/services.c
+@@ -1,6 +1,9 @@
+ /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
+ #include "runtime.h"
+ #include <TargetConditionals.h>
++#if !TARGET_OS_IPHONE
++#include "native_guest_memory.h"
++#endif
+ #include "ipc.h"
+ #include <mach/mach.h>
+ #include "mach_vm_compat.h"
+@@ -102,16 +105,16 @@
+  alias_space=low_space+LOW_SIZE;
+ #else
+  alias_space=reserve_fixed(ALIAS_SPACE_AT,ALIAS_SIZE);
+- if(alias_space)for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE);
++ if(alias_space)low_space=native_guest_reserve_gap(LOW_SIZE,LOW_SEARCH_FROM,ALIAS_SPACE_AT);
+  if(!low_space){
+   /* macOS 27: the shared cache fills 0x1_8000_0000..0xF_C000_0000 and the system reserves ~24 GiB at a random place in
+      0x70_0000_0000..2^39, so neither fixed region fits. As on iOS, put stack+heap and the alias region side by side in one
+-     free hole, shrinking the alias region (the game uses < 3 GiB of it) until it fits. TOTK_ALIAS_GIB pins one size. */
++     free hole, shrinking the alias region until it fits. Search actual gaps: a 1 GiB address step can miss a hole
++     large enough for the reservation. TOTK_ALIAS_GIB pins one size. */
+   if(alias_space)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)alias_space,ALIAS_SIZE);
+   uint64_t want=alias_requested(),least=getenv("TOTK_ALIAS_GIB")?want:(8ULL<<30);
+   for(uint64_t g=want;!low_space;g-=4ULL<<30){
+-   for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE+g<=GUEST_ADDRESS_LIMIT&&!low_space;at+=1ULL<<30)
+-    if((low_space=reserve_fixed(at,LOW_SIZE+g)))alias_len=g;
++   if((low_space=native_guest_reserve_gap(LOW_SIZE+g,LOW_SEARCH_FROM,GUEST_ADDRESS_LIMIT)))alias_len=g;
+    if(g<least+(4ULL<<30))break;
+   }
+   if(!low_space)runtime_fail(getenv("TOTK_ALIAS_GIB")?"reserve guest stack, heap and the TOTK_ALIAS_GIB alias region below 2^39":"reserve guest stack, heap and alias regions below 2^39");

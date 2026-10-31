@@ -14,9 +14,15 @@ import build_xlate
 from macos.build import BUILD, ROOT, digest, run, stage_sources, write, library_prefix
 from macos.prepare import link
 
-SPIRV_PIN = 'aa217aeb6c9f0ace7a0ab233b28807edf45eb165'
+SPIRV_PIN = '98cbb7c02be35364ecacc23dc0c038d2360b0ed0'
+METAL_FLAGS = ('-std=metal3.2', '-fmetal-math-mode=safe')
 SPIRV_SOURCES = ('main.cpp spirv_cfg.cpp spirv_cpp.cpp spirv_cross.cpp spirv_cross_parsed_ir.cpp '
                  'spirv_cross_util.cpp spirv_glsl.cpp spirv_hlsl.cpp spirv_msl.cpp spirv_parser.cpp spirv_reflect.cpp').split()
+
+
+def metal_compiler_identity():
+    version = subprocess.check_output(['xcrun', 'metal', '--version'], text=True)
+    return hashlib.sha256(json.dumps([METAL_FLAGS, version]).encode()).hexdigest()
 
 
 def build_tools(tree, jobs):
@@ -112,7 +118,7 @@ def compile_libraries(sources, libraries, jobs):
             return 0
         with tempfile.TemporaryDirectory(dir=libraries, prefix='compile-') as temporary:
             compiled = Path(temporary) / 'shader.metallib'
-            run(['xcrun', 'metal', '-fmetal-math-mode=safe', '-o', compiled, source])
+            run(['xcrun', 'metal', *METAL_FLAGS, '-o', compiled, source])
             compiled.replace(out)
         return 1
     unique = {digest(source): source for source in sources}
@@ -129,10 +135,13 @@ def prepare_shaders(tree, version, jobs):
     seed = tree / f'build/shader-seed/{version}'
     run([sys.executable, tree / 'scripts/prepare_shader_seed.py', '--romfs', tree / f'extracted/{version}/romfs',
          '--output', seed, '--translator', service, '--spirv-cross', cross, '--version', version,
-         '--modules', tree / f'rewritten/{version}'], cwd=tree)
+         '--modules', tree / f'rewritten/{version}'], cwd=tree,
+        env=dict(os.environ, TOTK_SHADER_DEBUGMODE='1'))
     run([sys.executable, tree / 'scripts/shader_list.py', 'export', tree / 'assets/shader_list.tsv',
          tree / 'build/pso_manifest.tsv', tree / 'build/pso_title.tsv'], cwd=tree)
-    compiler_id = hashlib.sha256((service.with_suffix('.id').read_text() + '-fmetal-math-mode=safe').encode()).hexdigest()
+    # Entries already include the full MSL hash. A translator change that emits
+    # identical MSL must not recompile it; only compiler options/version matter.
+    compiler_id = metal_compiler_identity()
     libraries = BUILD / 'shader-libs' / compiler_id
     libraries.mkdir(parents=True, exist_ok=True)
     link(tree / 'build/shader-libs', libraries)

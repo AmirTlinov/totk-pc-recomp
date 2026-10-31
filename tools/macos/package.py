@@ -80,6 +80,10 @@ def package(tree, out, version, probes):
                 CFBundleVersion='1', LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSSupportsGameMode=True, LSApplicationCategoryType='public.app-category.games',
                 GCSupportsControllerUserInteraction=True)
+    icon = BUILD / 'AppIcon.icns'
+    if icon.is_file():
+        copy(icon, resources / 'AppIcon.icns')
+        info['CFBundleIconFile'] = 'AppIcon'
     (stage / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     # Sign nested executables before sealing the outer bundle.
     for binary in (macos / 'totk-native', macos / 'TotKRecomp'):

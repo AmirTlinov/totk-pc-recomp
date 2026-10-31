@@ -12,6 +12,7 @@
 extern void runtime_fail(const char *message);
 
 static int strict_mode;
+static id<NSObject> activity_token;
 // Strict scene dimensions are constant; publish only the frame identity.
 // Zero denotes an unused slot, so frame zero is stored as one.
 static _Atomic uint64_t scene_frames[64];
@@ -19,11 +20,22 @@ static _Atomic uint64_t scene_frames[64];
 int native_policy_strict(void) { return strict_mode; }
 
 void native_policy_init(void) {
+    if (!activity_token) {
+        activity_token = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical |
+                                      NSActivityIdleDisplaySleepDisabled | NSActivityIdleSystemSleepDisabled)
+                              reason:@"TotK 4K 144Hz Gameplay"];
+    }
     const char *setting = getenv("TOTK_NATIVE_4K144");
     strict_mode = !setting || strcmp(setting, "0");
     const struct { const char *key, *value; } defaults[] = {
         {"TOTK_GPU_KEEPALIVE", "0"}, {"TOTK_ARG_BIND_CACHE", "1"},
         {"TOTK_POOL_QUERY_CACHE", "1"}, {"TOTK_USNAP_INDEX", "1"},
+        {"TOTK_PKG_FINAL_CACHE", "1"}, {"TOTK_ARG_EPOCH", "1"},
+        {"TOTK_TEX_SLOTS", "1"}, {"TOTK_SHADOW_INDEX", "1"},
+        {"TOTK_DRV_CACHE", "1"}, {"TOTK_ASYNC_REPLAY", "0"},
+        {"TOTK_TEXTURE_PLAN", "1"}, {"TOTK_INLINE_BULK", "1"},
+        {"TOTK_DIAG_ENV_ONCE", "1"}, {"TOTK_VERTEX_STREAMS", "1"},
         // Speculative pipeline scans compile mostly unused render states.
         // Keep the recorded startup cache and compile new states on demand.
         {"TOTK_PSO_PREDICT", "0"},
@@ -37,7 +49,8 @@ void native_policy_init(void) {
         {"DM_PRESENT_HZ", "144"}, {"DM_PRESENT_LINK", "1"}, {"DM_PRESENT_LATENCY", "1"},
         {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"}, {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"},
         {"TOTK_MFX", "0"}, {"TOTK_MFX_UPSCALE", "0"}, {"TOTK_MFX_OUTPUT", "0"},
-        {"TOTK_GPU_ALLOW_SUBMIT", "1"},
+        {"TOTK_GPU_ALLOW_SUBMIT", "1"}, {"TOTK_GPU_WIDEN", "1"},
+        {"TOTK_GPU_BLOCKRT", "1"}, {"TOTK_GPU_MIDCLEAR", "1"},
         {"TOTK_GPU_NOCOMMIT", "0"}, {"TOTK_SKIP_INVISIBLE", "0"}, {"TOTK_EXP_SKIP_INVISIBLE", "0"},
         {"TOTK_SKIP_STORERS", "0"}, {"DM_FPS", "60"},
     };

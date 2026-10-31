@@ -80,7 +80,7 @@ class NativeLinkTests(unittest.TestCase):
             probe_headers(out)
             tables = out / 'runtime_tables.h'
             tables.write_text(tables.read_text().replace('#define TOTK_PROBE_BUILD 1\n', ''))
-            headers = ('runtime_tables.h', 'romfs_config.h', 'shared_fonts_config.h', 'native_layout.h')
+            headers = ('runtime_tables.h', 'romfs_config.h', 'shared_fonts_config.h', 'native_layout.h', 'native_prompt_textures.h')
             (out / 'preparation.json').write_text(json.dumps({
                 'fixture': 'link-only, no game data', 'version': 'v143',
                 'source_id': (tree.parent.parent / '.source-id').read_text(),

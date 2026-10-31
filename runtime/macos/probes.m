@@ -13,6 +13,8 @@ extern void runtime_gpu_path_probe(const char *name);
 extern void runtime_save_probe(void);
 extern void runtime_swkbd_probe(void);
 extern void mtl_probe_warm_pipelines(void);
+extern void mtl_probe_attachment_ledger(void);
+extern void mtl_probe_attachment_feedback(void);
 extern uint64_t runtime_now_ns(void);
 
 static mach_timebase_info_data_t reference_timebase;
@@ -114,6 +116,15 @@ int native_run_probe(const char *name) {
     if (!strcmp(name, "--probe-clock")) return probe_clock();
     if (!strcmp(name, "--probe-pool-cache")) return probe_pool_cache();
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
+    if (!strcmp(name, "--probe-attachment-ledger") || !strcmp(name, "--probe-attachment-feedback")) {
+        setenv("TOTK_NATIVE_4K144", "0", 1);
+        setenv("TOTK_HEADLESS", "1", 1);
+        setenv("TOTK_PROBE_GPU", "1", 1);
+        native_policy_init();
+        if (!strcmp(name, "--probe-attachment-feedback")) mtl_probe_attachment_feedback();
+        else mtl_probe_attachment_ledger();
+        return 0;
+    }
     if (!strcmp(name, "--probe-trace")) return probe_trace(0);
     if (!strcmp(name, "--probe-trace-exit")) return probe_trace(1);
     if (!strcmp(name, "--probe-policy")) {

@@ -1,3 +1,4 @@
+diff --git a/runtime/fs_host.c b/runtime/fs_host.c
 --- a/runtime/fs_host.c
 +++ b/runtime/fs_host.c
 @@ -1,12 +1,10 @@
@@ -315,6 +316,7 @@
      printf("{\"status\":\"pass\",\"probe\":\"probe-save\",\"checks\":%u,\"scope\":\"save-in-progress state (runtime_fs_save_busy) through open / write / close / create / rename / delete / commit on a save mount; reads and temporary storage do not count; stale uncommitted changes do not hold a close\"}\n", checks);
  }
  
+diff --git a/runtime/romfs.c b/runtime/romfs.c
 --- a/runtime/romfs.c
 +++ b/runtime/romfs.c
 @@ -39,6 +39,21 @@

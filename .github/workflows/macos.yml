@@ -45,8 +45,16 @@ jobs:
           python tests/game_inputs_test.py -v
           python tests/macos_save_test.py -v
           python tests/macos_layout_test.py -v
+          python tests/macos_resolution_test.py -v
           python tests/macos_benchmark_test.py -v
           python tests/macos_build_test.py -v
+          python tests/macos_shader_cache_test.py
+          python tests/macos_guest_memory_test.py
+          python tests/macos_mouse_test.py
+          python tests/macos_prompts_test.py
+          python tests/macos_prompt_assets_test.py
+          python tests/macos_game_input_test.py
+          python tests/macos_cache_register_test.py
           python tests/macos_trace_test.py -v
           build/macos-arm64/probes-v143/totk-native --probe-policy
           build/macos-arm64/probes-v143/totk-native --probe-clock

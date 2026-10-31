@@ -1,5 +1,6 @@
 """Execute the actual local game's adaptive and emergency size producers."""
 import ctypes
+import ast
 from pathlib import Path
 import struct
 import subprocess
@@ -11,6 +12,49 @@ from unicorn.arm64_const import UC_ARM64_REG_X19, UC_ARM64_REG_W0, UC_ARM64_REG_
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = ROOT / 'generated/macos-arm64/v121/main.patched.bin'
+NATIVE_TREE = ROOT / 'build/macos-arm64/source/games/totk'
+
+
+@unittest.skipUnless(NATIVE_TREE.is_dir(), 'prepared native sources required')
+class ResolutionHeapTests(unittest.TestCase):
+    def test_runtime_allocation_matches_romfs_heap_in_both_modes(self):
+        # Execute the actual overlay generator's calculation without its CLI.
+        module = ast.parse((NATIVE_TREE / 'scripts/make_output_res_overlay.py').read_text())
+        names = {'BASE_W', 'BASE_H', 'DTA_KIB', 'GRAPHICS_KIB'}
+        nodes = []
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name == 'extra_kib':
+                nodes.append(node)
+            elif isinstance(node, ast.Assign) and any(
+                    isinstance(item, ast.Name) and item.id in names for item in ast.walk(node)):
+                nodes.append(node)
+        import math
+        overlay = {'math': math}
+        exec(compile(ast.Module(nodes, type_ignores=[]), '<overlay heap calculation>', 'exec'), overlay)
+        with tempfile.TemporaryDirectory(dir=ROOT / 'build') as directory:
+            directory = Path(directory)
+            code = ['#include <stdint.h>\n#include <math.h>\n'
+                    'static unsigned width,height; static int strict;\n'
+                    'int runtime_output_res(unsigned *w,unsigned *h){*w=width;*h=height;return 1;}\n'
+                    'int native_policy_strict(void){return strict;}\n'
+                    'void size_mode(unsigned w,unsigned h,int s){width=w;height=h;strict=s;}\n']
+            for version, name in [('v121', 'game_patches.c'), ('v143', 'game_patches_v143.c')]:
+                source = (NATIVE_TREE / 'runtime' / name).read_text()
+                start = source.index('uint64_t runtime_output_res_extra_bytes(')
+                end = source.index('\n}', start) + 2
+                code.append(source[start:end].replace('runtime_output_res_extra_bytes', f'extra_{version}'))
+            (directory / 'heap.c').write_text('\n'.join(code))
+            library = directory / 'heap.dylib'
+            subprocess.run(['xcrun', 'clang', '-dynamiclib', directory / 'heap.c', '-o', library], check=True)
+            native = ctypes.CDLL(str(library))
+            for version in ('v121', 'v143'):
+                function = getattr(native, f'extra_{version}')
+                function.restype = ctypes.c_uint64
+                for w, h in ((1280,720), (1920,1080), (2560,1440), (3840,2160), (3840,2159), (7680,4320)):
+                    for strict in (0,1):
+                        with self.subTest(version=version, size=(w,h), strict=strict):
+                            native.size_mode(w,h,strict)
+                            self.assertEqual(function(), overlay['extra_kib'](w,h)*1024)
 
 
 @unittest.skipUnless(IMAGE.is_file(), 'verified local 1.2.1 modules required')
