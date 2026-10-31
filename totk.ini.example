@@ -110,8 +110,10 @@
 # gpu_name = NVIDIA
 # Game resolution: the size the game draws its picture and interface in (1280x720 to 7680x4320). Above 1920x1080 the
 # game's texture heap and memory pool grow with it. A size wider than 16:9, such as 3440x1440 on a 21:9 monitor, widens
-# the camera's view to that shape and lays the HUD out for it (1.4.3; the installer prepares the UI for 2560x1080,
-# 3440x1440, 3840x1600 and 5120x2160). Read at start.
+# the camera's view to that shape and lays the HUD out for it. That is 1.4.3 only (1.2.1 keeps the 16:9 view), and the
+# installer prepares the UI layout for four sizes: 2560x1080, 3440x1440, 3840x1600 and 5120x2160. Any other shape
+# (16:10, 32:9) gets the camera's view but a 16:9 HUD, stretched over the picture, unless you build its layout with
+# tools/make_romfs_patches.py --aspect WxH (wider than 16:9 only). Read at start.
 # output_res = 1920x1080
 # 3D render scale: the scene's size relative to the game resolution, game (5/6, the game's own 1600x900 at 1080p) or
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
@@ -121,8 +123,9 @@
 # upscaler = fsr
 # sharpness = 80
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
-# window): fit keeps it, with black bars at the sides or above and below; stretch fills the window. Changes while the
-# game runs take effect at once.
+# window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
+# window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at
+# once.
 # aspect = fit
 
 [language]
