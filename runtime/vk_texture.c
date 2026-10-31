@@ -1216,7 +1216,12 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         vmaFlushAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
         barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         int done = 0;
-        if (agpu) {
+        // A BC3 image takes whole 4x4 blocks, or a part that ends on the mip's edge; a region of a 5x5 or 6x6 footprint
+        // may end inside a block (vk_astc_record checks the start corner).
+        uint32_t mw = e->t.d.width >> g->level, mh = e->t.d.height >> g->level;
+        int bc_cut = e->f.astc_bc && (((w & 3) && (uint32_t)r->xoffset + w != (mw ? mw : 1)) ||
+                                      ((h & 3) && (uint32_t)r->yoffset + h != (mh ? mh : 1)));
+        if (agpu && !bc_cut) {   // bc_cut: nothing recorded, logged below as not decoded
             VkAstcRegion *ar = calloc((size_t)g->nz, sizeof *ar);
             for (int z = 0; z < g->nz; z++)
                 ar[z] = (VkAstcRegion){.src = slice * (size_t)z, .w = w, .h = h, .slices = 1, .level = rg[z].imageSubresource.mipLevel,
