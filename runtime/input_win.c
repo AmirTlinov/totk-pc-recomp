@@ -515,12 +515,44 @@ static void binds_refresh(void) {
     input_map_configure();
 }
 
+// TOTK_TEST_PAD=<lx>,<ly>,<rx>,<ry> (test runs): an SDL virtual gamepad whose sticks rest at these raw SDL axis values
+// (-32768..32767, down is +y), attached before the first scan so it is the gamepad the game reads: drift and full
+// deflection go through the same mapping and dead zone as a real pad.
+static void test_pad_attach(void) {
+    static SDL_Joystick *joy;   // kept open: a virtual joystick's axes are set through an open handle
+    const char *e = cfg_get("TOTK_TEST_PAD");
+    int v[4];
+    if (!e || !*e) return;
+    if (sscanf(e, "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) != 4) {
+        rt_log("input: TOTK_TEST_PAD=%s is not <lx>,<ly>,<rx>,<ry>; no test gamepad", e);
+        return;
+    }
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.name = "TotK test gamepad";
+    SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
+    joy = id ? SDL_OpenJoystick(id) : NULL;
+    if (!joy) {
+        rt_log("input: test gamepad not attached (%s)", SDL_GetError());
+        return;
+    }
+    static const SDL_GamepadAxis axes[4] = {SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_RIGHTX,
+                                            SDL_GAMEPAD_AXIS_RIGHTY};
+    for (int i = 0; i < 4; i++)
+        SDL_SetJoystickVirtualAxis(joy, axes[i], (Sint16)(v[i] < -32768 ? -32768 : v[i] > 32767 ? 32767 : v[i]));
+    rt_log("input: test gamepad attached, sticks at %d,%d %d,%d", v[0], v[1], v[2], v[3]);
+}
+
 static void start(void) {
     binds_refresh();
     const char *e = cfg_get("TOTK_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (TOTK_INPUT=none)"); return; }
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
     else state = 1;
+    if (state == 1) test_pad_attach();
     if (state == 1) {
         scan_pads();
         if (!pad) rt_log("input: no gamepad (keyboard only until one is connected)");
