@@ -10,6 +10,7 @@ enum {
     PERIODIC_PACKET_DRAW = 1u << 2,
     PERIODIC_PACKET_ICB_COMMAND = 1u << 3,
     PERIODIC_PACKET_ICB_BREAK = 1u << 4,
+    PERIODIC_FORM_PASS_LIMIT = 512,
 };
 
 typedef struct {
@@ -60,12 +61,17 @@ void periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t stat
 // Closed forms are related to the concrete pass occurrence after compilation.
 // The map is a bounded recent-history table for anchor-plan compilation.
 int periodic_form_for_pass(uint64_t pass_id, uint64_t *form_id, uint64_t *anchor_id);
+// The latest complete anchor publishes forms in render-pass order. The encode
+// worker uses the previous complete schedule; an in-progress anchor is never
+// visible through this query.
+int periodic_form_expected(uint32_t pass_index, uint64_t *form_id, uint64_t *anchor_id);
 int periodic_form_snapshot(uint64_t form_id, PeriodicFormSnapshot *snapshot);
 void periodic_form_set_closed_callback(PeriodicFormClosedFn callback);
 
 // An anchor is a guest-rendered state. A phase renderer may publish additional
 // states without advancing the guest simulation clock.
 uint64_t periodic_anchor_publish(uint64_t anchor_id);
+uint64_t periodic_anchor_sequence(void);
 uint64_t periodic_anchor_generation(uint64_t anchor_id);
 PeriodicFormStats periodic_form_stats(void);
 

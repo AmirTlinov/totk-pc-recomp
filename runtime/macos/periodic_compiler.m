@@ -55,7 +55,7 @@ static void finish_cluster(PeriodicICBCluster *clusters, uint32_t *count,
         .draw_count=draws,
         .dynamic_slot_count=dynamic_slots,
         .resource_slot_count=resource_slots,
-        .icb_eligible=draws >= 2,
+        .icb_eligible=draws >= 2 && commands <= PERIODIC_ICB_PACKET_LIMIT,
     };
 }
 
@@ -71,7 +71,7 @@ static PeriodicCompiledForm *compile_form(uint64_t form_id) {
         if (!(command->flags & PERIODIC_PACKET_ICB_COMMAND)) {
             if (commands) {
                 finish_cluster(clusters, &cluster_count, first, commands, draws, dynamic_slots, resource_slots);
-                if (draws >= 2) eligible_draws += draws;
+                if (draws >= 2 && commands <= PERIODIC_ICB_PACKET_LIMIT) eligible_draws += draws;
             }
             commands = draws = dynamic_slots = resource_slots = 0;
             continue;
@@ -86,7 +86,7 @@ static PeriodicCompiledForm *compile_form(uint64_t form_id) {
     }
     if (commands) {
         finish_cluster(clusters, &cluster_count, first, commands, draws, dynamic_slots, resource_slots);
-        if (draws >= 2) eligible_draws += draws;
+        if (draws >= 2 && commands <= PERIODIC_ICB_PACKET_LIMIT) eligible_draws += draws;
     }
     PeriodicCompiledForm *program = calloc(1, sizeof *program);
     if (!program) { free(clusters); return NULL; }
@@ -295,12 +295,12 @@ int periodic_compiler_probe(void) {
     const uint64_t draw[8] = {3, 0, 12}, boundary[8] = {0}, end[8] = {0};
     for (uint64_t anchor = 0; anchor < 3; ++anchor) {
         periodic_observe_packet(100, begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN | PERIODIC_PACKET_ICB_BREAK, NULL, 7000 + anchor);
-        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
-        periodic_observe_packet(102, address, 3, 0, 4, PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
+        periodic_observe_packet(102, address, 3, 0, 4, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         for (unsigned draw_index = 0; draw_index < 3; ++draw_index)
             periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(104, boundary, 0, 1, 0, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
-        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(105, end, 1, 0, 0, PERIODIC_PACKET_PASS_END | PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         periodic_anchor_publish(anchor);
@@ -310,7 +310,7 @@ int periodic_compiler_probe(void) {
     PeriodicCompilerStats stats = periodic_compiler_stats();
     if (!program || program->cluster_count != 2 || program->draw_count != 4 ||
         program->eligible_draw_count != 3 || program->dynamic_slot_count != 8 ||
-        program->resource_slot_count != 3 || stats.compiled_forms != 1 || stats.dropped_forms || !probe_metal_icb()) return 1;
+        program->resource_slot_count != 0 || stats.compiled_forms != 1 || stats.dropped_forms || !probe_metal_icb()) return 1;
     printf("{\"probe\":\"periodic-compiler\",\"status\":\"pass\",\"forms\":1,\"clusters\":2,\"draws\":4,\"icb_eligible_draws\":3,\"metal4_icb\":true}\n");
     return 0;
 }

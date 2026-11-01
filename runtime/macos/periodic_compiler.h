@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+enum { PERIODIC_ICB_PACKET_LIMIT = 128 };
+
 typedef struct {
     uint32_t first_command;
     uint32_t command_count;

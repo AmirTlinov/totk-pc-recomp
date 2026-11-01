@@ -57,6 +57,9 @@ static struct {
     _Atomic uint64_t published_form_count;
     _Atomic(PeriodicFormClosedFn) closed_callback;
     _Atomic uint8_t closed_flags[FORM_CAPACITY];
+    _Atomic uint64_t schedule_sequence, schedule_anchor;
+    _Atomic uint32_t schedule_pass_count;
+    _Atomic uint64_t schedule_forms[PERIODIC_FORM_PASS_LIMIT];
     _Atomic uint64_t state_generation;
     struct { _Atomic uint64_t anchor, generation; } anchors[ANCHOR_SLOTS];
     _Atomic int active, stopping;
@@ -138,6 +141,20 @@ int periodic_form_for_pass(uint64_t pass_id, uint64_t *form_id, uint64_t *anchor
     return form != 0;
 }
 
+int periodic_form_expected(uint32_t pass_index, uint64_t *form_id, uint64_t *anchor_id) {
+    if (!periodic_form_active()) return 0;
+    uint64_t sequence = atomic_load_explicit(&state.schedule_sequence, memory_order_acquire);
+    if (sequence & 1) return 0;
+    uint32_t count = atomic_load_explicit(&state.schedule_pass_count, memory_order_relaxed);
+    if (pass_index >= count) return 0;
+    uint64_t form = atomic_load_explicit(&state.schedule_forms[pass_index], memory_order_relaxed);
+    uint64_t anchor = atomic_load_explicit(&state.schedule_anchor, memory_order_relaxed);
+    if (atomic_load_explicit(&state.schedule_sequence, memory_order_acquire) != sequence) return 0;
+    if (form_id) *form_id = form;
+    if (anchor_id) *anchor_id = anchor;
+    return form != 0;
+}
+
 static void forget_forms(void) {
     for (size_t i = 0; i < state.form_count; ++i) free(state.forms[i].commands);
     free(state.forms);
@@ -146,7 +163,7 @@ static void forget_forms(void) {
     memset(state.buckets, 0, sizeof state.buckets);
 }
 
-static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
+static uint64_t retain_form(CompiledForm *candidate, uint64_t anchor_id) {
     unsigned bucket = (unsigned)(candidate->hash % FORM_BUCKETS);
     for (uint32_t entry = state.buckets[bucket]; entry; entry = state.forms[entry - 1].next) {
         CompiledForm *form = &state.forms[entry - 1];
@@ -162,11 +179,11 @@ static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
             if (callback) callback(form->id);
         }
         if (form->closed) publish_pass_form(candidate->pass_id, form->id, anchor_id);
-        return;
+        return form->closed ? form->id : 0;
     }
     if (state.form_count == FORM_CAPACITY) {
         atomic_fetch_add_explicit(&state.invalidated_forms, 1, memory_order_relaxed);
-        return;
+        return 0;
     }
     candidate->last_anchor = anchor_id;
     candidate->id = state.form_count + 1;
@@ -177,6 +194,25 @@ static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
     atomic_store_explicit(&state.published_form_count, state.form_count, memory_order_release);
     memset(candidate, 0, sizeof *candidate);
     atomic_fetch_add_explicit(&state.learned_forms, 1, memory_order_relaxed);
+    return 0;
+}
+
+static void publish_schedule(CompiledForm pending[PENDING_FORM_CAPACITY], size_t count,
+                             uint64_t anchor_id) {
+    atomic_fetch_add_explicit(&state.schedule_sequence, 1, memory_order_acq_rel);
+    uint32_t published = count < PERIODIC_FORM_PASS_LIMIT ? (uint32_t)count : PERIODIC_FORM_PASS_LIMIT;
+    for (uint32_t pass = 0; pass < published; ++pass) {
+        uint64_t form_id = retain_form(&pending[pass], anchor_id);
+        atomic_store_explicit(&state.schedule_forms[pass], form_id, memory_order_relaxed);
+        free(pending[pass].commands);
+    }
+    for (size_t pass = published; pass < count; ++pass) {
+        retain_form(&pending[pass], anchor_id);
+        free(pending[pass].commands);
+    }
+    atomic_store_explicit(&state.schedule_pass_count, published, memory_order_relaxed);
+    atomic_store_explicit(&state.schedule_anchor, anchor_id, memory_order_relaxed);
+    atomic_fetch_add_explicit(&state.schedule_sequence, 1, memory_order_release);
 }
 
 static void append_command(CompiledForm *candidate, const ObserverRecord *record) {
@@ -261,10 +297,7 @@ static void *compile_forms(void *unused) {
                 candidate.hash = UINT64_C(1469598103934665603);
                 in_pass = 0;
             }
-            for (size_t i = 0; i < pending_count; ++i) {
-                retain_form(&pending[i], record->anchor_id);
-                free(pending[i].commands);
-            }
+            publish_schedule(pending, pending_count, record->anchor_id);
             pending_count = 0;
             atomic_store_explicit(&state.read, read + 1, memory_order_release);
             atomic_store_explicit(&state.processed, read + 1, memory_order_release);
@@ -389,6 +422,10 @@ uint64_t periodic_anchor_publish(uint64_t anchor_id) {
     return generation;
 }
 
+uint64_t periodic_anchor_sequence(void) {
+    return atomic_load_explicit(&state.state_generation, memory_order_acquire);
+}
+
 uint64_t periodic_anchor_generation(uint64_t anchor_id) {
     if (!periodic_form_active()) return anchor_id + 1;
     unsigned slot = (unsigned)(anchor_id % ANCHOR_SLOTS);
@@ -457,8 +494,10 @@ int periodic_form_probe(void) {
     }
     periodic_form_flush();
     PeriodicFormStats stats = periodic_form_stats();
-    uint64_t form_id = 0, mapped_anchor = 0;
+    uint64_t form_id = 0, mapped_anchor = 0, expected_form = 0, expected_anchor = 0;
     if (!periodic_form_for_pass(1002, &form_id, &mapped_anchor) || form_id != 1 || mapped_anchor != 2) return 1;
+    if (!periodic_form_expected(0, &expected_form, &expected_anchor) ||
+        expected_form != 1 || expected_anchor != 2 || periodic_form_expected(1, NULL, NULL)) return 1;
     if (stats.closed_forms != 1 || stats.learned_forms != 1 || stats.mapped_passes != 1 || stats.dropped_records ||
         stats.observed_packets != 12 || stats.observed_anchors != 3 || stats.state_generation != 3) return 1;
     enum { BENCH_PACKETS = 4096, BENCH_ROUNDS = 9 };

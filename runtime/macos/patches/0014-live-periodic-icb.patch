@@ -1,0 +1,185 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+index bdcba63..78442ac 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -1,4 +1,5 @@
+ #include "native_policy.h"
++#include "periodic_executor.h"
+ #include "periodic_store.h"
+ #include "prompt_textures.h"
+ #include "input_prompts.h"
+@@ -227,6 +228,7 @@ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+ 
+ static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // 驻留集专用锁：res_add 会在持 g_mu 的路径里调用（arena_new），不能共用 g_mu | Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
+ static NSHashTable *g_res_objects;
++static _Atomic uint64_t g_periodic_buffer_generation = 1;
+ /* TOTK residency accounting by registration site. The four macOS kernel panics (IOGPUFamily, after kIOReturnNoMemory)
+    all show ~15 GB of wired memory on the 16 GB machine with totk-native on the Metal submission queue: the driver ran out
+    of memory wiring what this residency set made resident. Live resident bytes are attributed to the res_add source line
+@@ -256,6 +258,8 @@ static void res_add_at(id<MTLResource> r, int site) {
+             NvAllocTrack *tr = [NvAllocTrack new]; tr->site = site; tr->bytes = sz; atomic_fetch_add(&g_res_site[site].alive, 1); atomic_fetch_add(&g_res_site[site].alive_bytes, sz);
+             objc_setAssociatedObject(r, &g_alloc_track_key, tr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+         }
++        if ([r respondsToSelector:@selector(gpuAddress)] && [r respondsToSelector:@selector(length)])
++            atomic_fetch_add_explicit(&g_periodic_buffer_generation, 1, memory_order_relaxed);
+     }
+     g_res_dirty = 1;
+     pthread_mutex_unlock(&g_res_mu);
+@@ -266,6 +270,8 @@ static void res_remove_body(id<MTLResource> r) {
+     pthread_mutex_lock(&g_res_mu);
+     [g_res removeAllocation:(id<MTLAllocation>)r];
+     if ([g_res_objects containsObject:r]) {
++        if ([r respondsToSelector:@selector(gpuAddress)] && [r respondsToSelector:@selector(length)])
++            atomic_fetch_add_explicit(&g_periodic_buffer_generation, 1, memory_order_relaxed);
+         int site = ((NSNumber *)[g_res_site_of objectForKey:r]).intValue; uint64_t sz = (uint64_t)r.allocatedSize;
+         g_res_site[site].removes++; g_res_site[site].live_bytes -= sz < g_res_site[site].live_bytes ? sz : g_res_site[site].live_bytes;
+         g_res_live_bytes -= sz < g_res_live_bytes ? sz : g_res_live_bytes;
+@@ -274,6 +280,28 @@ static void res_remove_body(id<MTLResource> r) {
+     g_res_dirty = 1;
+     pthread_mutex_unlock(&g_res_mu);
+ }
++static uint64_t periodic_buffer_generation(void) {
++    return atomic_load_explicit(&g_periodic_buffer_generation, memory_order_relaxed);
++}
++static int periodic_resolve_buffer(uint64_t address, uint64_t length, void **retained, uint64_t *offset) {
++    if (!address || !retained || !offset) return 0;
++    uint64_t end = address + length;
++    if (end < address) return 0;
++    int found = 0;
++    pthread_mutex_lock(&g_res_mu);
++    for (id candidate in g_res_objects) {
++        if (![candidate respondsToSelector:@selector(gpuAddress)] || ![candidate respondsToSelector:@selector(length)]) continue;
++        id<MTLBuffer> buffer = candidate;
++        uint64_t base = buffer.gpuAddress, limit = base + buffer.length;
++        if (limit < base || address < base || end > limit) continue;
++        *retained = (void *)CFBridgingRetain(buffer); *offset = address - base; found = 1; break;
++    }
++    pthread_mutex_unlock(&g_res_mu);
++    return found;
++}
++static void periodic_make_resident(void *allocation) {
++    res_add_at((__bridge id<MTLResource>)allocation, __LINE__);
++}
+ static int g_res_remove_no_pool; // GPU probe negative control only
+ static void res_remove(id<MTLResource> r) {
+     if (!r) return;
+@@ -614,6 +642,7 @@ void mtl_init(void) {
+     g_keep = [NSMutableArray array];
+     g_nvn_deswz_gpu = nvn_deswz_gpu_init(g_dev) == 0;
+     dm_res_report_register(mtl_res_counts);
++    periodic_executor_init(g_dev, periodic_buffer_generation, periodic_resolve_buffer, periodic_make_resident);
+     if (!g_nvn_deswz_gpu) MLOG("【红】显卡解排布初始化失败，预排布贴图回退 CPU");
+     MLOG("Metal 设备 %s", g_dev.name.UTF8String);
+     udc_selftest();
+@@ -1280,9 +1309,11 @@ @protocol TotkPeriodicMTLResource
+ static void periodic_note_mtl_resource(id resource, uint64_t offset, uint64_t length,
+                                        uint32_t kind, uint32_t role, uint8_t access) {
+     if (!resource || !periodic_store_active()) return;
+-    uint64_t identity = ((id<TotkPeriodicMTLResource>)resource).gpuResourceID._impl;
++    uint64_t identity = kind == 4 ? ((id<MTLBuffer>)resource).gpuAddress
++                                  : ((id<TotkPeriodicMTLResource>)resource).gpuResourceID._impl;
++    uint64_t generation = kind == 4 ? periodic_buffer_generation() : identity;
+     periodic_store_resource((PeriodicResourceKey){.owner=identity, .offset=offset,
+-        .length=length ? length : 1, .kind=kind}, identity, role, access);
++        .length=length ? length : 1, .kind=kind}, generation, role, access);
+ }
+ static inline void blit_close(void) { if (g_blit) { periodic_encoder_end(g_blit); m4_end(g_blit); g_blit = nil; } }
+ #include "nvn_render_stream.h"
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+index 7dfa1a6..420799d 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+@@ -16,6 +16,7 @@
+    No GPU ordering, resource retirement or uniform snapshot policy changes: B only encodes what A decided, in A's order. */
+ #include "nvn_encode_fifo.h"
+ #include "periodic_form.h"
++#include "periodic_executor.h"
+ #include <TargetConditionals.h>
+ #include <sched.h>
+ #include <dispatch/dispatch.h>
+@@ -27,6 +28,9 @@ enum {
+     RS_BEGIN,   /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
+     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
+ };
++_Static_assert(RS_PSO == PERIODIC_METAL_PSO && RS_DRAW == PERIODIC_METAL_DRAW &&
++               RS_INDEXED == PERIODIC_METAL_INDEXED && RS_BEGIN == PERIODIC_METAL_BEGIN &&
++               RS_END == PERIODIC_METAL_END, "periodic Metal packet ABI");
+ enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue before sleeping on the semaphore. During a replay A never pauses
+                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
+                                    not a hot spin: with a hot spin (2 ms yield loop) the visible-mode GPU time rose 8.9 -> 9.3 ms (analysis/rs3v-*,
+@@ -63,10 +67,10 @@ static inline void rs_observe(const nvn_encode_packet *p) {
+             for (unsigned i = 0; i < 4; ++i) refs[i] = (PeriodicResourceRef){.role=0x100u + i};
+             break;
+         case RS_END: fixed = 0x03; flags = PERIODIC_PACKET_PASS_END | PERIODIC_PACKET_ICB_BREAK; break;
+-        case RS_PSO: resources = 0x01; flags = PERIODIC_PACKET_ICB_COMMAND; refs[0] = (PeriodicResourceRef){.role=1}; break;
+-        case RS_DSS: resources = 0x01; flags = PERIODIC_PACKET_ICB_COMMAND; refs[0] = (PeriodicResourceRef){.role=2}; break;
++        case RS_PSO: resources = 0x01; flags = PERIODIC_PACKET_ICB_BREAK; refs[0] = (PeriodicResourceRef){.role=1}; break;
++        case RS_DSS: resources = 0x01; flags = PERIODIC_PACKET_ICB_BREAK; refs[0] = (PeriodicResourceRef){.role=2}; break;
+         case RS_ADDRESS:
+-            fixed = 0x03; resources = 0x04; flags = PERIODIC_PACKET_ICB_COMMAND;
++            fixed = 0x03; resources = 0x04; flags = PERIODIC_PACKET_ICB_BREAK;
+             refs[2] = (PeriodicResourceRef){.role=0x1000u + (uint32_t)(p->u[0] << 8) + (uint32_t)p->u[1]};
+             break;
+         case RS_DRAW: fixed = 0x01; dynamic = 0x06; flags = PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND; break;
+@@ -76,8 +80,8 @@ static inline void rs_observe(const nvn_encode_packet *p) {
+             refs[3] = (PeriodicResourceRef){.role=0x2000};
+             break;
+         case RS_CULL: case RS_WINDING: case RS_FILL: case RS_CLIP:
+-            dynamic = 0x01; flags = PERIODIC_PACKET_ICB_COMMAND; break;
+-        case RS_BIAS: dynamic = 0xff; flags = PERIODIC_PACKET_ICB_COMMAND; break;
++            dynamic = 0x01; flags = PERIODIC_PACKET_ICB_BREAK; break;
++        case RS_BIAS: dynamic = 0xff; flags = PERIODIC_PACKET_ICB_BREAK; break;
+         case RS_STENCIL: dynamic = 0x03; flags = PERIODIC_PACKET_ICB_BREAK; break;
+         case RS_VIEWPORT: case RS_SCISSOR: case RS_BLEND:
+             dynamic = 0xff; flags = PERIODIC_PACKET_ICB_BREAK; break;
+@@ -89,10 +93,12 @@ static inline void rs_observe(const nvn_encode_packet *p) {
+                             p->op == RS_BEGIN ? p->u[6] : 0);
+ }
+ static inline uint64_t rs_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+-static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *vt, id<MTL4ArgumentTable> *ft, const nvn_encode_packet *p) {
++static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *vt, id<MTL4ArgumentTable> *ft,
++                     uint64_t *anchor_sequence, uint32_t *pass_index, const nvn_encode_packet *p) {
+     const uint64_t *u = p->u; id<MTL4RenderCommandEncoder> e = *enc;
+     if (g_rs_probe_negative && (p->op == RS_DRAW || p->op == RS_INSTANCED || p->op == RS_INDEXED)) return;
+     if (p->op != RS_BEGIN && !e) MDIE("render stream packet %llu without an encoder", (unsigned long long)p->op);
++    if (p->op != RS_BEGIN && periodic_executor_packet((uint32_t)p->op, p->u)) return;
+     switch (p->op) {
+         case RS_BEGIN: {
+             if (e) MDIE("render stream: pass begun while the previous one is open");
+@@ -106,6 +112,10 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
+                 [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:(MTL4VisibilityOptions)u[5]];
+             } else if (u[4]) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[5]];
+             [e setArgumentTable:*vt atStages:MTLRenderStageVertex]; [e setArgumentTable:*ft atStages:MTLRenderStageFragment];
++            if (*anchor_sequence != u[7]) { *anchor_sequence = u[7]; *pass_index = 0; }
++            uint64_t form_id = 0;
++            if (periodic_form_expected((*pass_index)++, &form_id, NULL))
++                periodic_executor_begin(form_id, e, u);
+             CFRelease((CFTypeRef)(uintptr_t)u[0]);
+             *enc = e; atomic_fetch_add_explicit(&g_rs_b_passes, 1, memory_order_relaxed);
+             break; }
+@@ -142,6 +152,7 @@ static void *rs_worker(void *unused) {
+     pthread_setname_np("TOTK encode stage");
+     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+     id<MTL4RenderCommandEncoder> enc = nil; id<MTL4ArgumentTable> vt = nil, ft = nil;
++    uint64_t anchor_sequence = UINT64_MAX; uint32_t pass_index = 0;
+     uint64_t idle_since = 0, busy_since = 0;
+     for (;;) {
+         const nvn_encode_packet *p = nvn_encode_fifo_peek(&g_rs_fifo);
+@@ -158,7 +169,7 @@ static void *rs_worker(void *unused) {
+         }
+         if (!busy_since) busy_since = rs_now();
+         idle_since = 0;
+-        @autoreleasepool { rs_apply(&enc, &vt, &ft, p); }
++        @autoreleasepool { rs_apply(&enc, &vt, &ft, &anchor_sequence, &pass_index, p); }
+         nvn_encode_fifo_consume(&g_rs_fifo);
+         __builtin_arm_sev();
+     }
+@@ -225,7 +236,7 @@ static id rs_pass_begin(MTL4RenderPassDescriptor *d, id<MTL4ArgumentTable> vt, i
+     if (g_rs_active) MDIE("render stream: pass begun while another streamed pass is open");
+     g_rs_active = 1; g_rs_passes++;
+     rs_put((nvn_encode_packet){.op = RS_BEGIN, .u = {(uint64_t)(uintptr_t)CFBridgingRetain(d), (uint64_t)(uintptr_t)(__bridge void *)vt, (uint64_t)(uintptr_t)(__bridge void *)ft,
+-                                                     (uint64_t)(uintptr_t)(__bridge void *)cb, (uint64_t)bar_start, vis, g_periodic_render_pass_id}}, 1);
++                                                     (uint64_t)(uintptr_t)(__bridge void *)cb, (uint64_t)bar_start, vis, g_periodic_render_pass_id, periodic_anchor_sequence()}}, 1);
+     return g_rs_sentinel;
+ }
+ static int rs_using(id e) {

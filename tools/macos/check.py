@@ -30,7 +30,7 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(dir=logs, prefix='profile-') as profile:
         env = dict(os.environ, TOTK_PROFILE_DIR=profile, TOTK_NATIVE_4K144='0', TOTK_HEADLESS='1',
                    MTL_DEBUG_LAYER='1', MTL_DEBUG_LAYER_ERROR_MODE='assert')
-        for probe in ['selftest', 'probe-policy', 'probe-clock', 'probe-pool-cache', 'probe-periodic-form', 'probe-periodic-compiler', 'probe-periodic-store', 'probe-nvn-cpu', 'probe-save', 'probe-warm-pipelines', 'probe-attachment-ledger', 'probe-attachment-feedback',
+        for probe in ['selftest', 'probe-policy', 'probe-clock', 'probe-pool-cache', 'probe-periodic-form', 'probe-periodic-compiler', 'probe-periodic-executor', 'probe-periodic-store', 'probe-nvn-cpu', 'probe-save', 'probe-warm-pipelines', 'probe-attachment-ledger', 'probe-attachment-feedback',
                       *[f'probe-gpu-{name}' for name in args.gpu]]:
             log = logs / f'{probe}.log'
             with log.open('w') as output:
