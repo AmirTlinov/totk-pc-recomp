@@ -242,7 +242,8 @@ def compile_runtime(tree, out, version, jobs, probes):
                for s in RUNTIME_SOURCES if probes or s not in PROBE_SOURCES]
     gfx = tree / 'third_party/d2r_gfx/gfx'
     sources += sorted(p for d in ('nvn', 'tex') for p in (gfx / d).iterdir() if p.suffix in ('.c', '.m', '.S'))
-    sources += sorted(p for p in INTEGRATION.iterdir() if p.suffix in ('.c', '.m') and p.name != 'launcher.m')
+    sources += sorted(p for p in INTEGRATION.iterdir() if p.suffix in ('.c', '.m')
+                      and p.name != 'launcher.m' and (probes or not p.stem.endswith('_probe')))
     objects = [out / 'obj' / f'{p.name}.o' for p in sources]
     if len(set(objects)) != len(objects):
         raise RuntimeError('Native source basenames must be unique')

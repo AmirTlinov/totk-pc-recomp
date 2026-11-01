@@ -1,0 +1,33 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -13000,9 +13000,16 @@
+     if (!dr) return 0;
+     native_check_output((unsigned)dr.texture.width, (unsigned)dr.texture.height);
+     NativeFrame native_frame = {0};
+-    if (native_trace_active() || (interp < 0 && periodic_present_enabled()))
++    if (native_trace_active() || (interp < 0 && periodic_present_enabled())) {
+         native_frame = native_frame_capture(frame, (unsigned)src.width, (unsigned)src.height,
+                                             (unsigned)dr.texture.width, (unsigned)dr.texture.height);
++        native_frame.simulation_generation = simulation.generation;
++        native_frame.simulation_time_ns = simulation.simulation_time_ns;
++        native_frame.completed_step_ns = simulation.completed_step_ns;
++        native_frame.display_phase_time_ns = simulation.simulation_time_ns;
++        // FIFO minimum-duration presentation has no explicit target timestamp.
++        native_frame.requested_presentation_time_ns = target_ts > 0 ? (uint64_t)(target_ts * 1e9) : 0;
++    }
+     int alloc_i = (int)((ticket * 2 + (interp >= 0 ? 0 : 1)) % 3);   // the interpolated frame of a ticket and the ticket's own frame use different allocators
+     // Claim ownership before resetting or encoding. A display phase may probe
+     // the same slot concurrently while this anchor is prepared.
+@@ -13182,6 +13189,11 @@
+     NativeFrame native_frame = native_phase_capture(state.source_frame, state.anchor_id,
+         state.state_generation, state.phase, (unsigned)picture.width, (unsigned)picture.height,
+         (unsigned)drawable.texture.width, (unsigned)drawable.texture.height);
++    native_frame.simulation_generation = state.time.simulation_generation;
++    native_frame.simulation_time_ns = state.time.simulation_time_ns - state.time.elapsed_ns;
++    native_frame.completed_step_ns = 0; // A camera request completes no guest action.
++    native_frame.display_phase_time_ns = state.time.simulation_time_ns;
++    native_frame.requested_presentation_time_ns = state.time.presentation_time_ns;
+     uint64_t native_ticket = atomic_fetch_add_explicit(&g_native_present_ticket, 1, memory_order_relaxed) + 1;
+     [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+         CFTimeInterval time = shown.presentedTime;

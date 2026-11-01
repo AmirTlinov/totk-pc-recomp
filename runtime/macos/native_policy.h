@@ -13,12 +13,18 @@ typedef struct {
     uint64_t frame;
     uint64_t anchor_id;
     uint64_t state_generation;
+    // Completed guest work. A camera phase carries its source anchor's stamp
+    // and completes no guest step of its own.
+    uint64_t simulation_generation, simulation_time_ns, completed_step_ns;
+    uint64_t display_phase_time_ns;
+    // Zero means the FIFO scheduler has no explicit presentation deadline.
+    uint64_t requested_presentation_time_ns;
     double phase;
     unsigned kind;
     unsigned scene_width, scene_height, output_width, output_height;
     unsigned drawable_width, drawable_height;
 } NativeFrame;
-enum { NATIVE_FRAME_ANCHOR, NATIVE_FRAME_PHASE };
+enum { NATIVE_FRAME_ANCHOR, NATIVE_FRAME_PHASE, NATIVE_FRAME_CAMERA_PHASE };
 void native_check_scene(uint64_t frame, unsigned width, unsigned height);
 NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigned dw, unsigned dh);
 NativeFrame native_phase_capture(uint64_t source_frame, uint64_t anchor_id, uint64_t generation,

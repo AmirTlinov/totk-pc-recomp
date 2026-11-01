@@ -19,6 +19,7 @@ typedef struct {
     double dx, dy, sensitivity;
     uint64_t held, pressed, frame, sampled_ns, moved_ns, camera_frame;
     NativeMouseSample sample;
+    NativeMousePhase consumed_phase;
     bool captured, invert_y, has_frame, direct, has_camera, stick_override;
 } NativeMouseInput;
 
@@ -42,4 +43,7 @@ NativeMouseTurn runtime_input_mouse_turn(int normal_camera_active);
 // consuming the game's anchor input. The value changes only for accepted raw
 // mouse motion and is safe to read from the display-link thread.
 NativeMousePhase runtime_input_mouse_phase(void);
+// Exact cumulative sample consumed or discarded by the guest input owner.
+// Capture this once at the guest frame boundary and carry it with that frame.
+NativeMousePhase runtime_input_mouse_anchor_phase(void);
 #endif

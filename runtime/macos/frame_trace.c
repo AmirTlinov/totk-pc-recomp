@@ -1,9 +1,7 @@
 // Presentation callbacks only enqueue records. Formatting and disk I/O belong
 // to the writer; a full queue fails the capture instead of losing evidence.
 #include "native_policy.h"
-#include "periodic_executor.h"
-#include "periodic_form.h"
-#include "periodic_store.h"
+#include "periodic_gpu_encode.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -53,10 +51,15 @@ static void *write_trace(void *unused) {
         for (size_t i=0; i<n; ++i) {
             const TraceRecord *r = &batch[i];
             NativeFrame f = r->frame;
-            const char *kind = f.kind == NATIVE_FRAME_ANCHOR ? "anchor" : f.kind == NATIVE_FRAME_PHASE ? "phase" : "invalid";
-            if (fprintf(trace.file, "%llu,%llu,%s,%llu,%.9f,%llu,%.9f,%u,%u,%u,%u,%u,%u,%d\n",
+            const char *kind = f.kind == NATIVE_FRAME_ANCHOR ? "anchor" :
+                f.kind == NATIVE_FRAME_PHASE ? "phase" :
+                f.kind == NATIVE_FRAME_CAMERA_PHASE ? "camera" : "invalid";
+            if (fprintf(trace.file, "%llu,%llu,%s,%llu,%.9f,%llu,%llu,%llu,%llu,%llu,%llu,%.9f,%u,%u,%u,%u,%u,%u,%d\n",
                 (unsigned long long)r->ticket, (unsigned long long)f.frame, kind,
-                (unsigned long long)f.anchor_id, f.phase, (unsigned long long)f.state_generation, r->seconds,
+                (unsigned long long)f.anchor_id, f.phase, (unsigned long long)f.state_generation,
+                (unsigned long long)f.simulation_generation, (unsigned long long)f.simulation_time_ns,
+                (unsigned long long)f.completed_step_ns, (unsigned long long)f.display_phase_time_ns,
+                (unsigned long long)f.requested_presentation_time_ns, r->seconds,
                 f.scene_width, f.scene_height, f.output_width, f.output_height,
                 f.drawable_width, f.drawable_height, r->strict) < 0) writer_failure();
         }
@@ -82,28 +85,7 @@ void native_trace_finish(void) {
 
 _Noreturn void native_exit(int status) {
     native_trace_finish();
-    PeriodicFormStats forms = {0};
-    PeriodicStoreStats owners = {0};
-    if (periodic_form_active()) forms = periodic_form_stats();
-    if (periodic_store_active()) owners = periodic_store_stats();
-    fprintf(stderr, "[totk] periodic forms: %llu packets, %llu learned, %llu owner-closed, %llu mapped, %llu invalidated, %llu dropped\n",
-            (unsigned long long)forms.observed_packets,
-            (unsigned long long)forms.learned_forms,
-            (unsigned long long)forms.closed_forms,
-            (unsigned long long)forms.mapped_passes,
-            (unsigned long long)forms.invalidated_forms,
-            (unsigned long long)forms.dropped_records);
-    fprintf(stderr, "[totk] periodic owners: %llu returns, %llu ready certificates, %llu published, %llu unknown passes, %llu ring drops, %llu submission overflow, %llu deferred drops, %llu transition overflow, %llu transition replacements\n",
-            (unsigned long long)owners.owner_returns,
-            (unsigned long long)owners.owner_certificates,
-            (unsigned long long)owners.published_certificates,
-            (unsigned long long)owners.unknown_passes,
-            (unsigned long long)owners.ring_drops,
-            (unsigned long long)owners.submission_overflow,
-            (unsigned long long)owners.deferred_owner_drops,
-            (unsigned long long)owners.transition_overflow,
-            (unsigned long long)owners.transition_replacements);
-    periodic_executor_report();
+    periodic_gpu_encode_report();
     _exit(status);
 }
 
@@ -116,7 +98,7 @@ void native_trace_init(void) {
     trace.read = trace.write = 0;
     trace.stopping = 0;
     if (setvbuf(trace.file, NULL, _IOFBF, 65536) ||
-        fputs("ticket,frame,kind,anchor_id,phase,state_generation,present_seconds,scene_width,scene_height,output_width,output_height,drawable_width,drawable_height,strict\n", trace.file) < 0)
+        fputs("ticket,frame,kind,anchor_id,phase,state_generation,simulation_generation,simulation_time_ns,completed_step_ns,display_phase_time_ns,requested_presentation_time_ns,present_seconds,scene_width,scene_height,output_width,output_height,drawable_width,drawable_height,strict\n", trace.file) < 0)
         runtime_fail("initialize frame trace");
     if (pthread_create(&trace.thread, NULL, write_trace, NULL)) runtime_fail("start frame trace writer");
     atomic_store_explicit(&active, 1, memory_order_relaxed);

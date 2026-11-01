@@ -3,12 +3,14 @@
 
 #include <stdint.h>
 #include "mouse_input.h"
+#include "periodic_clock.h"
 
 typedef struct {
     uint64_t source_frame;
     uint64_t anchor_id;
     uint64_t state_generation;
     double phase;
+    PeriodicPhaseTime time;
 } PeriodicPresentState;
 
 typedef struct {
@@ -40,6 +42,7 @@ int periodic_present_capture_scene(id<MTL4CommandBuffer> command_buffer,
 uint64_t periodic_present_capture_anchor(id<MTL4CommandBuffer> command_buffer,
                                          id<MTLTexture> source, uint64_t frame,
                                          double presentation_time, NativeMousePhase input,
+                                         PeriodicSimulationStamp simulation,
                                          MTLPixelFormat output_format);
 // Publish snapshots only after their command buffer has been committed. Passing
 // committed=0 releases snapshots encoded into a discarded command buffer.

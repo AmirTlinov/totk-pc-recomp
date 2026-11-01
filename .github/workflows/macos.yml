@@ -47,6 +47,11 @@ jobs:
           python tests/macos_layout_test.py -v
           python tests/macos_resolution_test.py -v
           python tests/macos_benchmark_test.py -v
+          python tests/macos_periodic_clock_test.py
+          python tests/macos_periodic_camera_test.py
+          python tests/macos_periodic_owner_test.py
+          python tests/macos_periodic_state_test.py
+          python tests/macos_command_owner_test.py
           python tests/macos_build_test.py -v
           python tests/macos_shader_cache_test.py
           python tests/macos_guest_memory_test.py

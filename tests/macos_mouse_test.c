@@ -3,11 +3,33 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 static unsigned checks;
 #define CHECK(value) do { assert(value); ++checks; } while (0)
 static int same(NativeMouseSample a, NativeMouseSample b) {
     return a.buttons==b.buttons && a.x==b.x && a.y==b.y;
+}
+static _Atomic int phase_done;
+static NativeMousePhase phase_start;
+static void *phase_writer(void *unused) {
+    (void)unused;
+    NativeMouseInput m = {0}; native_mouse_configure(&m, 1, false); native_mouse_capture(&m, true, 1);
+    for (unsigned i = 0; i < 100000; ++i) assert(native_mouse_motion(&m, 1, 1, i + 1));
+    atomic_store(&phase_done, 1); return NULL;
+}
+static void *phase_reader(void *unused) {
+    (void)unused;
+    do {
+        NativeMousePhase p = runtime_input_mouse_phase();
+        double x = p.yaw - phase_start.yaw, y = p.pitch - phase_start.pitch;
+        // Equal axis input must be one coherent publication, even while the
+        // writer is between its yaw and pitch atomic stores.
+        assert(fabs(x-y) < 1e-10);
+        assert(p.generation >= phase_start.generation);
+    } while (!atomic_load(&phase_done));
+    return NULL;
 }
 
 int main(void) {
@@ -132,5 +154,21 @@ int main(void) {
     native_mouse_capture(&m,false,1202000000);
     NativeMouseTurn released=native_mouse_turn(&m,1203000000);
     CHECK(!released.yaw && !released.pitch);
+    native_mouse_capture(&m, true, 1300000000);
+    NativeMousePhase before = m.consumed_phase;
+    native_mouse_motion(&m, 7, 9, 1301000000);
+    CHECK(m.consumed_phase.generation == before.generation);
+    native_mouse_turn(&m, 1302000000);
+    NativeMousePhase consumed = m.consumed_phase;
+    CHECK(consumed.generation == runtime_input_mouse_phase().generation);
+    native_mouse_motion(&m, 11, 13, 1303000000);
+    CHECK(m.consumed_phase.generation == consumed.generation);
+    CHECK(runtime_input_mouse_phase().generation > consumed.generation);
+    phase_start = runtime_input_mouse_phase();
+    pthread_t writer, readers[3];
+    for (unsigned i = 0; i < 3; ++i) CHECK(!pthread_create(&readers[i], NULL, phase_reader, NULL));
+    CHECK(!pthread_create(&writer, NULL, phase_writer, NULL));
+    CHECK(!pthread_join(writer, NULL));
+    for (unsigned i = 0; i < 3; ++i) CHECK(!pthread_join(readers[i], NULL));
     printf("{\"probe\":\"mouse-input\",\"status\":\"pass\",\"checks\":%u}\n",checks);
 }

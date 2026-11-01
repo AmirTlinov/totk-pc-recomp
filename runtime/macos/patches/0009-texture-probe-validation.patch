@@ -1,0 +1,66 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_tex_slots_probe.h b/third_party/d2r_gfx/gfx/nvn/nvn_tex_slots_probe.h
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_tex_slots_probe.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_tex_slots_probe.h
+@@ -19,19 +19,6 @@
+     op_hdr end = {OP_END,8};
+     for (int kind = 0; kind < 3; kind++) {
+         tex_t textures[2] = {0};
+-        for (int i = 0; i < 3; i++) {
+-            if (kind == 2) {
+-                memcpy((uint8_t *)typed.contents + i*256, pixels[i], 8);
+-                MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 resourceOptions:MTLResourceStorageModeShared usage:MTLTextureUsageShaderRead];
+-                sources[i] = [typed newTextureWithDescriptor:d offset:i*256 bytesPerRow:256];
+-            } else {
+-                MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:1 mipmapped:NO];
+-                d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+-                sources[i] = [g_dev newTextureWithDescriptor:d];
+-                [sources[i] replaceRegion:MTLRegionMake2D(0,0,2,1) mipmapLevel:0 withBytes:pixels[i] bytesPerRow:8];
+-            }
+-            if (!sources[i]) MDIE("texture slots probe resource"); res_add(sources[i]);
+-        }
+         for (int i = 0; i < 2; i++) {
+             textures[i].serial = 0xffffe100 + kind*4 + i;
+             textures[i].d = (nvn_texdesc){.width=2,.height=1,.depth=1,.levels=1,.format=0x25,.target=kind==2?10:1,
+@@ -58,12 +45,28 @@
+             sh->ae=[sh->fn newArgumentEncoderWithBufferIndex:0]; sh->arg_len=sh->ae.encodedLength;
+             if(sh->arg_len != (NSUInteger)sh->rf.nb*8) MDIE("texture slots probe argument ABI");
+             MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new]; pd.vertexFunction=[lib newFunctionWithName:@"vs"];pd.fragmentFunction=sh->fn;pd.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
++            pd.supportIndirectCommandBuffers=periodic_gpu_encode_active();
+             pipelines[i]=[g_dev newRenderPipelineStateWithDescriptor:pd error:&error];
+             if(!pipelines[i]) MDIE("texture slots probe pipeline: %s",error.localizedDescription.UTF8String);
+         }
+         for(int mode=0;mode<3;mode++) for(int submission=0;submission<2;submission++) {
+             atomic_store(&g_tex_slots_on,mode!=0);atomic_store(&g_tex_slots_check,mode==2);
+             atomic_store(&g_arg_epoch_on,0);g_tex_slots_negative=mode?negative:0;
++            // Serial replacement retires its prior allocation after the submit.
++            // Reusing the fixture object would not renew its residency.
++            for (int i = 0; i < 3; i++) {
++                if (kind == 2) {
++                    memcpy((uint8_t *)typed.contents + i*256, pixels[i], 8);
++                    MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 resourceOptions:MTLResourceStorageModeShared usage:MTLTextureUsageShaderRead];
++                    sources[i] = [typed newTextureWithDescriptor:d offset:i*256 bytesPerRow:256];
++                } else {
++                    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:1 mipmapped:NO];
++                    d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++                    sources[i] = [g_dev newTextureWithDescriptor:d];
++                    [sources[i] replaceRegion:MTLRegionMake2D(0,0,2,1) mipmapLevel:0 withBytes:pixels[i] bytesPerRow:8];
++                }
++                if (!sources[i]) MDIE("texture slots probe resource"); res_add(sources[i]);
++            }
+             mtl_sub_begin();mtl_exec((const uint8_t *)&end);
+             for(int i=0;i<2;i++){serial_put(textures[i].serial,sources[i]);mtl_reg_tex(51+i,&textures[i],NULL);}
+             mtl_reg_samp(61,&clamp);mtl_reg_samp(62,&repeat);
+@@ -103,11 +106,11 @@
+                 checked++;
+             }
+             enc_r_end(en);enc_b_copy_texture_buffer(blit(),output,0,0,MTLOriginMake(0,0,0),MTLSizeMake(64,8,1),rb,0,256,2048);mtl_sub_commit();mtl_finish();
+-            for(int i=0;i<2048;i++){if(abs((int)((uint8_t *)rb.contents)[i]-expected[i])>1) MDIE("texture slots probe GPU mismatch kind%d mode%d stripe%d channel%d got%d want%d",kind,mode,(i/4)%64/4,i%4,((uint8_t *)rb.contents)[i],expected[i]);checked++;}
++            for(int i=0;i<2048;i++){if(abs((int)((uint8_t *)rb.contents)[i]-expected[i])>1) MDIE("texture slots probe GPU mismatch kind%d mode%d submission%d pixel%d,%d channel%d got%d want%d",kind,mode,submission,(i/4)%64,i/(64*4),i%4,((uint8_t *)rb.contents)[i],expected[i]);checked++;}
+             (void)sampler0;(void)sampler1;
++            for(int i=0;i<3;i++)res_remove(sources[i]);
+         }
+         for(int i=0;i<2;i++){mtl_reg_tex(51+i,NULL,NULL);serial_del(textures[i].serial);}
+-        for(int i=0;i<3;i++)res_remove(sources[i]);
+     }
+     if(!g_tex_slots_hits||!g_tex_slots_verified) MDIE("texture slots probe missed cache/shadow paths");
+     MLOG("texture slots probe: hits=%llu verified=%llu",(unsigned long long)g_tex_slots_hits,(unsigned long long)g_tex_slots_verified);

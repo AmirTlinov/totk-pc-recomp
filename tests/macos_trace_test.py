@@ -22,6 +22,12 @@ class FrameTraceTests(unittest.TestCase):
             self.assertEqual({int(row['ticket']) for row in rows}, set(range(1024)))
             for row in rows:
                 self.assertEqual(row['ticket'], row['frame'])
+                i=int(row['frame'])
+                self.assertEqual(row['simulation_generation'], str(i+1))
+                self.assertEqual(row['simulation_time_ns'], str((i+1)*20833333))
+                self.assertEqual(row['completed_step_ns'], '20833333')
+                self.assertEqual(row['display_phase_time_ns'], row['simulation_time_ns'])
+                self.assertEqual(row['requested_presentation_time_ns'], str(1000000000+i*6944444))
                 self.assertAlmostEqual(float(row['present_seconds']), int(row['frame']) / 144, places=8)
                 self.assertEqual(row['strict'], '1')
                 for key in ('scene_width', 'output_width', 'drawable_width'):

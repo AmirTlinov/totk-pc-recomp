@@ -3,9 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "native_policy.h"
-#include "periodic_form.h"
-#include "periodic_compiler.h"
-#include "periodic_store.h"
+#include "periodic_state.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,9 +45,6 @@ void native_frame_thread_init(void) {
 }
 
 void native_policy_init(void) {
-    periodic_form_init();
-    periodic_compiler_init();
-    periodic_store_init();
     if (!activity_token) {
         activity_token = [[NSProcessInfo processInfo]
             beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical |
@@ -84,7 +79,8 @@ void native_policy_init(void) {
         {"TOTK_FPS_LIMIT", "144"}, {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"},
         {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"}, {"TOTK_ASYNC_REPLAY", "1"},
         {"TOTK_MFX", "0"}, {"TOTK_MFX_UPSCALE", "0"}, {"TOTK_MFX_OUTPUT", "0"},
-        {"TOTK_PERIODIC_PHASE", "1"}, {"TOTK_PERIODIC_ANCHOR_HZ", "48"},
+        // Camera-only reprojection cannot publish a complete temporal state.
+        {"TOTK_PERIODIC_PHASE", "0"}, {"TOTK_PERIODIC_ANCHOR_HZ", "48"},
         {"TOTK_GPU_ALLOW_SUBMIT", "1"}, {"TOTK_GPU_WIDEN", "1"},
         {"TOTK_GPU_BLOCKRT", "1"}, {"TOTK_GPU_MIDCLEAR", "1"},
         // Keep vertex work overlapped across independent render passes. The
@@ -157,7 +153,7 @@ NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigne
 NativeFrame native_phase_capture(uint64_t source_frame, uint64_t anchor_id, uint64_t generation,
                                  double phase, unsigned w, unsigned h, unsigned dw, unsigned dh) {
     NativeFrame result = {.frame=anchor_id, .anchor_id=anchor_id, .state_generation=generation,
-                          .phase=phase, .kind=NATIVE_FRAME_PHASE};
+                          .phase=phase, .kind=NATIVE_FRAME_CAMERA_PHASE};
     if (anchor_scene_seen(source_frame)) {
         result.scene_width=3840;
         result.scene_height=2160;

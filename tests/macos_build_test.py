@@ -91,6 +91,7 @@ class NativeLinkTests(unittest.TestCase):
             symbols = subprocess.check_output(['nm', str(binary)], text=True)
             self.assertNotIn('_runtime_gpu_path_probe', symbols)
             self.assertNotIn('_probe_pool_cache', symbols)
+            self.assertNotIn('_periodic_gpu_encode_probe', symbols)
             # Runtime-discovered native entry tables must survive dead stripping.
             sections = subprocess.check_output(['otool', '-l', binary], text=True)
             self.assertIn('sectname totkgfx', sections)

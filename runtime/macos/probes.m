@@ -1,10 +1,7 @@
 // Game-free probes are compiled only into diagnostic builds.
 #include "native_policy.h"
-#include "periodic_form.h"
-#include "periodic_compiler.h"
-#include "periodic_executor.h"
+#include "periodic_gpu_encode.h"
 #include "periodic_present.h"
-#include "periodic_store.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +20,6 @@ extern void runtime_swkbd_probe(void);
 extern void mtl_probe_warm_pipelines(void);
 extern void mtl_probe_attachment_ledger(void);
 extern void mtl_probe_attachment_feedback(void);
-extern int mtl_probe_owner_skip(void);
 extern uint64_t runtime_now_ns(void);
 
 static void *probe_frame_thread(void *unused) {
@@ -116,6 +112,9 @@ static void *trace_producer(void *arg) {
     uint64_t first=(uintptr_t)arg*256;
     for (uint64_t i=first; i<first+256; ++i) {
         NativeFrame frame={.frame=i,.anchor_id=i,.state_generation=i+1,.phase=1.0,.kind=NATIVE_FRAME_ANCHOR,
+                           .simulation_generation=i+1,.simulation_time_ns=(i+1)*20833333,
+                           .completed_step_ns=20833333,.display_phase_time_ns=(i+1)*20833333,
+                           .requested_presentation_time_ns=UINT64_C(1000000000)+i*6944444,
                            .scene_width=3840,.scene_height=2160,
                            .output_width=3840,.output_height=2160,.drawable_width=3840,.drawable_height=2160};
         native_presented(i,frame,(double)i/144.0);
@@ -143,18 +142,8 @@ int native_run_probe(const char *name) {
 #ifdef TOTK_PROBE_BUILD
     if (!strcmp(name, "--probe-clock")) return probe_clock();
     if (!strcmp(name, "--probe-pool-cache")) return probe_pool_cache();
-    if (!strcmp(name, "--probe-periodic-form")) return periodic_form_probe();
-    if (!strcmp(name, "--probe-periodic-compiler")) return periodic_compiler_probe();
-    if (!strcmp(name, "--probe-periodic-executor")) return periodic_executor_probe();
+    if (!strcmp(name, "--probe-gpu-command-generation")) return periodic_gpu_encode_probe();
     if (!strcmp(name, "--probe-periodic-present")) return periodic_present_probe();
-    if (!strcmp(name, "--probe-periodic-store")) return periodic_store_probe();
-    if (!strcmp(name, "--probe-owner-skip")) {
-        setenv("TOTK_NATIVE_4K144", "0", 1); setenv("TOTK_HEADLESS", "1", 1);
-        native_policy_init();
-        if (mtl_probe_owner_skip() != 1) runtime_fail("owner skip probe");
-        puts("{\"probe\":\"owner-skip\",\"status\":\"pass\",\"metal_render_passes\":0,\"argument_continuation\":true}");
-        return 0;
-    }
     if (!strcmp(name, "--probe-nvn-cpu")) { extern void runtime_gfx_probe(int); runtime_gfx_probe(0); return 0; }
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
     if (!strcmp(name, "--probe-attachment-ledger") || !strcmp(name, "--probe-attachment-feedback")) {
@@ -180,7 +169,7 @@ int native_run_probe(const char *name) {
         if (strcmp(getenv("TOTK_FPS_LIMIT") ?: "", "144") ||
             strcmp(getenv("DM_PRESENT_HZ") ?: "", "144") ||
             strcmp(getenv("DM_PRESENT_LINK") ?: "", "1") ||
-            strcmp(getenv("TOTK_PERIODIC_PHASE") ?: "", "1") ||
+            strcmp(getenv("TOTK_PERIODIC_PHASE") ?: "", "0") ||
             strcmp(getenv("TOTK_ASYNC_REPLAY") ?: "", "1") ||
             strcmp(getenv("TOTK_BARRIER_NARROW") ?: "", "1") ||
             strcmp(getenv("TOTK_TBDR_ATTACH") ?: "", "1") ||

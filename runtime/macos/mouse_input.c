@@ -7,6 +7,7 @@
 // The input owner still serializes writes to NativeMouseInput itself.
 static _Atomic int64_t phase_yaw_nr, phase_pitch_nr;
 static _Atomic uint64_t phase_generation;
+static _Atomic uint64_t phase_sequence;
 
 void native_mouse_configure(NativeMouseInput *m, double sensitivity, bool invert_y) {
     m->sensitivity = isfinite(sensitivity) ? fmin(10.0, fmax(0.0, sensitivity)) : 1.0;
@@ -20,6 +21,7 @@ void native_mouse_clear(NativeMouseInput *m, uint64_t now_ns) {
     m->sampled_ns = now_ns;
     m->has_frame = false;
     m->has_camera = m->stick_override = false;
+    m->consumed_phase = runtime_input_mouse_phase();
 }
 
 void native_mouse_capture(NativeMouseInput *m, bool captured, uint64_t now_ns) {
@@ -30,28 +32,35 @@ void native_mouse_capture(NativeMouseInput *m, bool captured, uint64_t now_ns) {
 bool native_mouse_motion(NativeMouseInput *m, double dx, double dy, uint64_t now_ns) {
     if (!m->captured || !m->sensitivity || !isfinite(dx) || !isfinite(dy) || (!dx && !dy)) return false;
     // Bound accumulated input after a stall; never replay a long queue of turns.
+    double before_x = m->dx, before_y = m->dy;
     m->dx = fmax(-1000000.0, fmin(1000000.0, m->dx + dx));
     m->dy = fmax(-1000000.0, fmin(1000000.0, m->dy + dy));
+    dx = m->dx - before_x; dy = m->dy - before_y;
     m->moved_ns = now_ns;
     double scale = m->sensitivity * (0.08 * 3.14159265358979323846 / 180.0);
+    atomic_fetch_add_explicit(&phase_sequence, 1, memory_order_acq_rel);
     atomic_fetch_add_explicit(&phase_yaw_nr, (int64_t)llround(dx * scale * 1e9), memory_order_relaxed);
     atomic_fetch_add_explicit(&phase_pitch_nr,
                               (int64_t)llround(dy * scale * (m->invert_y ? -1 : 1) * 1e9),
                               memory_order_relaxed);
-    atomic_fetch_add_explicit(&phase_generation, 1, memory_order_release);
+    atomic_fetch_add_explicit(&phase_generation, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&phase_sequence, 1, memory_order_release);
     return true;
 }
 
 NativeMousePhase runtime_input_mouse_phase(void) {
-    uint64_t before, after;
+    uint64_t before, after, generation;
     int64_t yaw, pitch;
     do {
-        before = atomic_load_explicit(&phase_generation, memory_order_acquire);
+        before = atomic_load_explicit(&phase_sequence, memory_order_acquire);
+        if (before & 1) continue;
         yaw = atomic_load_explicit(&phase_yaw_nr, memory_order_relaxed);
         pitch = atomic_load_explicit(&phase_pitch_nr, memory_order_relaxed);
-        after = atomic_load_explicit(&phase_generation, memory_order_acquire);
-    } while (before != after);
-    return (NativeMousePhase){yaw * 1e-9, pitch * 1e-9, after};
+        generation = atomic_load_explicit(&phase_generation, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        after = atomic_load_explicit(&phase_sequence, memory_order_relaxed);
+    } while ((before & 1) || before != after);
+    return (NativeMousePhase){yaw * 1e-9, pitch * 1e-9, generation};
 }
 
 bool native_mouse_button(NativeMouseInput *m, unsigned button, bool down) {
@@ -83,6 +92,7 @@ NativeMouseTurn native_mouse_turn(NativeMouseInput *m, uint64_t now_ns) {
         turn.pitch = m->dy * scale * (m->invert_y ? -1 : 1);
     }
     m->dx = m->dy = 0;
+    m->consumed_phase = runtime_input_mouse_phase();
     return turn;
 }
 
@@ -101,7 +111,10 @@ NativeMouseSample native_mouse_sample(NativeMouseInput *m, uint64_t frame, uint6
     if (direct || now_ns < m->moved_ns || now_ns - m->moved_ns > 100000000ULL) scale = 0;
     m->sample = (NativeMouseSample){m->held | m->pressed,
         stick(m->dx * scale), stick(m->dy * scale * (m->invert_y ? -1 : 1))};
-    if (!direct) m->dx = m->dy = 0;
+    if (!direct) {
+        m->dx = m->dy = 0;
+        m->consumed_phase = runtime_input_mouse_phase();
+    }
     m->pressed = 0;
     m->sampled_ns = now_ns;
     return m->sample;
