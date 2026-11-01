@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #include "native_policy.h"
 #include "periodic_form.h"
+#include "periodic_store.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,7 @@ void native_frame_thread_init(void) {
 
 void native_policy_init(void) {
     periodic_form_init();
+    periodic_store_init();
     if (!activity_token) {
         activity_token = [[NSProcessInfo processInfo]
             beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical |

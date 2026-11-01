@@ -1,6 +1,7 @@
 // Game-free probes are compiled only into diagnostic builds.
 #include "native_policy.h"
 #include "periodic_form.h"
+#include "periodic_store.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,6 +140,7 @@ int native_run_probe(const char *name) {
     if (!strcmp(name, "--probe-clock")) return probe_clock();
     if (!strcmp(name, "--probe-pool-cache")) return probe_pool_cache();
     if (!strcmp(name, "--probe-periodic-form")) return periodic_form_probe();
+    if (!strcmp(name, "--probe-periodic-store")) return periodic_store_probe();
     if (!strcmp(name, "--probe-nvn-cpu")) { extern void runtime_gfx_probe(int); runtime_gfx_probe(0); return 0; }
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
     if (!strcmp(name, "--probe-attachment-ledger") || !strcmp(name, "--probe-attachment-feedback")) {

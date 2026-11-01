@@ -1,0 +1,225 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+index 914fd50..9ee2240 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -1,4 +1,5 @@
+ #include "native_policy.h"
++#include "periodic_store.h"
+ #include "prompt_textures.h"
+ #include "input_prompts.h"
+ // NVN 空设备的 Metal 执行层，见 nvn_mtl.h。
+@@ -2058,6 +2059,7 @@ uint64_t mtl_sub_commit(void) {
+     upd_flush();   // TOTK: renamed uniform updates reach memory here, after every draw that read them through private copies
+     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
++    periodic_store_submit(g_sub_serial);
+     up_flush();
+     uint64_t fence = ++g_fence;
+     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
+@@ -3773,6 +3775,35 @@ void zskip_test_add(const char *key, int ubo_slot, int vec, int comp) {
+ // 当前渲染通道的目标信息：rp_begin 时由附件定一次，通道内各绘制共用（管线键、深度模板、视口 / 剪裁都只依赖它）
+ // Target info of the current render pass: determined once from the attachments at rp_begin and shared by all draws in the pass (pipeline key, depth-stencil, viewport / scissor all depend only on it)
+ static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro; __unsafe_unretained id<MTLTexture> range_color, range_depth; int layered, mfx; } g_pass;
++
++static PeriodicResourceKey periodic_tex_key(const tex_t *texture, uint32_t plane) {
++    if (!texture) return (PeriodicResourceKey){0};
++    uint64_t owner = texture->mem ? (uint64_t)(uintptr_t)texture->mem : (UINT64_C(1) << 63) | texture->serial;
++    return (PeriodicResourceKey){.owner=owner, .length=1, .kind=1, .plane=plane};
++}
++
++static void periodic_note_pass_attachments(MTL4RenderPassDescriptor *pd) {
++    if (!periodic_store_active()) return;
++    periodic_store_pass_begin(g_pass.serial);
++    for (int i = 0; i < R.rt.n && i < 8; ++i) {
++        MTLRenderPassColorAttachmentDescriptor *attachment = pd.colorAttachments[i];
++        if (!attachment.texture || !R.rt.color[i]) continue;
++        uint8_t access = PERIODIC_RESOURCE_WRITE;
++        if (attachment.loadAction == MTLLoadActionLoad) access |= PERIODIC_RESOURCE_READ;
++        periodic_store_resource(periodic_tex_key(R.rt.color[i], 0), attachment.texture.gpuResourceID._impl,
++                                0x100u + (uint32_t)i, access);
++    }
++    if (R.rt.depth && pd.depthAttachment.texture) {
++        uint8_t access = PERIODIC_RESOURCE_WRITE;
++        if (pd.depthAttachment.loadAction == MTLLoadActionLoad) access |= PERIODIC_RESOURCE_READ;
++        periodic_store_resource(periodic_tex_key(R.rt.depth, 0), pd.depthAttachment.texture.gpuResourceID._impl, 0x108, access);
++    }
++    if (R.rt.depth && pd.stencilAttachment.texture) {
++        uint8_t access = PERIODIC_RESOURCE_WRITE;
++        if (pd.stencilAttachment.loadAction == MTLLoadActionLoad) access |= PERIODIC_RESOURCE_READ;
++        periodic_store_resource(periodic_tex_key(R.rt.depth, 0), pd.stencilAttachment.texture.gpuResourceID._impl, 0x109, access);
++    }
++}
+ /* TOTK_MFX=interp (totk_mfx.m): the canvas is the float target the game composes the frame in and then copies to the
+    presented texture (docked: 1920x1080, the 1600x900 scene upscaled into it; handheld: 1280x720, the scene drawn in it).
+    Before the first UI draw into it (a TOTK UI vertex shader) the pass is ended and the canvas copied: that is the scene.
+@@ -4405,7 +4436,7 @@ static void rp_end(void) { if (g_enc) {
+ #ifdef NVN_RT_RANGE_TEST
+     int ranged=g_rt_range_active && !g_rt_range_pending;
+ #endif
+-    sd_finish(); enc_r_end(g_enc); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_barrier = 0; g_pass_rtsnap_mask = 0; g_lay.active = 0;
++    sd_finish(); enc_r_end(g_enc); periodic_store_pass_end(); zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_rt_barrier = 0; g_pass_rtsnap_mask = 0; g_lay.active = 0;
+     /* Diagnostic: inspect each full-size HDR render target immediately after its
+        producer pass, on the same Metal 4 queue and before later passes reuse it. */
+     { static int on = -1; static FILE *f; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -4756,6 +4787,7 @@ static void mfx_snapshot_scene(void) {
+         if (rt_range_on()) { g_pass.range_dirty=dirty0; g_pass.range_color=pd.colorAttachments[0].texture; g_pass.range_depth=pd.depthAttachment.texture; }
+         g_enc_pso = nil; g_enc_dss = nil;
+     }
++    periodic_note_pass_attachments(pd);
+     if (g_vis_on || perdraw_vis_on()) {
+         if (!g_vis || g_vis_n >= VIS_SLOTS) { if (g_vis) defer_obj_release(g_vis); g_vis = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis); g_vis_n = 0; }
+         pd.visibilityResultBuffer = g_vis;
+@@ -4898,7 +4930,7 @@ @implementation NvShader @end
+ @interface NvProg : NSObject { @public NvShader *sh[6];
+     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
+     const uint8_t *ctl[6], *code[6]; NSString *key[6]; shader_state_key sig[6]; NSMutableDictionary<NSData *, NvShader *> *alt[6];
+-    void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw, udc_unknown_write; uint32_t udc_cmask, udc_imgw_mask[5];   // udc_*: draw and barrier summaries of sh[] (valid while sh[] is the same)
++    void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw, udc_unknown_write; uint32_t udc_cmask, udc_imgw_mask[5], udc_img_mask[5]; uint64_t udc_tex_mask[5][2];   // udc_*: draw and barrier summaries of sh[] (valid while sh[] is the same)
+     int missing, miss_has[6]; shader_state_key miss_sig[6]; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
+ @implementation NvProg @end
+ /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
+@@ -5445,6 +5477,10 @@ static void treg_clear_view_locked(int tid) {
+ // Lock-free copy of texture ID → serial (the replay hot path only needs the serial: store lookahead index, binding set of the clear-only hoist): texture IDs are 20 bits, fixed 1M entries (BSS, only touched pages are used),
+ // release write at registration, relaxed atomic read on the reader side, without entering g_rmu (the former h_ser locked and unlocked on every lookup, thousands of times per frame in the camp)
+ static _Atomic uint64_t g_tser[1 << 20];
++/* Lock-free texture-slot backing identity for the retained pass graph. Aliased
++   NVN descriptors that name the same storage publish the same owner. */
++static _Atomic uint64_t g_towner[1 << 20];
++static _Atomic uint64_t g_tgeneration[1 << 20];
+ static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview：采样器号 → MTLSamplerState（持有） | g_sview: sampler ID → MTLSamplerState (retained)
+ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
+     int id_ = tid; if (id_ < 0) return;
+@@ -5459,7 +5495,12 @@ the slot keeps its view and no argument buffer has to be encoded again (g_reg_ge
+     if (g_treg[id_].view) treg_clear_view_locked(id_);
+     g_treg[id_].ok = t != NULL; if (t) g_treg[id_].t = *t; g_treg[id_].has_v = v != NULL;
+     if (v) g_treg[id_].v = *v; else memset(&g_treg[id_].v, 0, sizeof g_treg[id_].v);   // TOTK: a registration without a view must not keep the slot's previous view (depth texture once got a stale BC3 9-level view)
+-    if (id_ < (1 << 20)) atomic_store_explicit(&g_tser[id_], t ? t->serial : 0, memory_order_release);
++    if (id_ < (1 << 20)) {
++        uint64_t owner = t ? (t->mem ? (uint64_t)(uintptr_t)t->mem : (UINT64_C(1) << 63) | t->serial) : 0;
++        atomic_store_explicit(&g_tgeneration[id_], 0, memory_order_relaxed);
++        atomic_store_explicit(&g_towner[id_], owner, memory_order_relaxed);
++        atomic_store_explicit(&g_tser[id_], t ? t->serial : 0, memory_order_release);
++    }
+     registry_unlock();
+ }
+ /* TOTK: Metal has three border colours (transparent black, opaque black, opaque white). A sampler that clamps to any
+@@ -5705,7 +5746,12 @@ static void life_use(int tid, const tex_t *t, const char *how) {
+             static uint64_t n; if (n++ < 4 || n % 100000 == 0) MLOG("texture id %d: registration followed its storage from finalised serial %llu to live serial %llu (%u redirects so far)", tid, (unsigned long long)rp->t.serial, (unsigned long long)live.serial, (unsigned)n);
+             if (rp->view) treg_clear_view_locked(tid);
+             if (totk_life_on() && totk_life_match(&live)) totk_life_log("use fc=%llu id=%d redirect %llu -> %llu mem=%p", (unsigned long long)atomic_load(&g_cur_frame), tid, (unsigned long long)rp->t.serial, (unsigned long long)live.serial, (void *)live.mem);
+-            rp->t = live; if (tid < (1 << 20)) atomic_store_explicit(&g_tser[tid], live.serial, memory_order_release);
++            rp->t = live; if (tid < (1 << 20)) {
++                uint64_t owner = live.mem ? (uint64_t)(uintptr_t)live.mem : (UINT64_C(1) << 63) | live.serial;
++                atomic_store_explicit(&g_tgeneration[tid], 0, memory_order_relaxed);
++                atomic_store_explicit(&g_towner[tid], owner, memory_order_relaxed);
++                atomic_store_explicit(&g_tser[tid], live.serial, memory_order_release);
++            }
+             dead = 0;
+         }
+     }
+@@ -5876,11 +5922,17 @@ static void prog_draw_summary(NvProg *pr) {
+     if (!pr->udc_ok) {
+         int img = 0, imgw = 0, unknown_write = 0; uint32_t cm = 0;
+         memset(pr->udc_imgw_mask, 0, sizeof pr->udc_imgw_mask);
++        memset(pr->udc_img_mask, 0, sizeof pr->udc_img_mask);
++        memset(pr->udc_tex_mask, 0, sizeof pr->udc_tex_mask);
+         for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; pr->udc_sh[st] = (__bridge void *)sh; if (!sh) continue;
+             if (st == 1) cm = sh->rf.color_mask;
+             for (int i = 0; i < sh->rf.nb; i++) {
+                 const nvn_rbind *b = &sh->rf.b[i];
+                 if (b->kind == NVN_RB_IMG) img = 1;
++                if (sh->stage < 5 && (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && b->reg < 128)
++                    pr->udc_tex_mask[sh->stage][b->reg >> 6] |= UINT64_C(1) << (b->reg & 63);
++                if (sh->stage < 5 && b->kind == NVN_RB_IMG && b->reg < 32)
++                    pr->udc_img_mask[sh->stage] |= 1u << b->reg;
+                 if (!b->rw) continue;
+                 if (b->kind == NVN_RB_IMG) {
+                     imgw = 1;
+@@ -5892,6 +5944,51 @@ static void prog_draw_summary(NvProg *pr) {
+         pr->udc_cmask = cm; pr->udc_ok = 1;
+     }
+ }
++
++static PeriodicResourceKey periodic_handle_key(uint64_t handle) {
++    int tid = (int)(handle & 0xfffff);
++    if (!tid) return (PeriodicResourceKey){0};
++    uint64_t owner = atomic_load_explicit(&g_towner[tid], memory_order_relaxed);
++    if (!owner) {
++        uint64_t serial = atomic_load_explicit(&g_tser[tid], memory_order_relaxed);
++        owner = serial ? (UINT64_C(1) << 63) | serial : 0;
++    }
++    return (PeriodicResourceKey){.owner=owner, .length=1, .kind=1};
++}
++
++static uint64_t periodic_handle_generation(uint64_t handle) {
++    int tid = (int)(handle & 0xfffff);
++    if (!tid) return 0;
++    uint64_t generation = atomic_load_explicit(&g_tgeneration[tid], memory_order_relaxed);
++    if (generation) return generation;
++    return atomic_load_explicit(&g_towner[tid], memory_order_relaxed);
++}
++
++static void periodic_note_draw(NvProg *pr) {
++    if (!periodic_store_active()) return;
++    if (!pr) { periodic_store_unknown(); return; }
++    prog_draw_summary(pr);
++    if (pr->udc_unknown_write) periodic_store_unknown();
++    for (int stage = 0; stage < 5; ++stage) {
++        for (int word = 0; word < 2; ++word) {
++            uint64_t slots = pr->udc_tex_mask[stage][word];
++            while (slots) {
++                int bit = __builtin_ctzll(slots), slot = word * 64 + bit; slots &= slots - 1;
++                periodic_store_resource(periodic_handle_key(S.tex[stage][slot]), periodic_handle_generation(S.tex[stage][slot]),
++                                        0x1000u + (uint32_t)(stage << 8) + (uint32_t)slot,
++                                        PERIODIC_RESOURCE_READ);
++            }
++        }
++        uint32_t images = pr->udc_img_mask[stage];
++        while (images) {
++            int slot = __builtin_ctz(images); images &= images - 1;
++            uint8_t access = PERIODIC_RESOURCE_READ;
++            if (pr->udc_imgw_mask[stage] & (1u << slot)) access |= PERIODIC_RESOURCE_WRITE;
++            periodic_store_resource(periodic_handle_key(S.img[stage][slot]), periodic_handle_generation(S.img[stage][slot]),
++                                    0x2000u + (uint32_t)(stage << 8) + (uint32_t)slot, access);
++        }
++    }
++}
+ /* Return the colour targets this draw can actually modify. A declared fragment output with a disabled channel mask is
+    inert, as is an enabled channel mask for an output the shader does not declare. Writable images stay conservative:
+    an image can alias any currently bound render target. */
+@@ -7854,6 +7951,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+                     if (av) { t = av; trid = av.gpuResourceID._impl; } }
+             }
+             if (g_mfxup_out && (__bridge void *)sh == (__bridge void *)g_mfxup_sh && t == g_mfxup_src) { t = g_mfxup_out; trid = t.gpuResourceID._impl; }   // TOTK_MFX_UPSCALE
++            if (tid > 0 && tid < (1 << 20)) atomic_store_explicit(&g_tgeneration[tid], trid, memory_order_relaxed);
+             slots[aid] = trid;
+             USE(t, MTLResourceUsageRead);
+         } else if (b->kind == NVN_RB_IMG) {   // 可写贴图：NVN 图像槽 r（BindImages）↔ D3D u_r | Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
+@@ -7863,6 +7961,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+             if (t && b->rw && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
+             if (t && !b->rw && tid < g_ntreg) { t = rtsnap_bound(g_treg[tid].t.serial, t); trid = t.gpuResourceID._impl; }
+             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
++            if (tid > 0 && tid < (1 << 20)) atomic_store_explicit(&g_tgeneration[tid], trid, memory_order_relaxed);
+             slots[aid] = trid;
+             USE(t, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead);
+         } else if (b->kind == NVN_RB_TBUF) {   // 类型化缓冲：贴图槽 r 里的缓冲贴图（目标 BUFFER） | Typed buffer: the buffer texture (target BUFFER) in texture slot r
+@@ -7871,6 +7970,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+             if (t && t.textureType != MTLTextureTypeTextureBuffer) { RED_ONCE(40, "类型化缓冲槽绑的不是缓冲贴图（贴图号 %d 类型 %lu）", tid, (unsigned long)t.textureType); t = nil; }
+             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
+             if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
++            if (tid > 0 && tid < (1 << 20)) atomic_store_explicit(&g_tgeneration[tid], trid, memory_order_relaxed);
+             slots[aid] = trid;
+             USE(t, MTLResourceUsageRead);
+         } else if (b->kind == NVN_RB_SBUFU) {   // TOTK: the shader loads this storage buffer's address from a user uniform block (slot reg, byte offset off); resolve that pointer now
+@@ -10887,7 +10987,10 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
+     rr_snap(dw,di);
+ #endif
+     udc_note_draw(pr);
+-    if ((dw && (dw->prim != 7 ? dw->count > 0 : dw->count >= 4)) || (di && di->count > 0)) bar_note_draw(pr);
++    if ((dw && (dw->prim != 7 ? dw->count > 0 : dw->count >= 4)) || (di && di->count > 0)) {
++        periodic_note_draw(pr);
++        bar_note_draw(pr);
++    }
+     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
+     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
+     if (dw && prim == 7) {   // 四边形：共享索引 0,1,2,0,2,3 | Quads: shared indices 0,1,2,0,2,3
