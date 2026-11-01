@@ -29,7 +29,9 @@ def main(argv=None):
     results = []
     with tempfile.TemporaryDirectory(dir=logs, prefix='profile-') as profile:
         env = dict(os.environ, TOTK_PROFILE_DIR=profile, TOTK_NATIVE_4K144='0', TOTK_HEADLESS='1',
-                   MTL_DEBUG_LAYER='1', MTL_DEBUG_LAYER_ERROR_MODE='assert')
+                   MTL_DEBUG_LAYER='1', MTL_DEBUG_LAYER_ERROR_MODE='assert',
+                   MTL_SHADER_VALIDATION='1', MTL_SHADER_VALIDATION_REPORT_TO_STDERR='1',
+                   MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING='1', MTL_SHADER_VALIDATION_ABORT_ON_FAULT='1')
         for probe in ['selftest', 'probe-policy', 'probe-clock', 'probe-pool-cache', 'probe-gpu-command-generation', 'probe-periodic-present', 'probe-nvn-cpu', 'probe-save', 'probe-warm-pipelines', 'probe-attachment-ledger', 'probe-attachment-feedback',
                       *[f'probe-gpu-{name}' for name in args.gpu]]:
             log = logs / f'{probe}.log'

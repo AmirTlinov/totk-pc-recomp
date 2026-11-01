@@ -1,0 +1,33 @@
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -6732,6 +6732,7 @@
+ }
+ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
+     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
++    d.label = [NSString stringWithFormat:@"NVN vs=%s fs=%s", vs->key, fs ? fs->key : "none"];
+     /* Retained command forms are compiled into Metal indirect command buffers.
+        Metal rejects an ICB command whose pipeline was not created with this bit,
+        so every game PSO that can enter the retained stream must opt in before
+@@ -7660,7 +7661,7 @@
+         while (base.parentTexture) base = base.parentTexture;
+         id<MTLResource> allocation = base.buffer ?: (id<MTLResource>)base;
+         if ([g_res_objects containsObject:allocation]) continue;
+-        defer_obj_unref(view); defer_obj_unref(key);
++        defer_obj_release(view); defer_obj_unref(key);
+         [g_type_views removeObjectForKey:key]; g_type_retired_views++;
+     }
+     pthread_mutex_unlock(&g_res_mu);
+@@ -7670,9 +7671,12 @@
+     if (!g_type_views) g_type_views = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory];
+     id<MTLTexture> v = [g_type_views objectForKey:base];
+     if (v && v.textureType == want) return v;
+-    if (v) defer_obj_unref(v);   // another type requested: earlier encoded draws may still use the old view
++    if (v) defer_obj_release(v);   // The old view remains resident through its last submission.
+     v = [base newTextureViewWithPixelFormat:base.pixelFormat textureType:want levels:NSMakeRange(0, base.mipmapLevelCount) slices:NSMakeRange(0, 1)];
+     if (!v) { RED_ONCE(46, "贴图类型视图建不出（%lu → %lu）", (unsigned long)base.textureType, (unsigned long)want); return nil; }
++    // Type-changing views have their own resource ID in the argument buffer.
++    // Register that view, including views whose parent is another sampling view.
++    res_add(v);
+     [g_type_views setObject:v forKey:base];
+     static int said; if (said++ < 3) MLOG("texture type view: %lu -> %lu for a %lux%lu texture", (unsigned long)base.textureType, (unsigned long)want, (unsigned long)base.width, (unsigned long)base.height);
+     return v;
