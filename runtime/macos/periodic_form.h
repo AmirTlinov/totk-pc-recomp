@@ -8,6 +8,8 @@ enum {
     PERIODIC_PACKET_PASS_BEGIN = 1u << 0,
     PERIODIC_PACKET_PASS_END = 1u << 1,
     PERIODIC_PACKET_DRAW = 1u << 2,
+    PERIODIC_PACKET_ICB_COMMAND = 1u << 3,
+    PERIODIC_PACKET_ICB_BREAK = 1u << 4,
 };
 
 typedef struct {
@@ -16,6 +18,24 @@ typedef struct {
     uint64_t serial;
     uint64_t offset;
 } PeriodicResourceRef;
+
+typedef struct {
+    uint32_t op;
+    uint8_t static_mask, dynamic_mask, resource_mask, flags;
+    uint64_t fields[8];
+    struct {
+        uint32_t role;
+        uint64_t offset;
+    } resources[8];
+} PeriodicFormCommand;
+
+typedef struct {
+    uint64_t form_id;
+    const PeriodicFormCommand *commands;
+    size_t command_count;
+} PeriodicFormSnapshot;
+
+typedef void (*PeriodicFormClosedFn)(uint64_t form_id);
 
 typedef struct {
     uint64_t observed_packets;
@@ -40,6 +60,8 @@ void periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t stat
 // Closed forms are related to the concrete pass occurrence after compilation.
 // The map is a bounded recent-history table for anchor-plan compilation.
 int periodic_form_for_pass(uint64_t pass_id, uint64_t *form_id, uint64_t *anchor_id);
+int periodic_form_snapshot(uint64_t form_id, PeriodicFormSnapshot *snapshot);
+void periodic_form_set_closed_callback(PeriodicFormClosedFn callback);
 
 // An anchor is a guest-rendered state. A phase renderer may publish additional
 // states without advancing the guest simulation clock.

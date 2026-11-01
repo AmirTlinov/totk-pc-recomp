@@ -42,10 +42,14 @@ typedef struct {
     uint64_t submission_id;
     uint64_t execute[PERIODIC_EXECUTION_WORDS];
     uint64_t retained[PERIODIC_EXECUTION_WORDS];
+    uint64_t icb[PERIODIC_EXECUTION_WORDS];
     uint64_t form_ids[PERIODIC_EXECUTION_PASSES];
     uint64_t form_anchors[PERIODIC_EXECUTION_PASSES];
     uint32_t pass_count;
     uint32_t retained_pass_count;
+    uint32_t icb_pass_count;
+    uint32_t icb_cluster_count;
+    uint32_t icb_draw_count;
     uint32_t graph_valid;
 } PeriodicExecutionPlan;
 

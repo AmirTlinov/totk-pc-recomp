@@ -26,17 +26,7 @@ typedef struct {
 // dynamic slot and resource generations are deliberately absent. Resource
 // roles and offsets describe bindings; serials are NextBindings values.
 typedef struct {
-    uint32_t op;
-    uint8_t static_mask, dynamic_mask, resource_mask, flags;
-    uint64_t fields[8];
-    struct {
-        uint32_t role;
-        uint64_t offset;
-    } resources[8];
-} FormCommand;
-
-typedef struct {
-    FormCommand *commands;
+    PeriodicFormCommand *commands;
     size_t count, capacity;
     uint64_t hash;
     uint64_t last_anchor;
@@ -64,6 +54,9 @@ static struct {
     _Atomic uint64_t observed_packets, observed_anchors;
     _Atomic uint64_t learned_forms, closed_forms, invalidated_forms;
     _Atomic uint64_t mapped_passes;
+    _Atomic uint64_t published_form_count;
+    _Atomic(PeriodicFormClosedFn) closed_callback;
+    _Atomic uint8_t closed_flags[FORM_CAPACITY];
     _Atomic uint64_t state_generation;
     struct { _Atomic uint64_t anchor, generation; } anchors[ANCHOR_SLOTS];
     _Atomic int active, stopping;
@@ -97,10 +90,23 @@ static int reserve_commands(CompiledForm *form, size_t count) {
     if (count <= form->capacity) return 1;
     size_t capacity = form->capacity ? form->capacity * 2 : 256;
     while (capacity < count) capacity *= 2;
-    FormCommand *commands = realloc(form->commands, capacity * sizeof *commands);
+    PeriodicFormCommand *commands = realloc(form->commands, capacity * sizeof *commands);
     if (!commands) return 0;
     form->commands = commands;
     form->capacity = capacity;
+    return 1;
+}
+
+void periodic_form_set_closed_callback(PeriodicFormClosedFn callback) {
+    atomic_store_explicit(&state.closed_callback, callback, memory_order_release);
+}
+
+int periodic_form_snapshot(uint64_t form_id, PeriodicFormSnapshot *snapshot) {
+    if (!snapshot || !form_id || !periodic_form_active()) return 0;
+    uint64_t count = atomic_load_explicit(&state.published_form_count, memory_order_acquire);
+    if (form_id > count || !atomic_load_explicit(&state.closed_flags[form_id - 1], memory_order_acquire)) return 0;
+    const CompiledForm *form = &state.forms[form_id - 1];
+    *snapshot = (PeriodicFormSnapshot){.form_id=form_id, .commands=form->commands, .command_count=form->count};
     return 1;
 }
 
@@ -150,7 +156,10 @@ static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
         form->last_anchor = anchor_id;
         if (!form->closed && form->consecutive_returns >= FORM_CLOSE_RETURNS) {
             form->closed = 1;
+            atomic_store_explicit(&state.closed_flags[form->id - 1], 1, memory_order_release);
             atomic_fetch_add_explicit(&state.closed_forms, 1, memory_order_relaxed);
+            PeriodicFormClosedFn callback = atomic_load_explicit(&state.closed_callback, memory_order_acquire);
+            if (callback) callback(form->id);
         }
         if (form->closed) publish_pass_form(candidate->pass_id, form->id, anchor_id);
         return;
@@ -165,6 +174,7 @@ static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
     candidate->next = state.buckets[bucket];
     state.buckets[bucket] = (uint32_t)state.form_count + 1;
     state.forms[state.form_count++] = *candidate;
+    atomic_store_explicit(&state.published_form_count, state.form_count, memory_order_release);
     memset(candidate, 0, sizeof *candidate);
     atomic_fetch_add_explicit(&state.learned_forms, 1, memory_order_relaxed);
 }
@@ -178,7 +188,7 @@ static void append_command(CompiledForm *candidate, const ObserverRecord *record
         candidate->invalid = 1;
         return;
     }
-    FormCommand command = {
+    PeriodicFormCommand command = {
         .op = record->op,
         .static_mask = record->static_mask,
         .dynamic_mask = record->dynamic_mask,

@@ -1,5 +1,6 @@
 #include "periodic_store.h"
 #include "periodic_form.h"
+#include "periodic_compiler.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -635,6 +636,14 @@ int periodic_store_execution_plan(PeriodicExecutionPlan *plan) {
         if (!periodic_form_for_pass(graph->pass_ids[pass], &plan->form_ids[pass], &plan->form_anchors[pass])) continue;
         bit_set(plan->retained, pass);
         plan->retained_pass_count++;
+        const PeriodicCompiledForm *program = periodic_compiler_form(plan->form_ids[pass]);
+        if (program && program->eligible_draw_count) {
+            bit_set(plan->icb, pass);
+            plan->icb_pass_count++;
+            for (uint32_t cluster = 0; cluster < program->cluster_count; ++cluster)
+                plan->icb_cluster_count += program->clusters[cluster].icb_eligible != 0;
+            plan->icb_draw_count += program->eligible_draw_count;
+        }
     }
     release_graph(index);
     return plan->graph_generation != 0;
@@ -761,19 +770,22 @@ int periodic_store_probe(void) {
     periodic_store_pass_begin(90); periodic_store_resource(access_change, 1, 900, PERIODIC_RESOURCE_WRITE); periodic_store_pass_end();
     periodic_store_submit(11); periodic_store_flush();
     if (!periodic_store_execution_plan(&plan) || !(plan.execute[0] & 1)) return 1;
-    periodic_form_init();
+    periodic_compiler_init();
     const uint64_t form_begin[8] = {1}, form_draw[8] = {3, 0, 12}, form_end[8] = {0};
     for (uint64_t anchor = 0; anchor < 3; ++anchor) {
-        periodic_observe_packet(100, form_begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN, NULL, 9000 + anchor);
-        periodic_observe_packet(101, form_draw, 5, 2, 0, PERIODIC_PACKET_DRAW, NULL, 0);
-        periodic_observe_packet(102, form_end, 1, 0, 0, PERIODIC_PACKET_PASS_END, NULL, 0);
+        periodic_observe_packet(100, form_begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN | PERIODIC_PACKET_ICB_BREAK, NULL, 9000 + anchor);
+        periodic_observe_packet(101, form_draw, 5, 2, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(101, form_draw, 5, 2, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(102, form_end, 1, 0, 0, PERIODIC_PACKET_PASS_END | PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         periodic_anchor_publish(anchor);
     }
-    periodic_form_flush();
+    periodic_form_flush(); periodic_compiler_flush();
     periodic_store_pass_begin(9002); periodic_store_resource(access_change, 1, 900, PERIODIC_RESOURCE_READ); periodic_store_pass_end();
     periodic_store_submit(12); periodic_store_flush();
     if (!periodic_store_execution_plan(&plan) || plan.retained_pass_count != 1 ||
-        !(plan.retained[0] & 1) || plan.form_ids[0] != 1 || plan.form_anchors[0] != 2) return 1;
+        !(plan.retained[0] & 1) || !(plan.icb[0] & 1) || plan.icb_pass_count != 1 ||
+        plan.icb_cluster_count != 1 || plan.icb_draw_count != 2 ||
+        plan.form_ids[0] != 1 || plan.form_anchors[0] != 2) return 1;
     enum { BENCH_NOTES = 4096, BENCH_ROUNDS = 9 };
     double samples[BENCH_ROUNDS];
     for (unsigned round = 0; round < BENCH_ROUNDS; ++round) {
