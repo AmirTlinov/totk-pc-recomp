@@ -11,9 +11,14 @@ int native_host_check(void);
 void native_check_output(unsigned width, unsigned height);
 typedef struct {
     uint64_t frame;
+    uint64_t anchor_id;
+    uint64_t state_generation;
+    double phase;
+    unsigned kind;
     unsigned scene_width, scene_height, output_width, output_height;
     unsigned drawable_width, drawable_height;
 } NativeFrame;
+enum { NATIVE_FRAME_ANCHOR, NATIVE_FRAME_PHASE };
 void native_check_scene(uint64_t frame, unsigned width, unsigned height);
 NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigned dw, unsigned dh);
 void native_presented(uint64_t ticket, NativeFrame frame, double seconds);

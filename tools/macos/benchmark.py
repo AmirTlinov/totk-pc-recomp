@@ -1,4 +1,4 @@
-"""Evaluate real presentation timestamps; never count interpolation or repeated frames."""
+"""Evaluate real presentation timestamps and unique native anchor/phase states."""
 import argparse
 import csv
 import json
@@ -23,10 +23,31 @@ def evaluate(rows, target=144.0, minimum_seconds=60.0):
     times.sort()
     tickets = [int(row['ticket']) for row in rows]
     frames = [int(row['frame']) for row in rows]
+    kinds = [row['kind'] for row in rows]
+    anchors = [int(row['anchor_id']) for row in rows]
+    phases = [float(row['phase']) for row in rows]
+    generations = [int(row['state_generation']) for row in rows]
     if any(b != a + 1 for a, b in zip(tickets, tickets[1:])):
         problems.append('missing, repeated or reordered present tickets')
-    if len(set(frames)) != len(frames) or any(b <= a for a, b in zip(frames, frames[1:])):
-        problems.append('repeated or reordered game frames')
+    if len(set(generations)) != len(generations) or any(b <= a for a, b in zip(generations, generations[1:])):
+        problems.append('repeated or reordered rendered states')
+    if any(g <= 0 for g in generations):
+        problems.append('invalid rendered state generation')
+    if any(frame != anchor for frame, anchor in zip(frames, anchors)):
+        problems.append('frame identity differs from anchor identity')
+    if any(b < a for a, b in zip(anchors, anchors[1:])):
+        problems.append('reordered anchor states')
+    for index, (kind, phase) in enumerate(zip(kinds, phases)):
+        if not math.isfinite(phase):
+            raise ValueError('invalid display phase')
+        if kind == 'anchor':
+            if phase != 1.0: problems.append('anchor state does not end its display phase')
+        elif kind == 'phase':
+            if not 0.0 < phase < 1.0: problems.append('phase state is outside its anchor interval')
+        else:
+            problems.append('unknown rendered state kind')
+        if index and anchors[index] == anchors[index - 1] and phase <= phases[index - 1]:
+            problems.append('repeated or reordered display phases')
     if any(int(row['strict']) != 1 for row in rows):
         problems.append('non-strict rendering mode')
     for name in ('scene', 'output', 'drawable'):
@@ -48,7 +69,7 @@ def evaluate(rows, target=144.0, minimum_seconds=60.0):
     precision = 1e-9 + max(math.ulp(t) for t in times)
     if elapsed > len(intervals) / target + precision: problems.append('average presented FPS is below target')
     if p99 > budget + precision: problems.append('p99 frame time exceeds the frame budget')
-    return dict(status='pass' if not problems else 'fail', reasons=problems, frames=len(rows),
+    return dict(status='pass' if not problems else 'fail', reasons=list(dict.fromkeys(problems)), frames=len(rows),
                 seconds=elapsed, average_fps=fps, p50_ms=statistics.median(intervals) * 1000,
                 p99_ms=p99 * 1000, low_1_percent_fps=1 / statistics.mean(worst_one_percent),
                 worst_ms=max(intervals) * 1000, over_budget=sum(dt > budget + precision for dt in intervals),

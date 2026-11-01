@@ -1,5 +1,5 @@
 // Adapted from MacNativeGames games/totk/runtime/game_patches.c @ ebe621d (MIT, Copyright (c) 2026 MacNativeGames
-// contributors): runtime_frame_step_update (2338bb0: no 1/120 s floor) and the speed survey's player chain
+// contributors): runtime_anchor_step_update (2338bb0: no 1/120 s floor) and the speed survey's player chain
 // (world_survey.c player_actor).
 // Frame rate: the frame limit and the real-time frame step, the host half of the patch sets fps60, realtime and cloth
 // (build tables patches-v121.txt, patches-v143.txt).

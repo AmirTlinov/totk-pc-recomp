@@ -50,8 +50,10 @@ static void *write_trace(void *unused) {
         for (size_t i=0; i<n; ++i) {
             const TraceRecord *r = &batch[i];
             NativeFrame f = r->frame;
-            if (fprintf(trace.file, "%llu,%llu,%.9f,%u,%u,%u,%u,%u,%u,%d\n",
-                (unsigned long long)r->ticket, (unsigned long long)f.frame, r->seconds,
+            const char *kind = f.kind == NATIVE_FRAME_ANCHOR ? "anchor" : f.kind == NATIVE_FRAME_PHASE ? "phase" : "invalid";
+            if (fprintf(trace.file, "%llu,%llu,%s,%llu,%.9f,%llu,%.9f,%u,%u,%u,%u,%u,%u,%d\n",
+                (unsigned long long)r->ticket, (unsigned long long)f.frame, kind,
+                (unsigned long long)f.anchor_id, f.phase, (unsigned long long)f.state_generation, r->seconds,
                 f.scene_width, f.scene_height, f.output_width, f.output_height,
                 f.drawable_width, f.drawable_height, r->strict) < 0) writer_failure();
         }
@@ -89,7 +91,7 @@ void native_trace_init(void) {
     trace.read = trace.write = 0;
     trace.stopping = 0;
     if (setvbuf(trace.file, NULL, _IOFBF, 65536) ||
-        fputs("ticket,frame,present_seconds,scene_width,scene_height,output_width,output_height,drawable_width,drawable_height,strict\n", trace.file) < 0)
+        fputs("ticket,frame,kind,anchor_id,phase,state_generation,present_seconds,scene_width,scene_height,output_width,output_height,drawable_width,drawable_height,strict\n", trace.file) < 0)
         runtime_fail("initialize frame trace");
     if (pthread_create(&trace.thread, NULL, write_trace, NULL)) runtime_fail("start frame trace writer");
     atomic_store_explicit(&active, 1, memory_order_relaxed);

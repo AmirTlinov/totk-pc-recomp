@@ -10,6 +10,8 @@ The Windows target translates ARM64 to C and renders through Vulkan. The macOS t
 
 The macOS integration owns transactional save publication, the strict native-4K presentation policy, frame evidence and application packaging. App resources stay read-only. Saves, caches and logs use the user's Library folders. See [macOS](macos.md) for the build and acceptance boundary.
 
+The native renderer is being split into guest-rendered anchors and retained display phases. `periodic_form.c` observes the existing render packet stream through a bounded SPSC tape. A compiler thread normalizes commands, separates fixed fields from dynamic and resource slots, and closes a command form only after full structural equality across consecutive anchor returns. Hashes select a bucket; they never establish identity. The render thread does no allocation, locking or form comparison. The current executor still presents anchors only; render-output retention, Metal ICB execution and native phase composition must each land with their own resource-generation checks before phase states can satisfy acceptance.
+
 ## Windows
 
 ## Starting points

@@ -1,0 +1,143 @@
+diff --git a/runtime/game_patches.c b/runtime/game_patches.c
+index 10dd551..90fe7d3 100644
+--- a/runtime/game_patches.c
++++ b/runtime/game_patches.c
+@@ -73,7 +73,7 @@ void runtime_frame_step_pin(double ms) {
+     else fprintf(stderr, "[totk] frame step pinned at %.3f ms (ratio %.3f, diagnostics)%s\n", us / 1000.0, us / 1e6 * 30.0,
+                  frame_step_data ? "" : " -- but the real-time patch is off, nothing changes");
+ }
+-void runtime_frame_step_update(uint64_t now_ns) {
++void runtime_anchor_step_update(uint64_t now_ns) {
+     if (!frame_step_data || !now_ns) return;
+     if (atomic_load_explicit(&pinned_step_us, memory_order_relaxed)) { last_present_ns = now_ns; return; }
+     if (!last_present_ns) { last_present_ns = now_ns; return; }
+diff --git a/runtime/game_patches_v143.c b/runtime/game_patches_v143.c
+index b8c3d2d..9f123e2 100644
+--- a/runtime/game_patches_v143.c
++++ b/runtime/game_patches_v143.c
+@@ -42,7 +42,7 @@ void runtime_frame_step_pin(double ms){
+     if(frame_step_data&&us)frame_step_store((float)(us/1e6));
+     fprintf(stderr,"[totk] 1.4.3 frame step %s (pin %.3f ms)\n",us?"pinned":"real time",us/1000.0);
+ }
+-void runtime_frame_step_update(uint64_t now_ns){
++void runtime_anchor_step_update(uint64_t now_ns){
+     if(!frame_step_data||!now_ns)return;
+     if(atomic_load_explicit(&pinned_step_us,memory_order_relaxed)){last_present_ns=now_ns;return;}
+     if(!last_present_ns){last_present_ns=now_ns;return;}
+diff --git a/runtime/runtime.h b/runtime/runtime.h
+index 2e669ff..eb2631e 100644
+--- a/runtime/runtime.h
++++ b/runtime/runtime.h
+@@ -31,7 +31,7 @@ void runtime_swkbd_probe(void);
+ void runtime_swkbd_selftest(void);
+ void runtime_dump_threads(void);   /* threads.c: every guest thread's wait state and guest return chain (TOTK_INPUT_FILE "threads") */   /* diagnostic "kbtest": show the text entry bar from a thread of its own */
+ void runtime_frame_step_pin(double ms);                  /* game_patches.c: pin the real-time frame step (diagnostics), 0 = real time */
+-void runtime_frame_step_update(uint64_t now_ns);
++void runtime_anchor_step_update(uint64_t now_ns);
+ void runtime_thread_note_hle(unsigned index);            /* threads.c: the calling guest thread's last host call (hletrace) */
+ uint32_t runtime_thread_current_handle(void);            /* threads.c: handle of the calling guest thread, 0 on a host thread */
+ void *runtime_hle_wrap_named(void *fn, const char *name);/* hle_stack.c: runtime_hle_wrap with a name for diagnostics */
+diff --git a/scripts/v143_timing_fixture.c b/scripts/v143_timing_fixture.c
+index 36bd153..7701432 100644
+--- a/scripts/v143_timing_fixture.c
++++ b/scripts/v143_timing_fixture.c
+@@ -22,7 +22,7 @@ int main(int argc,char **argv){
+  runtime_game_patches(&m);runtime_frame_step_pin(10.0);
+  float values[3];memcpy(values,base+data,sizeof values);
+  printf("{\"pin\":[%.9g,%.9g,%.9g]",values[0],values[1],values[2]);
+- runtime_frame_step_pin(0);runtime_frame_step_update(1000000000ULL);runtime_frame_step_update(1025000000ULL);
++ runtime_frame_step_pin(0);runtime_anchor_step_update(1000000000ULL);runtime_anchor_step_update(1025000000ULL);
+  memcpy(values,base+data,sizeof values);printf(",\"sample\":[%.9g,%.9g,%.9g]}\n",values[0],values[1],values[2]);
+  f=fopen(argv[2],"wb");if(!f||fwrite(base,1,size,f)!=size||fclose(f))return 2;
+  munmap(base,size);return 0;
+diff --git a/third_party/d2r_gfx/gfx/nvn/hle_nvn.c b/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+index 3b26252..bba7de9 100644
+--- a/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
++++ b/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+@@ -2287,7 +2287,8 @@ static int uncapped_interval_on(void) {
+ static void sleep_until_ns(uint64_t dl);
+ static uint64_t present_period(const win_t *o);
+ static unsigned present_ticks(const win_t *o);
+-extern void runtime_frame_step_update(uint64_t now_ns) __attribute__((weak_import));
++extern void runtime_anchor_step_update(uint64_t now_ns) __attribute__((weak_import));
++extern uint64_t periodic_anchor_publish(uint64_t anchor_id) __attribute__((weak_import));
+ extern void movie_host_tick(void) __attribute__((weak_import));   /* TOTK runtime/movie_host.c: pre-rendered cutscenes at their own frame rate */
+ __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
+ __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
+@@ -2662,6 +2663,7 @@ int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否
+ static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
+     gfx_enter();
+     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
++    if (frame && periodic_anchor_publish) periodic_anchor_publish(frame);
+     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
+     if (frame) mtl_set_frame(frame);
+     gfx_leave();
+@@ -2670,7 +2672,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+     NVN_BLOCKING();
+     (void)q; win_t *o = (win_t *)w; o->presents++;
+     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+-    if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
++    if (runtime_anchor_step_update) runtime_anchor_step_update(now_ns());
+     if (movie_host_tick) movie_host_tick();
+     game_work_tick(o->presents);
+     int stats = perf_stats_on();
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+index a1b87eb..60ed1eb 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+@@ -15,6 +15,7 @@
+      after use (probes build pipeline states that go away right after the pass; the game's live in caches).
+    No GPU ordering, resource retirement or uniform snapshot policy changes: B only encodes what A decided, in A's order. */
+ #include "nvn_encode_fifo.h"
++#include "periodic_form.h"
+ #include <TargetConditionals.h>
+ #include <sched.h>
+ #include <dispatch/dispatch.h>
+@@ -52,6 +53,39 @@ static int rs_enabled(void) {
+     }
+     return v;
+ }
++static inline void rs_observe(const nvn_encode_packet *p) {
++    if (!periodic_form_active()) return;
++    uint8_t fixed = 0, dynamic = 0, resources = 0, flags = 0;
++    PeriodicResourceRef refs[8];
++    switch (p->op) {
++        case RS_BEGIN:
++            fixed = 0x30; resources = 0x0f; flags = PERIODIC_PACKET_PASS_BEGIN;
++            for (unsigned i = 0; i < 4; ++i) refs[i] = (PeriodicResourceRef){.role=0x100u + i};
++            break;
++        case RS_END: fixed = 0x03; flags = PERIODIC_PACKET_PASS_END; break;
++        case RS_PSO: resources = 0x01; refs[0] = (PeriodicResourceRef){.role=1}; break;
++        case RS_DSS: resources = 0x01; refs[0] = (PeriodicResourceRef){.role=2}; break;
++        case RS_ADDRESS:
++            fixed = 0x03; resources = 0x04;
++            refs[2] = (PeriodicResourceRef){.role=0x1000u + (uint32_t)(p->u[0] << 8) + (uint32_t)p->u[1]};
++            break;
++        case RS_DRAW: fixed = 0x01; dynamic = 0x06; flags = PERIODIC_PACKET_DRAW; break;
++        case RS_INSTANCED: fixed = 0x01; dynamic = 0x1e; flags = PERIODIC_PACKET_DRAW; break;
++        case RS_INDEXED:
++            fixed = 0x05; dynamic = 0xf2; resources = 0x08; flags = PERIODIC_PACKET_DRAW;
++            refs[3] = (PeriodicResourceRef){.role=0x2000};
++            break;
++        case RS_CULL: case RS_WINDING: case RS_FILL: case RS_CLIP:
++            dynamic = 0x01; break;
++        case RS_STENCIL: dynamic = 0x03; break;
++        case RS_VIEWPORT: case RS_SCISSOR: case RS_BIAS: case RS_BLEND:
++            dynamic = 0xff; break;
++        case RS_VISIBILITY: dynamic = 0x03; break;
++        case RS_STORE: fixed = 0x07; break;
++        default: dynamic = 0xff; break;
++    }
++    periodic_observe_packet((uint32_t)p->op, p->u, fixed, dynamic, resources, flags, refs);
++}
+ static inline uint64_t rs_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *vt, id<MTL4ArgumentTable> *ft, const nvn_encode_packet *p) {
+     const uint64_t *u = p->u; id<MTL4RenderCommandEncoder> e = *enc;
+@@ -136,6 +170,7 @@ static inline void rs_publish(void) {
+     if (atomic_load_explicit(&g_rs_sleeping, memory_order_seq_cst)) dispatch_semaphore_signal(g_rs_sem);
+ }
+ static void rs_put(nvn_encode_packet p, int publish) {
++    rs_observe(&p);
+     if (!nvn_encode_fifo_push(&g_rs_fifo, &p)) {   /* ring full: B is behind; wait for it (counted: this is A time lost to B) */
+         uint64_t t0 = rs_now(); g_rs_full_waits++;
+         do { rs_publish(); __builtin_arm_wfe(); } while (!nvn_encode_fifo_push(&g_rs_fifo, &p));

@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "native_policy.h"
+#include "periodic_form.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,7 @@ void native_frame_thread_init(void) {
 }
 
 void native_policy_init(void) {
+    periodic_form_init();
     if (!activity_token) {
         activity_token = [[NSProcessInfo processInfo]
             beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical |
@@ -124,7 +126,9 @@ void native_check_scene(uint64_t frame, unsigned w, unsigned h) {
 }
 
 NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigned dw, unsigned dh) {
-    NativeFrame result = {.frame=frame};
+    uint64_t generation = periodic_anchor_generation(frame);
+    NativeFrame result = {.frame=frame, .anchor_id=frame, .state_generation=generation ? generation : frame + 1,
+                          .phase=1.0, .kind=NATIVE_FRAME_ANCHOR};
     if (frame != UINT64_MAX && atomic_load_explicit(&scene_frames[frame % 64], memory_order_relaxed) == frame + 1) {
         result.scene_width=3840; result.scene_height=2160;
     }

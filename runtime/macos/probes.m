@@ -1,5 +1,6 @@
 // Game-free probes are compiled only into diagnostic builds.
 #include "native_policy.h"
+#include "periodic_form.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,7 +110,8 @@ static int probe_pool_cache(void) {
 static void *trace_producer(void *arg) {
     uint64_t first=(uintptr_t)arg*256;
     for (uint64_t i=first; i<first+256; ++i) {
-        NativeFrame frame={.frame=i,.scene_width=3840,.scene_height=2160,
+        NativeFrame frame={.frame=i,.anchor_id=i,.state_generation=i+1,.phase=1.0,.kind=NATIVE_FRAME_ANCHOR,
+                           .scene_width=3840,.scene_height=2160,
                            .output_width=3840,.output_height=2160,.drawable_width=3840,.drawable_height=2160};
         native_presented(i,frame,(double)i/144.0);
     }
@@ -136,6 +138,7 @@ int native_run_probe(const char *name) {
 #ifdef TOTK_PROBE_BUILD
     if (!strcmp(name, "--probe-clock")) return probe_clock();
     if (!strcmp(name, "--probe-pool-cache")) return probe_pool_cache();
+    if (!strcmp(name, "--probe-periodic-form")) return periodic_form_probe();
     if (!strcmp(name, "--probe-nvn-cpu")) { extern void runtime_gfx_probe(int); runtime_gfx_probe(0); return 0; }
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
     if (!strcmp(name, "--probe-attachment-ledger") || !strcmp(name, "--probe-attachment-feedback")) {
