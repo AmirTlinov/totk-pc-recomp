@@ -72,7 +72,9 @@ void periodic_form_set_closed_callback(PeriodicFormClosedFn callback);
 // An anchor is a guest-rendered state. A phase renderer may publish additional
 // states without advancing the guest simulation clock.
 uint64_t periodic_anchor_publish(uint64_t anchor_id);
+uint64_t periodic_phase_publish(void);
 uint64_t periodic_anchor_sequence(void);
+uint64_t periodic_latest_anchor(void);
 uint64_t periodic_anchor_generation(uint64_t anchor_id);
 PeriodicFormStats periodic_form_stats(void);
 

@@ -9,6 +9,10 @@ typedef struct {
 } NativeMouseSample;
 
 typedef struct { double yaw, pitch; } NativeMouseTurn;
+typedef struct {
+    double yaw, pitch;
+    uint64_t generation;
+} NativeMousePhase;
 
 // The input owner serializes events and samples with its existing input lock.
 typedef struct {
@@ -34,4 +38,8 @@ void runtime_input_mouse_motion(double dx, double dy, int user);
 void runtime_input_mouse_button(unsigned button, int down, int user);
 void runtime_input_mouse_direct(int enabled);
 NativeMouseTurn runtime_input_mouse_turn(int normal_camera_active);
+// Cumulative angular input is sampled by the display-phase renderer without
+// consuming the game's anchor input. The value changes only for accepted raw
+// mouse motion and is safe to read from the display-link thread.
+NativeMousePhase runtime_input_mouse_phase(void);
 #endif

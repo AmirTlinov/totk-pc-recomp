@@ -1,0 +1,511 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+index 790c6da..3dde0f6 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -1,5 +1,7 @@
+ #include "native_policy.h"
+ #include "periodic_executor.h"
++#include "periodic_form.h"
++#include "periodic_present.h"
+ #include "periodic_store.h"
+ #include "prompt_textures.h"
+ #include "input_prompts.h"
+@@ -99,6 +101,7 @@
+ static id<MTL4CommandAllocator> g_up_alloc4[3];
+ static id<MTL4CommandAllocator> g_present_alloc4[3];
+ static id<MTL4CommandBuffer> g_present_cb[3];
++static MTL4RenderPassDescriptor *g_present_pass[3];
+ static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct;
+ static id<MTL4ArgumentTable> g_present_args[3];
+ static id<MTLBuffer> g_present_uv[3];
+@@ -130,18 +133,46 @@
+ static int g_bloomq_i;
+ static struct { int state; uint64_t s_ser, b0_ser, b1_ser, s_h, samp_h, b1_h; const tex_t *s_tex; float threshold, coeff_g, coeff_b; } g_bloomq;
+ static uint64_t g_bloomq_last_b0, g_bloomq_last_b1h, g_bloomq_last_b1s;   // 最近一次泛光 1/4 叠加改读：B0 序号 → B1 句柄（跨帧保留，见 2e2d6700a2569795 那支） | Most recent bloom 1/4 overlay read redirection: B0 serial → B1 handle (kept across frames, see the 2e2d6700a2569795 branch)
+-static int g_present_alloc_busy[3];   // Cleared only by this slot's GPU feedback; skipped present tickets do not release an allocator.
++static _Atomic int g_present_alloc_busy[3];   // Cleared only by this slot's GPU feedback; skipped present tickets do not release an allocator.
+ static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
+-static pthread_cond_t g_link_cv = PTHREAD_COND_INITIALIZER;
+-static pthread_mutex_t g_link_mu = PTHREAD_MUTEX_INITIALIZER;
+-static uint64_t g_link_tick_ns, g_link_tick_n;
++static dispatch_semaphore_t g_link_wake;
++static _Atomic uint64_t g_link_tick_ns, g_link_tick_n;
++static _Atomic unsigned g_link_waiters;
+ static uint64_t g_link_dropped;
+-static int g_pq_inflight;   // 持 g_pq_mu：已提交给 GPU、完成回调还没来的上屏数 | Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
++static _Atomic unsigned g_pq_inflight;   // Present encodes or submissions that still own an allocator slot.
+ int g_dm_present_link;   // 出图节拍模式（DM_PRESENT_LINK 的运行时值，同进程交替测量时直接改它）：0 = 自己取 drawable；1 = 显示节拍 60 Hz；2 = 120 Hz 节拍、游戏隔拍出一帧 | Present pacing mode (runtime value of DM_PRESENT_LINK, modified directly during same-process alternating measurement): 0 = acquire the drawable itself; 1 = display link at 60 Hz; 2 = display link at 120 Hz, the game presents a frame every other display-link tick
+ static int g_present_latency = 1;
+ static uint64_t g_pq_done;
+-static uint64_t g_pq_read;
++static _Atomic uint64_t g_pq_read;
++
++static int present_allocator_try_acquire(int slot) {
++    int expected = 0;
++    if (!atomic_compare_exchange_strong_explicit(&g_present_alloc_busy[slot], &expected, 1,
++                                                 memory_order_acquire, memory_order_relaxed))
++        return 0;
++    atomic_fetch_add_explicit(&g_pq_inflight, 1, memory_order_relaxed);
++    return 1;
++}
++
++static void present_allocator_acquire(int slot) {
++    while (!present_allocator_try_acquire(slot)) {
++        pthread_mutex_lock(&g_pq_mu);
++        while (atomic_load_explicit(&g_present_alloc_busy[slot], memory_order_acquire))
++            pthread_cond_wait(&g_pq_cv, &g_pq_mu);
++        pthread_mutex_unlock(&g_pq_mu);
++    }
++}
++
++static void present_allocator_release(int slot, uint64_t completed_ticket) {
++    atomic_store_explicit(&g_present_alloc_busy[slot], 0, memory_order_release);
++    atomic_fetch_sub_explicit(&g_pq_inflight, 1, memory_order_relaxed);
++    pthread_mutex_lock(&g_pq_mu);
++    if (completed_ticket > g_pq_done) g_pq_done = completed_ticket;
++    pthread_cond_broadcast(&g_pq_cv);
++    pthread_mutex_unlock(&g_pq_mu);
++}
++
+ static id<MTLResidencySet> g_res;
+ static int g_res_dirty;
+ static id<MTLSharedEvent> g_ev;
+@@ -174,10 +205,11 @@ static int mtl_perf_stats_on(void) {
+     }
+     return enabled;
+ }
+-@interface TotkCommitOptions : MTL4CommitOptions { @public NSMutableArray *handlers; } @end
++@interface TotkCommitOptions : MTL4CommitOptions { @public NSMutableArray *handlers; BOOL keepalive_handler; } @end
+ @implementation TotkCommitOptions
+ - (void)addFeedbackHandler:(MTL4CommitFeedbackHandler)block { if (!handlers) handlers = [NSMutableArray array]; [handlers addObject:[block copy]]; [super addFeedbackHandler:block]; }
+ @end
++static TotkCommitOptions *g_periodic_present_options[3];
+ static void gpu_budget_check(const char *where);
+ static void res_commit(void);
+ static void dead_put_flush(void);
+@@ -209,14 +241,21 @@ static void bg_gate(void) {
+     pthread_mutex_lock(&g_bg_mu); while (atomic_load(&g_app_inactive)) pthread_cond_wait(&g_bg_cv, &g_bg_mu); pthread_mutex_unlock(&g_bg_mu);
+     MLOG("App 不在前台：GPU 提交暂停了 %.1f s，现在继续", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+ }
+-static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
++static void q4_commit_inner(id<MTL4CommandBuffer> cb, TotkCommitOptions *o, int residency_dirty) {
+     bg_gate();
+-    res_commit();
++    if (residency_dirty) res_commit();
+     atomic_fetch_add(&g_q4_inflight, 1);
+-    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; if (atomic_fetch_sub(&g_q4_inflight, 1) == 1 && g_ka_idle) dispatch_semaphore_signal(g_ka_idle); }];
++    if (!o->keepalive_handler) {
++        o->keepalive_handler = YES;
++        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; if (atomic_fetch_sub(&g_q4_inflight, 1) == 1 && g_ka_idle) dispatch_semaphore_signal(g_ka_idle); }];
++    }
+     if (!nogpu()) { id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return; }
+     for (MTL4CommitFeedbackHandler h in o->handlers) h(nil);
+ }
++static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) { q4_commit_inner(cb, o, 1); }
++// Periodic phase resources are created, made resident and committed by their
++// anchor. The display hot path must not enter the residency mutex again.
++static void q4_commit_resident(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) { q4_commit_inner(cb, o, 0); }
+ static void cb_commit(id<MTLCommandBuffer> cb) { bg_gate(); res_commit(); if (!nogpu()) [cb commit]; }
+ static void cb_wait(id<MTLCommandBuffer> cb) { if (!nogpu()) [cb waitUntilCompleted]; }
+ static uint64_t g_fence;                        // 已提交的最大栅栏值（提交线程独占递增） | Highest committed fence value (incremented exclusively by the submit thread)
+@@ -316,6 +355,9 @@ static int periodic_resolve_buffer(uint64_t address, uint64_t length, void **ret
+ static void periodic_make_resident(void *allocation) {
+     res_add_at((__bridge id<MTLAllocation>)allocation, __LINE__);
+ }
++static void periodic_present_make_resident(id<MTLAllocation> allocation) {
++    periodic_make_resident((__bridge void *)allocation);
++}
+ static int g_res_remove_no_pool; // GPU probe negative control only
+ static void res_remove(id<MTLResource> r) {
+     if (!r) return;
+@@ -585,6 +627,8 @@ void mtl_init(void) {
+     g_q4 = [g_dev newMTL4CommandQueueWithDescriptor:q4d error:&re];
+     if (!g_q4) MDIE("建立 MTL4CommandQueue 失败");
+     [g_q4 addResidencySet:g_res];
++    g_link_wake = dispatch_semaphore_create(0);
++    periodic_present_prepare(g_dev, periodic_present_make_resident);
+     g_alloc_n = 3;
+     for (int i = 0; i < 3; i++) {
+         MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
+@@ -600,6 +644,15 @@ void mtl_init(void) {
+         if (!g_present_alloc4[i]) MDIE("建立出图 MTL4CommandAllocator[%d] 失败：%s", i, ae.localizedDescription.UTF8String);
+         g_present_cb[i] = [g_dev newCommandBuffer];
+         if (!g_present_cb[i]) MDIE("建立出图 MTL4CommandBuffer[%d] 失败", i);
++        g_present_pass[i] = [MTL4RenderPassDescriptor new];
++        if (!g_present_pass[i]) MDIE("建立出图 render pass descriptor[%d] 失败", i);
++        g_periodic_present_options[i] = [TotkCommitOptions new];
++        int slot = i;
++        [g_periodic_present_options[i] addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
++            sysload_note_gpu(feedback.GPUStartTime, feedback.GPUEndTime);
++            if (feedback.error) MLOG("【红】periodic phase command buffer: %s", feedback.error.description.UTF8String);
++            present_allocator_release(slot, 0);
++        }];
+     }
+     MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
+     atd.maxBufferBindCount = 31; atd.maxTextureBindCount = 1;
+@@ -3930,6 +3983,9 @@ Before the first UI draw into it (a TOTK UI vertex shader) the pass is ended and
+ #define MFX_ROLE_UI 2
+ #define MFX_ROLE_UI_OPAQUE 3
+ static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role; uint64_t frames; } g_mfx;
++// Replay-thread owned: one camera form is captured from the first G-buffer
++// pass for each render-frame identity. Present never resets this state.
++static struct { uint64_t frame; int want_cam; } g_periodic_camera = {UINT64_MAX, 0};
+ static id<MTLRenderPipelineState> g_enc_pso; static id<MTLDepthStencilState> g_enc_dss;   // 本编码器上已设的（相同不重设） | Already set on this encoder (not set again if identical)
+ static int g_enc_vis, g_enc_has_vis;   // 本编码器当前的可见性计数模式（0 关 / 槽号 + 1）、是否挂了可见性缓冲 | This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
+ static int g_pso_dirty = 1, g_dss_dirty = 1;   // 回放中改了管线 / 深度模板相关状态 | Pipeline / depth-stencil related state was changed during replay
+@@ -4681,6 +4737,21 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
+         g_pass.cfmt[7] = (uint32_t)MTLPixelFormatRGBA16Float; g_pass.mfx = 1;
+     }
+ }
++static void periodic_camera_pass_setup(MTL4RenderPassDescriptor *pd) {
++    uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
++    if (g_periodic_camera.frame == frame) return;
++    id<MTLTexture> depth = pd.depthAttachment.texture;
++    id<MTLTexture> color = pd.colorAttachments[0].texture;
++    if (!depth || !color || depth.pixelFormat != MTLPixelFormatDepth32Float ||
++        depth.width != color.width || depth.height != color.height || depth.width < 320) return;
++    int colors = 0;
++    for (int i = 0; i < R.rt.n && i < 8; ++i)
++        colors += pd.colorAttachments[i].texture != nil;
++    if (colors >= 3) {
++        g_periodic_camera.frame = frame;
++        g_periodic_camera.want_cam = 1;
++    }
++}
+ /* TOTK_MFX: vertex shaders of the game's UI (layout panes, text, icons, the minimap); the first draw into the canvas with
+    one of them ends the scene. */
+ static int mfx_ui_vs(const char *key) {
+@@ -4917,6 +4988,7 @@ static void mfx_snapshot_scene(void) {
+     ser_gate();
+     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
+     else if (uw_ratio()) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in
++    if (periodic_present_enabled()) periodic_camera_pass_setup(pd);
+     bar_prepare_pass(pd, bar_pr);
+     g_enc = enc_r_begin(pd);
+     args_dirty_all();
+@@ -10155,6 +10227,15 @@ static void mfx_take_camera(void) {
+     } else { static int said; if (said++ < 5) MLOG("[mfx] G-buffer pass %llu: vertex uniform 1 is %#llx / %llu bytes, not the 2368-byte camera block (frame %llu)", g_stat_pass,
+                                                  (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)atomic_load(&g_cur_frame)); }
+ }
++static void periodic_take_camera(void) {
++    g_periodic_camera.want_cam = 0;
++    const p_bind_buf *uniform = &S.ubo[0][1];
++    float camera[84];
++    if (uniform->addr && uniform->size == 2368) {
++        pend_materialize(uniform->addr, (uint8_t *)camera, sizeof camera, 0);
++        periodic_present_note_camera(atomic_load(&g_cur_frame), camera, 84);
++    }
++}
+ static void draw_inner(const p_draw *dw, const p_draw_idx *di);
+ /* Diagnostic DM_NVN_NANDRAW=<first>-<last frame> (log DM_NVN_NANDRAW_LOG, default analysis/nandraw.tsv): after every
+    draw into a full-size RG11B10F or R32F colour attachment (the HDR target, the linear depth), end the pass and count
+@@ -10928,6 +11009,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
+         if (r != g_mfx.role) { g_mfx.role = r; g_pso_dirty = 1; }
+     }
+     if (g_mfx.want_cam) mfx_take_camera();
++    if (g_periodic_camera.want_cam) periodic_take_camera();
+     if (defer_q_draw) defer_replay();
+     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
+     // 管线只依赖（程序, 通道目标, 混合 / 颜色 / 写掩码 / 多重采样状态, 顶点布局）：这些没变就沿用上次的
+@@ -11999,6 +12081,7 @@ void mtl_exec(const uint8_t *p) {
+ static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
+ static id<MTLSamplerState> g_blit_samp;
+ static uint64_t g_present_n;
++static _Atomic uint64_t g_native_present_ticket;
+ uint64_t mtl_present_count(void) { return g_present_n; }   // 实际出图次数（发热归因 DM_HEAT 算出图帧率） | Actual present count (heat attribution DM_HEAT computes the present frame rate)
+ void mtl_res_snapshot(mtl_res_count *out) {
+     memset(out, 0, sizeof *out);
+@@ -12677,7 +12760,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+     id<MTLTexture> up = output_upscale(cb, src, cx, cy, cw, ch, vp, uv_i);   // TOTK 2K output: MetalFX to the viewport, drawn 1:1 below
+     id<MTLTexture> pic = up ? up : src;
+     if (up) { cx = 0; cy = 0; cw = up.width; ch = up.height; }
+-    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
++    MTL4RenderPassDescriptor *rp = g_present_pass[uv_i];
+     rp.colorAttachments[0].texture = dst;
+     rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+@@ -12906,7 +12989,7 @@ static void cadence_note(double tt, int interp) {
+     }
+     pthread_mutex_unlock(&mu);
+ }
+-static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, int interp) {
++static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, int interp, NativeMousePhase phase_input) {
+     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
+     g_present_n++;
+     /* TOTK: the FPS box counts game presents per second and, while MetalFX interpolates, the generated frames shown as
+@@ -13108,17 +13191,24 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     if (!dr) return 0;
+     native_check_output((unsigned)dr.texture.width, (unsigned)dr.texture.height);
+     NativeFrame native_frame = {0};
+-    if (native_trace_active()) native_frame = native_frame_capture(frame, (unsigned)src.width, (unsigned)src.height,
+-                                                                  (unsigned)dr.texture.width, (unsigned)dr.texture.height);
++    if (native_trace_active() || (interp < 0 && periodic_present_enabled()))
++        native_frame = native_frame_capture(frame, (unsigned)src.width, (unsigned)src.height,
++                                            (unsigned)dr.texture.width, (unsigned)dr.texture.height);
+     int alloc_i = (int)((ticket * 2 + (interp >= 0 ? 0 : 1)) % 3);   // the interpolated frame of a ticket and the ticket's own frame use different allocators
+-    pthread_mutex_lock(&g_pq_mu);
+-    while (g_present_alloc_busy[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+-    pthread_mutex_unlock(&g_pq_mu);
++    // Claim ownership before resetting or encoding. A display phase may probe
++    // the same slot concurrently while this anchor is prepared.
++    present_allocator_acquire(alloc_i);
+     [g_present_alloc4[alloc_i] reset];
+     [g_q4 waitForDrawable:dr];
+     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
+     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
+-    if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
++    if (interp < 0 && periodic_present_enabled()) {
++        uint64_t generation = periodic_present_capture_anchor(cb, src, frame,
++            target_ts > 0 ? target_ts : CACurrentMediaTime(), phase_input,
++            dr.texture.pixelFormat);
++        if (generation) native_frame.state_generation = generation;
++    }
++    if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i)) { [cb endCommandBuffer]; present_allocator_release(alloc_i, 0); [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
+     id<MTLBuffer> grab_buf = nil; size_t grab_w = dr.texture.width, grab_h = dr.texture.height;
+     if (grab) {
+         grab_buf = grab_w && grab_h ? [g_dev newBufferWithLength:grab_w * grab_h * 4 options:MTLResourceStorageModeShared] : nil;
+@@ -13208,9 +13298,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+                 }
+             }
+         }
+-        pthread_mutex_lock(&g_pq_mu); g_present_alloc_busy[alloc_i] = 0; if (interp < 0 && ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
++        present_allocator_release(alloc_i, interp < 0 ? ticket : 0);
+     }];
+-    pthread_mutex_lock(&g_pq_mu); g_present_alloc_busy[alloc_i] = 1; g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
+     q4_commit(cb, o);
+     if (target_ts > 0) {
+         static double leads[300], e2e[300];   // e2e：游戏入队 → 系统预定上屏（含在队列里等节拍回调的时间），输入延迟里我们这一侧能读到的全程 | e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
+@@ -13233,9 +13322,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     (void)period; [dr present];
+ #else
+     uint64_t pn = ticket;   // 按游戏出图序号（票号）记上屏时刻：hle 的上屏统计按「游戏第 n 次出图」取；显示节拍路径里实际出图次数 ≠ 游戏出图次数（旧帧会被合并丢弃） | Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
++    uint64_t native_ticket = atomic_fetch_add_explicit(&g_native_present_ticket, 1, memory_order_relaxed) + 1;
+     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // 真实呈现时刻（屏幕上真正换上这一帧的时间，CACurrentMediaTime 基准） | Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
+         CFTimeInterval tt = d.presentedTime;
+-        if (interp < 0 && tt > 0) native_presented(pn, native_frame, tt);
++        if (interp < 0 && tt > 0) native_presented(native_ticket, native_frame, tt);
+         if (interp < 0) g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};   // statistics per game frame; the interpolated one is not a game frame
+         cadence_note(tt, interp >= 0);
+         front_frame_presented();
+@@ -13248,6 +13338,51 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     (void)frame;
+     return 1;
+ }
++
++// A display phase owns no NVN ticket and never advances the guest clock. It
++// reads the retained anchor copy and publishes a new state directly on the
++// display-link tick. If all present allocators are still in flight the phase is
++// skipped; the callback never waits and therefore cannot make the next anchor
++// miss its refresh.
++static int periodic_present_now(CAMetalDisplayLinkUpdate *update) {
++    if (!periodic_present_enabled() || !update.drawable ||
++        atomic_load_explicit(&g_app_inactive, memory_order_relaxed)) return 0;
++    NativeMousePhase input = runtime_input_mouse_phase();
++    double target = update.targetPresentationTimestamp;
++    if (!periodic_present_phase_due(target, input)) return 0;
++    int alloc_i = -1;
++    for (int i = 0; i < 3; ++i)
++        if (present_allocator_try_acquire(i)) { alloc_i = i; break; }
++    if (alloc_i < 0) return 0;
++    id<CAMetalDrawable> drawable = update.drawable;
++    native_check_output((unsigned)drawable.texture.width, (unsigned)drawable.texture.height);
++    [g_present_alloc4[alloc_i] reset];
++    [g_q4 waitForDrawable:drawable];
++    id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
++    [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
++    PeriodicPresentState state = {0};
++    id<MTLTexture> picture = periodic_present_encode_phase(cb, (unsigned)alloc_i,
++        drawable.texture, target, input, &state);
++    if (!picture)
++        MDIE("periodic phase encode failed after readiness was established");
++    [cb endCommandBuffer];
++    q4_commit_resident(cb, g_periodic_present_options[alloc_i]);
++    g_present_n++;
++    fps_overlay_note_gen(++g_gen_shown, CACurrentMediaTime());
++    [g_q4 signalDrawable:drawable];
++    NativeFrame native_frame = native_phase_capture(state.source_frame, state.anchor_id,
++        state.state_generation, state.phase, (unsigned)picture.width, (unsigned)picture.height,
++        (unsigned)drawable.texture.width, (unsigned)drawable.texture.height);
++    uint64_t native_ticket = atomic_fetch_add_explicit(&g_native_present_ticket, 1, memory_order_relaxed) + 1;
++    [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
++        CFTimeInterval time = shown.presentedTime;
++        if (time > 0) native_presented(native_ticket, native_frame, time);
++        cadence_note(time, 1);
++        front_frame_presented();
++    }];
++    [drawable present];
++    return 1;
++}
+ // ---------- 出图线程 ----------
+ // NVN 语义：QueuePresentTexture 只把出图排进队列、立即返回（游戏常持锁调用它；iOS 真机：在里面同步等 nextDrawable
+ // 约 30 ms，锁被占约 90%，装载线程饿死）。取 drawable、blit、present 都在这条线程上按入队顺序做。
+@@ -13261,10 +13396,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+ // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
+ // are necessarily ordered after that blit on the GPU queue.
+ #define PQ 8
+-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; int interp, interp_shown; double interp_ts; } pq_item;   // interp (TOTK_MFX): output slot of the frame shown before this one, or -1; interp_ts: the refresh it was shown at   // t_in：游戏把这一帧交进出图队列的时刻（CACurrentMediaTime） | t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
++typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; int interp, interp_shown; double interp_ts; NativeMousePhase phase_input; } pq_item;   // interp (TOTK_MFX): output slot of the frame shown before this one, or -1; interp_ts: the refresh it was shown at   // t_in：游戏把这一帧交进出图队列的时刻（CACurrentMediaTime） | t_in: the time the game handed this frame into the present queue (CACurrentMediaTime)
+ static pq_item g_pq[PQ];
+-static uint64_t g_pq_in;
+-static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int);
++static _Atomic uint64_t g_pq_in;
++static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, int, NativeMousePhase);
+ 
+ @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
+ @end
+@@ -13277,7 +13412,8 @@ @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
+ // One stall logs one hint line, and one line on recovery (neither is a failure); only when the same stall lasts longer than STALL_RED_NS is it a failure. All under g_pq_mu
+ #define STALL_NS 100000000ull
+ #define STALL_RED_NS 2000000000ull
+-static uint64_t g_stall_t0, g_stall_drop, g_stall_n; static int g_stall_red, g_stall_logged;
++static _Atomic uint64_t g_stall_t0;
++static uint64_t g_stall_drop, g_stall_n; static int g_stall_red, g_stall_logged;
+ // 显示节拍看门狗只认「激活」状态：App 失去活跃（下拉控制中心 / 通知、来电、系统弹窗）和后台里系统本来就不回调，画面也被盖住——丢帧兜底照旧，
+ // 但不算卡住、不报红；停顿从「最近一次回调 / 最近一次激活」较晚的那个算起（A16 日志：失活 8–17 秒、后台 17 秒都被报成「前台卡住」）
+ // The display link watchdog only recognizes the "active" state: when the App loses active status (pulling down Control Center / notifications, incoming call, system popup) and in the background the system does not call back anyway, and the picture is covered too -- the frame-drop fallback stays as before,
+@@ -13289,17 +13425,38 @@ @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
+ @implementation NvMetalDisplayLinkDelegate
+ - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
+     (void)link;
++    uint64_t tick_time = now_ns();
++    atomic_store_explicit(&g_link_tick_ns, tick_time, memory_order_relaxed);
++    atomic_fetch_add_explicit(&g_link_tick_n, 1, memory_order_release);
++    unsigned waiters = atomic_load_explicit(&g_link_waiters, memory_order_acquire);
++    for (unsigned i = 0; i < waiters; ++i) dispatch_semaphore_signal(g_link_wake);
++    if (!g_dm_present_link) return;
++
++    // The common phase tick observes an empty anchor queue without entering
++    // either present mutex. If an anchor is published after this snapshot it
++    // is eligible for the next display tick; the current drawable already
++    // belongs to this callback.
++    if (!atomic_load_explicit(&g_stall_t0, memory_order_acquire) &&
++        atomic_load_explicit(&g_pq_read, memory_order_acquire) ==
++        atomic_load_explicit(&g_pq_in, memory_order_acquire)) {
++        @autoreleasepool { (void)periodic_present_now(update); }
++        return;
++    }
++
+     pthread_mutex_lock(&g_pq_mu);
+-    if (g_stall_t0) { uint64_t since = dm_focus_in_since(), t = now_ns();
+-        MLOG("显示节拍恢复：这段停了 %.0f ms（其中激活中 %.0f ms），兜底丢了 %llu 帧（第 %llu 段）", (t - g_stall_t0) / 1e6, (t - (g_stall_t0 > since ? g_stall_t0 : since)) / 1e6, (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n); g_stall_t0 = 0; }
+-    pthread_mutex_unlock(&g_pq_mu);
+-    pthread_mutex_lock(&g_link_mu);
+-    g_link_tick_ns = now_ns();
+-    g_link_tick_n++;
+-    pthread_cond_broadcast(&g_link_cv);
+-    pthread_mutex_unlock(&g_link_mu);
+-    pthread_mutex_lock(&g_pq_mu);
+-    if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
++    uint64_t stalled = atomic_load_explicit(&g_stall_t0, memory_order_relaxed);
++    if (stalled) {
++        uint64_t since = dm_focus_in_since();
++        MLOG("显示节拍恢复：这段停了 %.0f ms（其中激活中 %.0f ms），兜底丢了 %llu 帧（第 %llu 段）",
++             (tick_time - stalled) / 1e6, (tick_time - (stalled > since ? stalled : since)) / 1e6,
++             (unsigned long long)g_stall_drop, (unsigned long long)g_stall_n);
++        atomic_store_explicit(&g_stall_t0, 0, memory_order_release);
++    }
++    if (g_pq_read == g_pq_in) {
++        pthread_mutex_unlock(&g_pq_mu);
++        @autoreleasepool { (void)periodic_present_now(update); }
++        return;
++    }
+     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
+     pq_item *ip = &g_pq[(g_pq_in - 1) % PQ];
+     int interp = ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;   // TOTK_MFX: this tick shows the interpolated frame, a later one the game frame
+@@ -13319,7 +13476,7 @@ - (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayL
+     pthread_cond_broadcast(&g_pq_cv);
+     pthread_mutex_unlock(&g_pq_mu);
+     int submitted;
+-    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp); }
++    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp, it.phase_input); }
+     if (!submitted && interp < 0) {
+         pthread_mutex_lock(&g_pq_mu);
+         if (ticket > g_pq_done) g_pq_done = ticket;
+@@ -13389,7 +13546,8 @@ static void present_drop_for_suspend(void) {
+         uint64_t n = g_pq_in - g_pq_read;
+         for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) g_pres[k % PRING] = (pres_ent){k, -1};
+         g_link_dropped += n; g_pq_read = g_pq_in;
+-        while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
++        while (atomic_load_explicit(&g_pq_inflight, memory_order_acquire))
++            pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+         if (g_pq_done < g_pq_in) g_pq_done = g_pq_in;
+         pthread_cond_broadcast(&g_pq_cv);
+         if (n) MLOG("进后台：丢弃排队中未上屏的 %llu 帧（显示节拍在后台不回调）", (unsigned long long)n);
+@@ -13415,8 +13573,8 @@ a newer game frame is already queued (uncapped interpolation above half the refr
+         static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
+         int show_interp = it.interp >= 0 && !behind;
+-        if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
+-        @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1); }
++        if (show_interp) { @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp, it.phase_input); } }
++        @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1, it.phase_input); }
+         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+         if (!submitted) {
+             pthread_mutex_lock(&g_pq_mu);
+@@ -13521,7 +13679,12 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+     }
+     pthread_mutex_lock(&g_pq_mu);
+     while (g_pq_in - g_pq_done >= (native_policy_strict() ? 2 : PQ)) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // 队满才等；正常由 AcquireTexture 先挡住 | Wait only when the queue is full; normally AcquireTexture blocks first
+-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0};
++    uint64_t anchor_frame = periodic_latest_anchor();
++    if (anchor_frame == UINT64_MAX) anchor_frame = atomic_load(&g_cur_frame);
++    pq_item *it = &g_pq[g_pq_in % PQ];
++    *it = (pq_item){.t=*t, .period=period, .frame=anchor_frame,
++                    .t_in=CACurrentMediaTime(), .interp=islot,
++                    .phase_input=runtime_input_mouse_phase()};
+     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // 当帧状态随票号入队，不在出图线程晚读可变window | The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
+     uint64_t tk = ++g_pq_in;
+     pthread_cond_broadcast(&g_pq_cv);
+@@ -13541,13 +13704,14 @@ void mtl_present_wait(uint64_t tk) {
+         // 已认定在停顿里（节拍回来时回调先清 g_stall_t0、再记节拍时刻）：不再每帧白等 100 ms，直接丢，游戏按自己的节拍等待超时（约两拍）走
+         // Already determined to be in a stall (when the display link comes back the callback first clears g_stall_t0, then records the display-link tick time): no longer wait 100 ms in vain every frame, drop directly, and the game proceeds by its own display-link wait timeout (about two ticks)
+         if (!g_stall_t0 && (pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts) != ETIMEDOUT || g_pq_done >= tk)) continue;
+-        uint64_t now = now_ns(), last = __atomic_load_n(&g_link_tick_ns, __ATOMIC_RELAXED);
++        uint64_t now = now_ns(), last = atomic_load_explicit(&g_link_tick_ns, memory_order_relaxed);
+         if (g_pq_read >= tk) continue;
+         if (now - last < STALL_NS) { pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts); continue; }   // 节拍还在走，只是这张还没轮到：接着等（有上限，不空转） | The display link is still running, it is just not this one's turn yet: keep waiting (bounded, no busy spinning)
+         uint64_t n = tk - g_pq_read;
+         for (uint64_t k = g_pq_read + 1; k <= tk; k++) g_pres[k % PRING] = (pres_ent){k, -1};
+         g_link_dropped += n; g_pq_read = tk;
+-        while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
++        while (atomic_load_explicit(&g_pq_inflight, memory_order_acquire))
++            pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+         if (g_pq_done < tk) g_pq_done = tk;
+         pthread_cond_broadcast(&g_pq_cv);
+         if (!g_stall_t0) { g_stall_t0 = last ? last : now; g_stall_drop = 0; g_stall_red = 0; g_stall_logged = 0; g_stall_n++; }
+@@ -13599,18 +13763,25 @@ int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) {
+        callbacks; test windows hit it) is not waited for: the caller paces by its own clock instead. Waiting out the timeout
+        every frame turned MetalFX frame interpolation's 50 fps into 18 (2026-10-16 night, mfiA1), and the presents are
+        dropped by mtl_present_wait's fallback anyway. The wait resumes with the first callback. */
+-    if (g_link_tick_ns && now_ns() - __atomic_load_n(&g_link_tick_ns, __ATOMIC_RELAXED) > STALL_NS) return 0;
++    uint64_t last_tick_ns = atomic_load_explicit(&g_link_tick_ns, memory_order_relaxed);
++    if (last_tick_ns && now_ns() - last_tick_ns > STALL_NS) return 0;
+     /* TOTK: a frame occupies frame_ticks 60 Hz ticks (the game's present interval); the variable-frame-rate step
+        advances game time by exactly that interval, so presenting faster would speed the game up. */
+     const uint64_t step = (uint64_t)(g_dm_present_link == 2 ? 2 : 1) * (frame_ticks ? frame_ticks : 1);   // 一帧占几拍：游戏出图间隔 × 每个 60 Hz 节拍对应的节拍数（120 Hz 节拍为 2） | Ticks per frame: the game's present interval times display-link ticks per 60 Hz tick (2 at 120 Hz)
+-    pthread_mutex_lock(&g_link_mu);
+-    if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
+-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+-    ts.tv_sec += timeout_ns / 1000000000ull; ts.tv_nsec += timeout_ns % 1000000000ull;
+-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+-    while (g_link_tick_n < started_tick + step) if (pthread_cond_timedwait(&g_link_cv, &g_link_mu, &ts) == ETIMEDOUT) { pthread_mutex_unlock(&g_link_mu); return 0; }
+-    started_tick = g_link_tick_n;
+-    pthread_mutex_unlock(&g_link_mu); return 1;
++    uint64_t goal = started_tick + step;
++    uint64_t tick = atomic_load_explicit(&g_link_tick_n, memory_order_acquire);
++    if (tick >= goal) { started_tick = tick; return 1; }
++    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ns);
++    atomic_fetch_add_explicit(&g_link_waiters, 1, memory_order_acq_rel);
++    while ((tick = atomic_load_explicit(&g_link_tick_n, memory_order_acquire)) < goal) {
++        if (dispatch_semaphore_wait(g_link_wake, deadline)) {
++            atomic_fetch_sub_explicit(&g_link_waiters, 1, memory_order_acq_rel);
++            return 0;
++        }
++    }
++    atomic_fetch_sub_explicit(&g_link_waiters, 1, memory_order_acq_rel);
++    started_tick = tick;
++    return 1;
+ }
+ 
+ static id<CAMetalDrawable> g_prefetched_drawable; // 合成直画 drawable 用 | Used for compositing straight onto the drawable

@@ -3,6 +3,7 @@
 #include "periodic_form.h"
 #include "periodic_compiler.h"
 #include "periodic_executor.h"
+#include "periodic_present.h"
 #include "periodic_store.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -144,6 +145,7 @@ int native_run_probe(const char *name) {
     if (!strcmp(name, "--probe-periodic-form")) return periodic_form_probe();
     if (!strcmp(name, "--probe-periodic-compiler")) return periodic_compiler_probe();
     if (!strcmp(name, "--probe-periodic-executor")) return periodic_executor_probe();
+    if (!strcmp(name, "--probe-periodic-present")) return periodic_present_probe();
     if (!strcmp(name, "--probe-periodic-store")) return periodic_store_probe();
     if (!strcmp(name, "--probe-nvn-cpu")) { extern void runtime_gfx_probe(int); runtime_gfx_probe(0); return 0; }
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
@@ -169,6 +171,8 @@ int native_run_probe(const char *name) {
             getenv("TOTK_EXP_SKIP_FS") || getenv("TOTK_GPU_SKIP_VC")) runtime_fail("strict policy retained an image override");
         if (strcmp(getenv("TOTK_FPS_LIMIT") ?: "", "144") ||
             strcmp(getenv("DM_PRESENT_HZ") ?: "", "144") ||
+            strcmp(getenv("DM_PRESENT_LINK") ?: "", "1") ||
+            strcmp(getenv("TOTK_PERIODIC_PHASE") ?: "", "1") ||
             strcmp(getenv("TOTK_ASYNC_REPLAY") ?: "", "1") ||
             strcmp(getenv("TOTK_BARRIER_NARROW") ?: "", "1") ||
             strcmp(getenv("TOTK_TBDR_ATTACH") ?: "", "1") ||
@@ -188,7 +192,10 @@ int native_run_probe(const char *name) {
         if (mfx_enabled() || mfxup_enabled() || mfxup_output_enabled()) runtime_fail("native policy runtime scaling");
         native_check_scene(7,3840,2160);
         NativeFrame f=native_frame_capture(7,3840,2160,3840,2160);
-        if(f.scene_width!=3840 || native_frame_capture(8,3840,2160,3840,2160).scene_width)
+        // The compose happens under id 7 and its following present publishes
+        // anchor 8; both identities must carry the same strict-size proof.
+        if(f.scene_width!=3840 || native_frame_capture(8,3840,2160,3840,2160).scene_width!=3840 ||
+           native_frame_capture(9,3840,2160,3840,2160).scene_width)
             runtime_fail("frame scene identity");
         native_check_scene(71,3840,2160);
         if(native_frame_capture(7,3840,2160,3840,2160).scene_width || f.scene_width!=3840)

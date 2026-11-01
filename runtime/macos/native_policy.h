@@ -21,6 +21,8 @@ typedef struct {
 enum { NATIVE_FRAME_ANCHOR, NATIVE_FRAME_PHASE };
 void native_check_scene(uint64_t frame, unsigned width, unsigned height);
 NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigned dw, unsigned dh);
+NativeFrame native_phase_capture(uint64_t source_frame, uint64_t anchor_id, uint64_t generation,
+                                 double phase, unsigned w, unsigned h, unsigned dw, unsigned dh);
 void native_presented(uint64_t ticket, NativeFrame frame, double seconds);
 void native_trace_init(void);
 void native_trace_finish(void);

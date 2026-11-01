@@ -22,6 +22,18 @@ static id<NSObject> activity_token;
 // Zero denotes an unused slot, so frame zero is stored as one.
 static _Atomic uint64_t scene_frames[64];
 
+static int scene_seen(uint64_t frame) {
+    return frame != UINT64_MAX &&
+        atomic_load_explicit(&scene_frames[frame % 64], memory_order_relaxed) == frame + 1;
+}
+
+static int anchor_scene_seen(uint64_t frame) {
+    // NVN identifies an anchor when QueuePresentTexture publishes it. The
+    // scene compose that produced that anchor ran while the previous present
+    // id was current, so its strict-size marker is one id behind.
+    return scene_seen(frame) || (frame > 0 && scene_seen(frame - 1));
+}
+
 int native_policy_strict(void) { return strict_mode; }
 
 void native_frame_thread_init(void) {
@@ -68,10 +80,11 @@ void native_policy_init(void) {
     if (!strict_mode) return;
     const struct { const char *key, *value; } settings[] = {
         {"TOTK_OUTPUT_RES", "3840x2160"}, {"TOTK_RENDER_RES", "3840x2160"},
-        {"DM_PRESENT_HZ", "144"}, {"DM_PRESENT_LINK", "0"},
+        {"DM_PRESENT_HZ", "144"}, {"DM_PRESENT_LINK", "1"},
         {"TOTK_FPS_LIMIT", "144"}, {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"},
         {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"}, {"TOTK_ASYNC_REPLAY", "1"},
         {"TOTK_MFX", "0"}, {"TOTK_MFX_UPSCALE", "0"}, {"TOTK_MFX_OUTPUT", "0"},
+        {"TOTK_PERIODIC_PHASE", "1"},
         {"TOTK_GPU_ALLOW_SUBMIT", "1"}, {"TOTK_GPU_WIDEN", "1"},
         {"TOTK_GPU_BLOCKRT", "1"}, {"TOTK_GPU_MIDCLEAR", "1"},
         // Keep vertex work overlapped across independent render passes. The
@@ -91,7 +104,7 @@ void native_policy_init(void) {
         "DM_NVN_HILITE", "DM_NVN_SKIP_FS", "DM_NVN_SKIP_SMALL", "DM_NVN_NOFXAA",
     };
     for (unsigned i = 0; i < sizeof image_overrides / sizeof *image_overrides; ++i) unsetenv(image_overrides[i]);
-    fprintf(stderr, "[totk] native profile: scene/output 3840x2160, target 144 rendered fps, no scaling or interpolation\n");
+    fprintf(stderr, "[totk] native profile: scene/output 3840x2160, 144 Hz retained phase presentation, no scaling or MetalFX interpolation\n");
 }
 
 int native_host_check(void) {
@@ -133,10 +146,25 @@ NativeFrame native_frame_capture(uint64_t frame, unsigned w, unsigned h, unsigne
     uint64_t generation = periodic_anchor_generation(frame);
     NativeFrame result = {.frame=frame, .anchor_id=frame, .state_generation=generation ? generation : frame + 1,
                           .phase=1.0, .kind=NATIVE_FRAME_ANCHOR};
-    if (frame != UINT64_MAX && atomic_load_explicit(&scene_frames[frame % 64], memory_order_relaxed) == frame + 1) {
+    if (anchor_scene_seen(frame)) {
         result.scene_width=3840; result.scene_height=2160;
     }
     result.output_width=w; result.output_height=h;
     result.drawable_width=dw; result.drawable_height=dh;
+    return result;
+}
+
+NativeFrame native_phase_capture(uint64_t source_frame, uint64_t anchor_id, uint64_t generation,
+                                 double phase, unsigned w, unsigned h, unsigned dw, unsigned dh) {
+    NativeFrame result = {.frame=anchor_id, .anchor_id=anchor_id, .state_generation=generation,
+                          .phase=phase, .kind=NATIVE_FRAME_PHASE};
+    if (anchor_scene_seen(source_frame)) {
+        result.scene_width=3840;
+        result.scene_height=2160;
+    }
+    result.output_width=w;
+    result.output_height=h;
+    result.drawable_width=dw;
+    result.drawable_height=dh;
     return result;
 }

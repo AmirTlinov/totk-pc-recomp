@@ -61,6 +61,7 @@ static struct {
     _Atomic uint32_t schedule_pass_count;
     _Atomic uint64_t schedule_forms[PERIODIC_FORM_PASS_LIMIT];
     _Atomic uint64_t state_generation;
+    _Atomic uint64_t latest_anchor;
     struct { _Atomic uint64_t anchor, generation; } anchors[ANCHOR_SLOTS];
     _Atomic int active, stopping;
     pthread_t compiler;
@@ -406,11 +407,12 @@ void periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t stat
 }
 
 uint64_t periodic_anchor_publish(uint64_t anchor_id) {
-    if (!periodic_form_active()) return anchor_id + 1;
     uint64_t generation = atomic_fetch_add_explicit(&state.state_generation, 1, memory_order_relaxed) + 1;
     unsigned slot = (unsigned)(anchor_id % ANCHOR_SLOTS);
     atomic_store_explicit(&state.anchors[slot].generation, generation, memory_order_relaxed);
     atomic_store_explicit(&state.anchors[slot].anchor, anchor_id + 1, memory_order_release);
+    atomic_store_explicit(&state.latest_anchor, anchor_id + 1, memory_order_release);
+    if (!periodic_form_active()) return generation;
     uint64_t position;
     ObserverRecord *record = reserve_record(&position);
     if (record) {
@@ -422,12 +424,20 @@ uint64_t periodic_anchor_publish(uint64_t anchor_id) {
     return generation;
 }
 
+uint64_t periodic_phase_publish(void) {
+    return atomic_fetch_add_explicit(&state.state_generation, 1, memory_order_relaxed) + 1;
+}
+
 uint64_t periodic_anchor_sequence(void) {
     return atomic_load_explicit(&state.state_generation, memory_order_acquire);
 }
 
+uint64_t periodic_latest_anchor(void) {
+    uint64_t anchor = atomic_load_explicit(&state.latest_anchor, memory_order_acquire);
+    return anchor ? anchor - 1 : UINT64_MAX;
+}
+
 uint64_t periodic_anchor_generation(uint64_t anchor_id) {
-    if (!periodic_form_active()) return anchor_id + 1;
     unsigned slot = (unsigned)(anchor_id % ANCHOR_SLOTS);
     if (atomic_load_explicit(&state.anchors[slot].anchor, memory_order_acquire) != anchor_id + 1) return 0;
     return atomic_load_explicit(&state.anchors[slot].generation, memory_order_relaxed);

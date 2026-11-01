@@ -1,6 +1,12 @@
 #include "mouse_input.h"
 #include "input_bindings.h"
 #include <math.h>
+#include <stdatomic.h>
+
+// Nanoradians keep the cross-thread representation integral and lock-free.
+// The input owner still serializes writes to NativeMouseInput itself.
+static _Atomic int64_t phase_yaw_nr, phase_pitch_nr;
+static _Atomic uint64_t phase_generation;
 
 void native_mouse_configure(NativeMouseInput *m, double sensitivity, bool invert_y) {
     m->sensitivity = isfinite(sensitivity) ? fmin(10.0, fmax(0.0, sensitivity)) : 1.0;
@@ -27,7 +33,25 @@ bool native_mouse_motion(NativeMouseInput *m, double dx, double dy, uint64_t now
     m->dx = fmax(-1000000.0, fmin(1000000.0, m->dx + dx));
     m->dy = fmax(-1000000.0, fmin(1000000.0, m->dy + dy));
     m->moved_ns = now_ns;
+    double scale = m->sensitivity * (0.08 * 3.14159265358979323846 / 180.0);
+    atomic_fetch_add_explicit(&phase_yaw_nr, (int64_t)llround(dx * scale * 1e9), memory_order_relaxed);
+    atomic_fetch_add_explicit(&phase_pitch_nr,
+                              (int64_t)llround(dy * scale * (m->invert_y ? -1 : 1) * 1e9),
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&phase_generation, 1, memory_order_release);
     return true;
+}
+
+NativeMousePhase runtime_input_mouse_phase(void) {
+    uint64_t before, after;
+    int64_t yaw, pitch;
+    do {
+        before = atomic_load_explicit(&phase_generation, memory_order_acquire);
+        yaw = atomic_load_explicit(&phase_yaw_nr, memory_order_relaxed);
+        pitch = atomic_load_explicit(&phase_pitch_nr, memory_order_relaxed);
+        after = atomic_load_explicit(&phase_generation, memory_order_acquire);
+    } while (before != after);
+    return (NativeMousePhase){yaw * 1e-9, pitch * 1e-9, after};
 }
 
 bool native_mouse_button(NativeMouseInput *m, unsigned button, bool down) {
