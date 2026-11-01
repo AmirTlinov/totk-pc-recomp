@@ -136,6 +136,7 @@ int native_run_probe(const char *name) {
 #ifdef TOTK_PROBE_BUILD
     if (!strcmp(name, "--probe-clock")) return probe_clock();
     if (!strcmp(name, "--probe-pool-cache")) return probe_pool_cache();
+    if (!strcmp(name, "--probe-nvn-cpu")) { extern void runtime_gfx_probe(int); runtime_gfx_probe(0); return 0; }
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
     if (!strcmp(name, "--probe-attachment-ledger") || !strcmp(name, "--probe-attachment-feedback")) {
         setenv("TOTK_NATIVE_4K144", "0", 1);
@@ -152,7 +153,22 @@ int native_run_probe(const char *name) {
         extern int mfx_enabled(void), mfxup_enabled(void), mfxup_output_enabled(void);
         extern void mfx_set(int), mfxup_set(int), mfxup_output_set(int);
         setenv("TOTK_NATIVE_4K144", "1", 1);
+        setenv("TOTK_FAST_MATH", "1", 1); setenv("TOTK_MIP_DROP", "1", 1);
+        setenv("TOTK_EXP_SKIP_FS", "deadbeef", 1); setenv("TOTK_GPU_SKIP_VC", "4", 1);
         native_policy_init();
+        if (strcmp(getenv("TOTK_FAST_MATH") ?: "", "0") || strcmp(getenv("TOTK_MIP_DROP") ?: "", "0") ||
+            getenv("TOTK_EXP_SKIP_FS") || getenv("TOTK_GPU_SKIP_VC")) runtime_fail("strict policy retained an image override");
+        if (strcmp(getenv("TOTK_FPS_LIMIT") ?: "", "144") ||
+            strcmp(getenv("DM_PRESENT_HZ") ?: "", "144") ||
+            strcmp(getenv("TOTK_ASYNC_REPLAY") ?: "", "1") ||
+            strcmp(getenv("TOTK_BARRIER_NARROW") ?: "", "1") ||
+            strcmp(getenv("TOTK_TBDR_ATTACH") ?: "", "1") ||
+            strcmp(getenv("DM_NVN_XV") ?: "", "0") ||
+            strcmp(getenv("TOTK_PSO_PREDICT") ?: "", "1") ||
+            strcmp(getenv("TOTK_PSO_PREDICT_CROSS_PASS") ?: "", "0") ||
+            strcmp(getenv("TOTK_PSO_PREDICT_KEYS") ?: "", "8") ||
+            strcmp(getenv("TOTK_LOAD_OVERLAY") ?: "", "0"))
+            runtime_fail("strict policy lost the 144 Hz asynchronous frame path");
         pthread_t frame_threads[2];
         for (unsigned i=0; i<2; ++i)
             if (pthread_create(&frame_threads[i], NULL, probe_frame_thread, NULL)) runtime_fail("start frame policy probe");
@@ -173,7 +189,7 @@ int native_run_probe(const char *name) {
     }
     // A closed list prevents unknown names from selecting the donor's default probe.
     const char *gpu[] = {"midclear", "ds-clear", "copy-alias", "dispatch-chain", "storage-view",
-        "texture-retire", "pool-retire", "ubo-snapshot", "linear-rt", "depth-output", "srgb-view",
+        "texture-retire", "pool-retire", "ubo-snapshot", "linear-rt", "depth-output", "srgb-view", "shader-variants",
         "vertex-streams", "arg-epoch", "tex-slots", "layer-merge", "cube-merge", "compressed-alias",
         "upload-batch", "ub-rename", "drv-c0", "widen", "winding", "tile", "blockrt"};
     for (unsigned i = 0; i < sizeof gpu / sizeof *gpu; ++i) {

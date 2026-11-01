@@ -3,14 +3,16 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from macos.build import BUILD, ROOT
 
 GPU_PROBES = ('midclear', 'ds-clear', 'copy-alias', 'dispatch-chain', 'storage-view', 'texture-retire',
-              'pool-retire', 'ubo-snapshot', 'linear-rt', 'depth-output', 'srgb-view', 'vertex-streams',
+              'pool-retire', 'ubo-snapshot', 'linear-rt', 'depth-output', 'srgb-view', 'shader-variants', 'vertex-streams',
               'arg-epoch', 'tex-slots', 'layer-merge', 'cube-merge', 'compressed-alias', 'upload-batch',
               'ub-rename', 'drv-c0', 'widen', 'winding', 'blockrt')
 
@@ -28,7 +30,7 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(dir=logs, prefix='profile-') as profile:
         env = dict(os.environ, TOTK_PROFILE_DIR=profile, TOTK_NATIVE_4K144='0', TOTK_HEADLESS='1',
                    MTL_DEBUG_LAYER='1', MTL_DEBUG_LAYER_ERROR_MODE='assert')
-        for probe in ['selftest', 'probe-policy', 'probe-clock', 'probe-pool-cache', 'probe-save', 'probe-warm-pipelines', 'probe-attachment-ledger', 'probe-attachment-feedback',
+        for probe in ['selftest', 'probe-policy', 'probe-clock', 'probe-pool-cache', 'probe-nvn-cpu', 'probe-save', 'probe-warm-pipelines', 'probe-attachment-ledger', 'probe-attachment-feedback',
                       *[f'probe-gpu-{name}' for name in args.gpu]]:
             log = logs / f'{probe}.log'
             with log.open('w') as output:

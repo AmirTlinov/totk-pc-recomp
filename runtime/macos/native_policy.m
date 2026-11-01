@@ -45,12 +45,16 @@ void native_policy_init(void) {
         {"TOTK_POOL_QUERY_CACHE", "1"}, {"TOTK_USNAP_INDEX", "1"},
         {"TOTK_PKG_FINAL_CACHE", "1"}, {"TOTK_ARG_EPOCH", "1"},
         {"TOTK_TEX_SLOTS", "1"}, {"TOTK_SHADOW_INDEX", "1"},
-        {"TOTK_DRV_CACHE", "1"}, {"TOTK_ASYNC_REPLAY", "0"},
         {"TOTK_TEXTURE_PLAN", "1"}, {"TOTK_INLINE_BULK", "1"},
         {"TOTK_DIAG_ENV_ONCE", "1"}, {"TOTK_VERTEX_STREAMS", "1"},
-        // Speculative pipeline scans compile mostly unused render states.
-        // Keep the recorded startup cache and compile new states on demand.
-        {"TOTK_PSO_PREDICT", "0"},
+        // Sampling every host thread and serializing every GPU completion is a
+        // useful diagnostic overlay, not part of the production frame path.
+        {"TOTK_LOAD_OVERLAY", "0"},
+        // The remainder of the current pass has exact attachment formats. Warm
+        // its missing pipelines in parallel; never guess states of later passes.
+        {"TOTK_PSO_PREDICT", "1"}, {"TOTK_PSO_PREDICT_CROSS_PASS", "0"},
+        {"TOTK_PSO_PREDICT_SCAN", "4096"}, {"TOTK_PSO_PREDICT_KEYS", "8"},
+        {"TOTK_PSO_PREDICT_US", "500"},
     };
     for (unsigned i=0; i<sizeof defaults/sizeof *defaults; ++i)
         if (setenv(defaults[i].key, defaults[i].value, 0)) runtime_fail("set native performance defaults");
@@ -59,16 +63,28 @@ void native_policy_init(void) {
     const struct { const char *key, *value; } settings[] = {
         {"TOTK_OUTPUT_RES", "3840x2160"}, {"TOTK_RENDER_RES", "3840x2160"},
         {"DM_PRESENT_HZ", "144"}, {"DM_PRESENT_LINK", "0"},
-        {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"}, {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"},
+        {"TOTK_FPS_LIMIT", "144"}, {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"},
+        {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"}, {"TOTK_ASYNC_REPLAY", "1"},
         {"TOTK_MFX", "0"}, {"TOTK_MFX_UPSCALE", "0"}, {"TOTK_MFX_OUTPUT", "0"},
         {"TOTK_GPU_ALLOW_SUBMIT", "1"}, {"TOTK_GPU_WIDEN", "1"},
         {"TOTK_GPU_BLOCKRT", "1"}, {"TOTK_GPU_MIDCLEAR", "1"},
+        // Keep vertex work overlapped across independent render passes. The
+        // renderer promotes texture, attachment and unknown-write hazards.
+        {"TOTK_BARRIER_NARROW", "1"},
+        {"TOTK_TBDR_ATTACH", "1"}, {"DM_NVN_XV", "0"},
         {"TOTK_GPU_NOCOMMIT", "0"}, {"TOTK_SKIP_INVISIBLE", "0"}, {"TOTK_EXP_SKIP_INVISIBLE", "0"},
-        {"TOTK_SKIP_STORERS", "0"}, {"DM_FPS", "60"},
+        {"TOTK_SKIP_STORERS", "0"}, {"TOTK_FAST_MATH", "0"}, {"TOTK_MIP_DROP", "0"}, {"DM_FPS", "60"},
     };
     for (unsigned i = 0; i < sizeof settings / sizeof *settings; ++i)
         if (setenv(settings[i].key, settings[i].value, 1)) runtime_fail("set native render policy");
     unsetenv("TOTK_PRESENT_SKIP");
+    const char *image_overrides[] = {
+        "TOTK_EXP_SKIP_FS", "TOTK_GPU_SKIP_VC", "TOTK_EXP_NOLOAD", "TOTK_EXP_NOSTORE",
+        "TOTK_GPU_HILITE1", "TOTK_GPU_HILITE_VS", "TOTK_GPU_HILITE_NOBLEND",
+        "TOTK_GPU_NODEPTH_FROM", "TOTK_GPU_NOCULL_FROM", "TOTK_GPU_WINDING_FLIP", "TOTK_GPU_NOCLAMP",
+        "DM_NVN_HILITE", "DM_NVN_SKIP_FS", "DM_NVN_SKIP_SMALL", "DM_NVN_NOFXAA",
+    };
+    for (unsigned i = 0; i < sizeof image_overrides / sizeof *image_overrides; ++i) unsetenv(image_overrides[i]);
     fprintf(stderr, "[totk] native profile: scene/output 3840x2160, target 144 rendered fps, no scaling or interpolation\n");
 }
 

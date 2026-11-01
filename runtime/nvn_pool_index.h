@@ -72,7 +72,11 @@ static inline int pidx_overlaps(const pidx *x, uintptr_t lo, uintptr_t hi) {
    must invalidate after every successful insertion/removal, including while the
    experiment is disabled. It stores indices, not retained resource pointers.
    Overlapping ranges retain pidx_find's exact selection and zero-length semantics. */
-#define PIDX_QUERY_SLOTS 256
+/* The world keeps roughly 3,200 pools alive and uses many distinct offsets
+   inside them in one frame. 256 direct-mapped entries thrashed in practice
+   (about half of 5.5 million live lookups missed). 4,096 entries cost 128 KiB
+   and keep the repeated draw bindings resident without adding hit-path probes. */
+#define PIDX_QUERY_SLOTS 4096
 typedef struct { uintptr_t address; uint64_t length, epoch; int index; } pidx_query;
 typedef struct { pidx_query queries[PIDX_QUERY_SLOTS]; uint64_t epoch, hits, misses; } pidx_query_cache;
 static inline void pidx_query_invalidate(pidx_query_cache *cache) {

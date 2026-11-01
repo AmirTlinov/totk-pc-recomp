@@ -1,11 +1,48 @@
 """Prepare verified player data for the native runtime, entirely in ignored folders."""
 import json
+import hashlib
 import os
 import shutil
 import sys
 from pathlib import Path
 
 from macos.build import ROOT, GENERATED_MARKER, run, digest, write
+
+
+def preparation_identity(tree, version):
+    """Hash inputs that can change generated game data, excluding the runtime."""
+    tree = Path(tree).resolve()
+    scripts = (
+        'prepare_modules.py', 'verify_rewrites.py', 'prepare_runtime.py',
+        'prepare_romfs_backend.py', 'make_romfs_patches.py',
+        'make_output_res_overlay.py', 'prepare_shared_fonts.py',
+    )
+    roots = [
+        ROOT / 'recomp',
+        ROOT / 'tools/build_xlate.py',
+        ROOT / 'tools/data' / f'expected-v{"1.4.3" if version == "v143" else "1.2.1"}.json',
+        ROOT / 'tools/macos/prepare.py',
+        ROOT / 'tools/macos/prompts.py',
+        *[tree / 'scripts' / name for name in scripts],
+        tree / 'third_party/d2r',
+    ]
+    files = []
+    for root in roots:
+        if root.is_file():
+            files.append(root)
+        elif root.is_dir():
+            files.extend(p for p in root.rglob('*') if p.is_file() and
+                         '__pycache__' not in p.parts and p.suffix not in ('.pyc', '.o'))
+    identity = hashlib.sha256(f'macos-game-preparation-v1\0{version}\0'.encode())
+    for path in sorted(files):
+        try:
+            name = path.relative_to(ROOT)
+        except ValueError:
+            name = path.relative_to(tree)
+        identity.update(str(name).encode())
+        identity.update(b'\0')
+        identity.update(bytes.fromhex(digest(path)))
+    return identity.hexdigest()
 
 
 def llvm_bin():
@@ -108,10 +145,8 @@ def prepare_game(tree, out, version, jobs, extracted):
              if p.is_file() and p.name != 'provenance.json'}
     write(generated / version / 'provenance.json', json.dumps(
         {'generated_from': GENERATED_MARKER, 'version': version, 'files': files}, indent=2) + '\n')
-    from macos.shaders import prepare_shaders
-    prepare_shaders(tree, version, jobs)
     write(out / 'preparation.json', json.dumps({'generated_from': GENERATED_MARKER, 'version': version,
-          'source_id': (tree.parent.parent / '.source-id').read_text(),
+          'preparation_id': preparation_identity(tree, version),
           'layout_sha256': digest(ROOT / 'recomp/layout.py'),
           'headers': {name: digest(out / name) for name in
                       ('runtime_tables.h','romfs_config.h','shared_fonts_config.h','native_layout.h','native_prompt_textures.h')}}, indent=2) + '\n')

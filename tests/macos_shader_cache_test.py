@@ -8,7 +8,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from macos.build import BUILD
-from macos.shaders import metal_compiler_identity, metal_version
+from macos.shaders import metal_compiler_identity, metal_version, shader_translation_list_digest
 
 
 def check_compiler_identity():
@@ -34,8 +34,21 @@ def check_compiler_identity():
     print('{"probe":"metal-compiler-identity","status":"pass","checks":5}')
 
 
+def check_translation_list_identity():
+    with tempfile.TemporaryDirectory(dir=BUILD, prefix='shader-list-test-') as tmp:
+        shader_list = Path(tmp) / 'shader_list.tsv'
+        shader_list.write_text('# header\nV\ta\t{}\nL\tb\tmodule:main\t1\t2\t3\nR\tdeadbeef\tm\n')
+        original = shader_translation_list_digest(shader_list)
+        shader_list.write_text('# changed comment\nV\ta\t{}\nL\tb\tmodule:main\t1\t2\t3\nR\tfeedface\tt\n')
+        assert shader_translation_list_digest(shader_list) == original, 'warm rows invalidated shader translation'
+        shader_list.write_text('# changed comment\nV\ta\t{"tex":{}}\nL\tb\tmodule:main\t1\t2\t3\nR\tfeedface\tt\n')
+        assert shader_translation_list_digest(shader_list) != original, 'variant change reused shader translation'
+        print('{"probe":"shader-list-translation-identity","status":"pass","checks":2}')
+
+
 def main():
     check_compiler_identity()
+    check_translation_list_identity()
     with tempfile.TemporaryDirectory(dir=BUILD, prefix='shader-cache-test-') as tmp:
         work = Path(tmp)
         source = work / 'cache.m'

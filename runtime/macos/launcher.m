@@ -52,6 +52,19 @@ int main(int argc, char **argv) {
         NSString *support = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/TotKRecomp"];
         NSString *profile = [support stringByAppendingPathComponent:version];
         NSString *logs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/TotKRecomp"];
+        NSString *dataRoot = [bundle.bundlePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"TotK Recomp Data"];
+        NSString *romfs = [[dataRoot stringByAppendingPathComponent:@"extracted"]
+            stringByAppendingPathComponent:[version stringByAppendingPathComponent:@"romfs"]];
+        if (![NSFileManager.defaultManager fileExistsAtPath:[romfs stringByAppendingPathComponent:@"runtime-index.bin"]])
+            romfs = [[root stringByAppendingPathComponent:@"extracted"]
+                stringByAppendingPathComponent:[version stringByAppendingPathComponent:@"romfs"]];
+        NSString *shaderData = [[dataRoot stringByAppendingPathComponent:@"shaders"] stringByAppendingPathComponent:version];
+        NSString *shaderSeed = [shaderData stringByAppendingPathComponent:@"seed"];
+        NSString *shaderLibraries = [shaderData stringByAppendingPathComponent:@"libraries"];
+        if (![NSFileManager.defaultManager fileExistsAtPath:[shaderSeed stringByAppendingPathComponent:@"seed-manifest.json"]]) {
+            shaderSeed = [root stringByAppendingPathComponent:@"build/shader-seed"];
+            shaderLibraries = [root stringByAppendingPathComponent:@"build/shader-libs"];
+        }
         NSString *cache = native_shader_cache_path(root, [[NSHomeDirectory()
             stringByAppendingPathComponent:@"Library/Caches/TotKRecomp"] stringByAppendingPathComponent:version]);
         if (!cache) return error(@"Cannot identify the shader translator or macOS graphics cache.");
@@ -66,7 +79,9 @@ int main(int argc, char **argv) {
         const struct { const char *name; NSString *value; } settings[] = {
             {"TOTK_RESOURCE_ROOT", root}, {"DM_MSL_DIR", cache},
             {"TOTK_PROFILE_DIR", profile}, {"TOTK_SHADER_CACHE", cache}, {"TOTK_GAME_SLOT_DIR", slot},
-            {"TOTK_ROMFS_PROOF_DIR", profile}, {"TOTK_SHARED_FONTS", @"extracted/firmware/shared-fonts"},
+            {"TOTK_ROMFS", romfs}, {"TOTK_ROMFS_PROOF_DIR", profile},
+            {"TOTK_SHADER_SEED_DIR", shaderSeed}, {"TOTK_SHADER_LIB_DIR", shaderLibraries},
+            {"TOTK_SHARED_FONTS", @"extracted/firmware/shared-fonts"},
             {"TOTK_SHADER_CONTRIB", [cache stringByAppendingPathComponent:@"shader-list-contribution.txt"]},
             {"TOTK_CONTROLS", [support stringByAppendingPathComponent:@"controls.txt"]},
         };

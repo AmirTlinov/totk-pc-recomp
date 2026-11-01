@@ -15,7 +15,8 @@ from macos.build import BUILD, ROOT, digest, run, stage_sources, write, library_
 from macos.prepare import link
 
 SPIRV_PIN = '98cbb7c02be35364ecacc23dc0c038d2360b0ed0'
-METAL_FLAGS = ('-std=metal3.2', '-fmetal-math-mode=safe')
+SERVICE_BUILD_SCHEMA = 'totk-xlate-nativeaot-macos26-v1'
+METAL_FLAGS = ('-std=metal3.2', '-fmetal-math-mode=safe', '-Werror=sometimes-uninitialized')
 SPIRV_SOURCES = ('main.cpp spirv_cfg.cpp spirv_cpp.cpp spirv_cross.cpp spirv_cross_parsed_ir.cpp '
                  'spirv_cross_util.cpp spirv_glsl.cpp spirv_hlsl.cpp spirv_msl.cpp spirv_parser.cpp spirv_reflect.cpp').split()
 
@@ -34,13 +35,52 @@ def metal_compiler_identity():
     return hashlib.sha256(json.dumps([METAL_FLAGS, metal_version()]).encode()).hexdigest()
 
 
+def shader_translation_list_digest(path):
+    """Hash only shader variants and locators, which are the translation inputs."""
+    rows = []
+    for line in Path(path).read_bytes().splitlines():
+        if line.startswith((b'V\t', b'L\t')):
+            rows.append(line)
+    return hashlib.sha256(b'\n'.join(rows)).hexdigest()
+
+
+def shader_preparation_identity(tree, version, service, cross):
+    """Hash shader-only inputs without coupling them to the game lifter."""
+    tree = Path(tree).resolve()
+    roots = [
+        tree / 'assets/shader_list.tsv',
+        tree / 'scripts/prepare_shader_seed.py',
+        tree / 'scripts/shader_list.py',
+        tree / 'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h',
+        tree / f'rewritten/{version}/provenance.json',
+        tree / f'extracted/{version}/romfs/index.json',
+        service,
+        cross,
+    ]
+    identity = hashlib.sha256(f'macos-shader-preparation-v2\0{version}\0'.encode())
+    for path in roots:
+        if not path.is_file():
+            raise RuntimeError(f'Missing shader preparation input: {path}')
+        try:
+            name = path.relative_to(ROOT)
+        except ValueError:
+            name = path.relative_to(tree)
+        identity.update(str(name).encode())
+        identity.update(b'\0')
+        content_digest = (shader_translation_list_digest(path)
+                          if path == tree / 'assets/shader_list.tsv' else digest(path))
+        identity.update(bytes.fromhex(content_digest))
+    return identity.hexdigest()
+
+
 def build_tools(tree, jobs):
     work = BUILD / 'shader-toolchain'
     work.mkdir(parents=True, exist_ok=True)
     build_xlate.verify_vendor()
     identity = hashlib.sha256(build_xlate.identity().encode())
     source = tree / 'tools/totk_xlate'
-    for p in sorted([*source.glob('*.cs'), source / 'totk_xlate.csproj', Path(__file__)]):
+    identity.update(SERVICE_BUILD_SCHEMA.encode())
+    for p in sorted([*source.glob('*.cs'), source / 'totk_xlate.csproj']):
         identity.update(p.name.encode()); identity.update(p.read_bytes())
     identity.update(subprocess.check_output(['dotnet', '--version']))
     stamp = work / 'source.id'
@@ -112,7 +152,10 @@ def build_tools(tree, jobs):
         if any(not line.strip().startswith(('/usr/lib/', '/System/Library/')) for line in dependencies):
             raise RuntimeError(f'Native helper has an unbundled dependency: {executable}')
     metal = metal_version()
-    cache_id = hashlib.sha256((identity.hexdigest() + digest(service) + digest(binary) + metal).encode()).hexdigest()
+    # Runtime shader keys follow executable translator behaviour. Python build
+    # orchestration must not invalidate tens of thousands of shaders when the
+    # produced translator and SPIRV-Cross binaries are byte-identical.
+    cache_id = hashlib.sha256((digest(service) + digest(binary) + metal).encode()).hexdigest()
     write(service.with_suffix('.id'), cache_id + '\n')
     return service, binary
 
@@ -130,7 +173,7 @@ def compile_libraries(sources, libraries, jobs):
             run(['xcrun', 'metal', *METAL_FLAGS, '-o', compiled, source])
             compiled.replace(out)
         return 1
-    unique = {digest(source): source for source in sources}
+    unique = dict(sources)
     with ThreadPoolExecutor(jobs) as pool:
         return sum(pool.map(compile_shader, unique.items()))
 
@@ -142,20 +185,40 @@ def prepare_shaders(tree, version, jobs):
     seeds.mkdir(exist_ok=True)
     link(tree / 'build/shader-seed', seeds)
     seed = tree / f'build/shader-seed/{version}'
-    run([sys.executable, tree / 'scripts/prepare_shader_seed.py', '--romfs', tree / f'extracted/{version}/romfs',
-         '--output', seed, '--translator', service, '--spirv-cross', cross, '--version', version,
-         '--modules', tree / f'rewritten/{version}'], cwd=tree,
-        env=dict(os.environ, TOTK_SHADER_DEBUGMODE='1'))
-    run([sys.executable, tree / 'scripts/shader_list.py', 'export', tree / 'assets/shader_list.tsv',
-         tree / 'build/pso_manifest.tsv', tree / 'build/pso_title.tsv'], cwd=tree)
+    preparation_id = shader_preparation_identity(tree, version, service, cross)
+    stamp = seed / 'preparation.id'
+    current = stamp.is_file() and stamp.read_text().strip() == preparation_id
+    if not current:
+        run([sys.executable, tree / 'scripts/prepare_shader_seed.py', '--romfs', tree / f'extracted/{version}/romfs',
+             '--output', seed, '--translator', service, '--spirv-cross', cross, '--version', version,
+             '--modules', tree / f'rewritten/{version}'], cwd=tree,
+            env=dict(os.environ, TOTK_SHADER_DEBUGMODE='1'))
+    warm_id = digest(tree / 'assets/shader_list.tsv')
+    warm_stamp = tree / 'build/pso_manifest.id'
+    if (not warm_stamp.is_file() or warm_stamp.read_text().strip() != warm_id or
+            not (tree / 'build/pso_manifest.tsv').is_file() or not (tree / 'build/pso_title.tsv').is_file()):
+        run([sys.executable, tree / 'scripts/shader_list.py', 'export', tree / 'assets/shader_list.tsv',
+             tree / 'build/pso_manifest.tsv', tree / 'build/pso_title.tsv'], cwd=tree)
+        write(warm_stamp, warm_id + '\n')
+    manifest_path = seed / 'seed-manifest.json'
+    if not manifest_path.is_file():
+        raise RuntimeError('Shader preparation did not produce a manifest')
+    manifest = json.loads(manifest_path.read_text())
+    if (manifest.get('version') != version or manifest.get('shaders', 0) < 8000 or
+            manifest.get('chain') not in (tree / 'third_party/d2r_gfx/gfx/nvn/dmsh_chain.h').read_text()):
+        raise RuntimeError('Prepared shader seed has the wrong identity')
     # Entries already include the full MSL hash. A translator change that emits
     # identical MSL must not recompile it; only compiler options/version matter.
     compiler_id = metal_compiler_identity()
     libraries = BUILD / 'shader-libs' / compiler_id
     libraries.mkdir(parents=True, exist_ok=True)
     link(tree / 'build/shader-libs', libraries)
-    compile_libraries(sorted(seed.glob('*.metal')), libraries, jobs)
+    sources = [(sha, seed / name) for name, sha in manifest['files'].items() if name.endswith('.metal')]
+    if any(not source.is_file() for _, source in sources):
+        raise RuntimeError('Prepared shader seed is incomplete')
+    compile_libraries(sources, libraries, jobs)
     write(seed / 'translator.id', service.with_suffix('.id').read_text())
+    write(stamp, preparation_id + '\n')
 
 
 def main():

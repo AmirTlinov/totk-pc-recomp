@@ -100,6 +100,27 @@ def preserve_source_times(tree, previous):
             os.utime(new, None)
 
 
+def preserve_generated_source_outputs(tree, previous):
+    """Carry ignored links and prepared manifests across a source restage."""
+    if not previous.is_dir():
+        return
+    for old in previous.rglob('*'):
+        if not old.is_symlink():
+            continue
+        relative = old.relative_to(previous)
+        new = tree / relative
+        new.parent.mkdir(parents=True, exist_ok=True)
+        if new.exists() or new.is_symlink():
+            continue
+        new.symlink_to(os.readlink(old), target_is_directory=old.resolve().is_dir())
+    for relative in ('games/totk/build/pso_manifest.tsv', 'games/totk/build/pso_title.tsv'):
+        old = previous / relative
+        new = tree / relative
+        if old.is_file() and not new.exists():
+            new.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(old, new)
+
+
 def _stage_sources():
     """Export committed inputs, ignoring local modifications in the reference checkout."""
     pin = mng_pin()
@@ -130,6 +151,7 @@ def _stage_sources():
         # git archive gives unmodified sources stable mtimes; patched files need
         # this byte comparison because git apply otherwise touches all of them.
         preserve_source_times(tree, source)
+        preserve_generated_source_outputs(tree, source)
         write(tree / '.source-id', identity.hexdigest())
         if source.exists():
             shutil.rmtree(source)
@@ -186,17 +208,21 @@ def compile_runtime(tree, out, version, jobs, probes):
     if probes:
         probe_headers(out)
     else:
+        from macos.prepare import preparation_identity
         proof = out / 'preparation.json'
         if not proof.is_file():
             raise RuntimeError('Verified game tables are missing; run with --prepare-game first')
         prepared = json.loads(proof.read_text())
         required = {'runtime_tables.h','romfs_config.h','shared_fonts_config.h','native_layout.h','native_prompt_textures.h'}
-        if (prepared.get('version') != version or
-            prepared.get('source_id') != (tree.parent.parent / '.source-id').read_text() or
-            prepared.get('layout_sha256') != digest(ROOT / 'recomp/layout.py') or
-            set(prepared.get('headers', {})) != required or
-            any(not (out / name).is_file() or digest(out / name) != sha for name, sha in prepared['headers'].items())):
-            raise RuntimeError('Native preparation is stale or changed; run --prepare-game again')
+        problems = []
+        if prepared.get('version') != version: problems.append('game version')
+        if prepared.get('preparation_id') != preparation_identity(tree, version): problems.append('game preparation inputs')
+        if prepared.get('layout_sha256') != digest(ROOT / 'recomp/layout.py'): problems.append('module layout')
+        if set(prepared.get('headers', {})) != required: problems.append('generated header set')
+        elif any(not (out / name).is_file() or digest(out / name) != sha
+                 for name, sha in prepared['headers'].items()): problems.append('generated header contents')
+        if problems:
+            raise RuntimeError('Native preparation is stale (' + ', '.join(problems) + '); run --prepare-game again')
     includes = [tree / 'runtime', tree / 'third_party/d2r_gfx/gfx/nvn/include', tree / 'third_party/d2r_gfx/gfx/nvn', out, INTEGRATION]
     libs = []
     for name, inc in [('opus', 'include/opus'), ('libvpx', 'include')]:
@@ -300,6 +326,9 @@ def main(argv=None):
     if args.prepare_game:
         from macos.prepare import prepare_game
         prepare_game(tree, out, args.version, args.jobs, extracted)
+    if not args.probes:
+        from macos.shaders import prepare_shaders
+        prepare_shaders(tree, args.version, args.jobs)
     binary = compile_runtime(tree, out, args.version, args.jobs, args.probes)
     if args.package:
         from macos.package import package
