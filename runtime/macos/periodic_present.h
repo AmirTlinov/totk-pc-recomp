@@ -41,6 +41,9 @@ uint64_t periodic_present_capture_anchor(id<MTL4CommandBuffer> command_buffer,
                                          id<MTLTexture> source, uint64_t frame,
                                          double presentation_time, NativeMousePhase input,
                                          MTLPixelFormat output_format);
+// Publish snapshots only after their command buffer has been committed. Passing
+// committed=0 releases snapshots encoded into a discarded command buffer.
+void periodic_present_finish_submission(id<MTL4CommandBuffer> command_buffer, int committed);
 int periodic_present_phase_due(double presentation_time, NativeMousePhase input);
 id<MTLTexture> periodic_present_encode_phase(id<MTL4CommandBuffer> command_buffer,
                                              unsigned slot, id<MTLTexture> destination,

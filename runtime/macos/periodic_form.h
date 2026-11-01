@@ -55,18 +55,40 @@ typedef struct {
 void periodic_form_init(void);
 void periodic_form_finish(void);
 int periodic_form_active(void);
-void periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t static_mask,
-                             uint8_t dynamic_mask, uint8_t resource_mask, uint8_t flags,
-                             const PeriodicResourceRef resources[8], uint64_t pass_id);
+// Returns a monotonic observation ticket, or zero when the bounded tape could
+// not accept the packet. The owner compiler uses the closing packet ticket to
+// wait for this exact structural occurrence instead of racing a recent-pass
+// lookup.
+uint64_t periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t static_mask,
+                                 uint8_t dynamic_mask, uint8_t resource_mask, uint8_t flags,
+                                 const PeriodicResourceRef resources[8], uint64_t pass_id);
 
 // Closed forms are related to the concrete pass occurrence after compilation.
 // The map is a bounded recent-history table for anchor-plan compilation.
 int periodic_form_for_pass(uint64_t pass_id, uint64_t *form_id, uint64_t *anchor_id);
-// The latest complete anchor publishes forms in render-pass order. The encode
-// worker uses the previous complete schedule; an in-progress anchor is never
-// visible through this query.
+// Structural templates are learned from command packets but are not executable
+// until the resource owner compiler certifies an exact causal return.
+int periodic_form_template_for_pass(uint64_t pass_id, uint64_t *form_id);
+// Cold compiler-side join from an exact closing observation to its structural
+// form. This may wait for the form compiler; it is never called by replay.
+int periodic_form_for_observation(uint64_t observation, uint64_t *form_id);
+// Nonblocking compiler-side lookup: -1 means the form compiler has not reached
+// the ticket, 0 means the occurrence was invalid, and 1 returns its form.
+int periodic_form_observation_status(uint64_t observation, uint64_t *form_id);
+int periodic_form_certify(uint64_t form_id);
+// The latest complete anchor atomically publishes already certified forms in
+// render-pass order. It neither closes nor advances a form.
 int periodic_form_expected(uint32_t pass_index, uint64_t *form_id, uint64_t *anchor_id);
 int periodic_form_snapshot(uint64_t form_id, PeriodicFormSnapshot *snapshot);
+// Exact structural validation for a buffered occurrence. Dynamic values and
+// resource identities are certified by the owner entry; this compares the
+// normalized command skeleton and its resource roles.
+int periodic_form_command_matches(uint64_t form_id, size_t command_index,
+                                  uint32_t op, const uint64_t fields[8],
+                                  uint8_t static_mask, uint8_t dynamic_mask,
+                                  uint8_t resource_mask, uint8_t flags,
+                                  const PeriodicResourceRef resources[8]);
+int periodic_form_command_count_matches(uint64_t form_id, size_t command_count);
 void periodic_form_set_closed_callback(PeriodicFormClosedFn callback);
 
 // An anchor is a guest-rendered state. A phase renderer may publish additional

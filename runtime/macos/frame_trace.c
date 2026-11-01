@@ -2,6 +2,8 @@
 // to the writer; a full queue fails the capture instead of losing evidence.
 #include "native_policy.h"
 #include "periodic_executor.h"
+#include "periodic_form.h"
+#include "periodic_store.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -80,6 +82,27 @@ void native_trace_finish(void) {
 
 _Noreturn void native_exit(int status) {
     native_trace_finish();
+    PeriodicFormStats forms = {0};
+    PeriodicStoreStats owners = {0};
+    if (periodic_form_active()) forms = periodic_form_stats();
+    if (periodic_store_active()) owners = periodic_store_stats();
+    fprintf(stderr, "[totk] periodic forms: %llu packets, %llu learned, %llu owner-closed, %llu mapped, %llu invalidated, %llu dropped\n",
+            (unsigned long long)forms.observed_packets,
+            (unsigned long long)forms.learned_forms,
+            (unsigned long long)forms.closed_forms,
+            (unsigned long long)forms.mapped_passes,
+            (unsigned long long)forms.invalidated_forms,
+            (unsigned long long)forms.dropped_records);
+    fprintf(stderr, "[totk] periodic owners: %llu returns, %llu ready certificates, %llu published, %llu unknown passes, %llu ring drops, %llu submission overflow, %llu deferred drops, %llu transition overflow, %llu transition replacements\n",
+            (unsigned long long)owners.owner_returns,
+            (unsigned long long)owners.owner_certificates,
+            (unsigned long long)owners.published_certificates,
+            (unsigned long long)owners.unknown_passes,
+            (unsigned long long)owners.ring_drops,
+            (unsigned long long)owners.submission_overflow,
+            (unsigned long long)owners.deferred_owner_drops,
+            (unsigned long long)owners.transition_overflow,
+            (unsigned long long)owners.transition_replacements);
     periodic_executor_report();
     _exit(status);
 }

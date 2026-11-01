@@ -582,7 +582,7 @@ int periodic_executor_probe(void) {
     const float bias_values[3] = {0.0f, 0.0f, 0.0f};
     memcpy(bias, bias_values, sizeof bias_values);
     const uint64_t end[8] = {0};
-    for (uint64_t anchor = 0; anchor < 3; ++anchor) {
+    for (uint64_t anchor = 0; anchor < 2; ++anchor) {
         periodic_observe_packet(PERIODIC_METAL_BEGIN, begin, 0x30, 0, 0x0f,
             PERIODIC_PACKET_PASS_BEGIN | PERIODIC_PACKET_ICB_BREAK, NULL, 8000 + anchor);
         periodic_observe_packet(PERIODIC_METAL_PSO, object_shape, 0, 0, 0x01,
@@ -606,6 +606,12 @@ int periodic_executor_probe(void) {
         periodic_observe_packet(PERIODIC_METAL_END, end, 0x03, 0, 0,
             PERIODIC_PACKET_PASS_END | PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         periodic_anchor_publish(anchor);
+        periodic_form_flush();
+        if (!anchor) {
+            uint64_t template_id = 0;
+            if (!periodic_form_template_for_pass(8000, &template_id) || template_id != 1 ||
+                !periodic_form_certify(template_id)) return 1;
+        }
     }
     periodic_form_flush(); periodic_compiler_flush();
     uint64_t form_id = 0;

@@ -7,8 +7,8 @@
 enum {
     PERIODIC_RESOURCE_READ = 1u << 0,
     PERIODIC_RESOURCE_WRITE = 1u << 1,
-    PERIODIC_EXECUTION_WORDS = 8,
-    PERIODIC_EXECUTION_PASSES = 512,
+    PERIODIC_EXECUTION_WORDS = 32,
+    PERIODIC_EXECUTION_PASSES = 2048,
 };
 
 typedef struct {
@@ -25,6 +25,8 @@ typedef struct {
     uint64_t observed_passes;
     uint64_t observed_submissions;
     uint64_t dropped_passes;
+    uint64_t ring_drops;
+    uint64_t submission_overflow;
     uint64_t unknown_passes;
     uint64_t same_shape_submissions;
     uint64_t changed_resources;
@@ -32,10 +34,21 @@ typedef struct {
     uint64_t promoted_guest_ranges;
     uint64_t rejected_guest_ranges;
     uint64_t graph_generation;
+    uint64_t owner_returns;
+    uint64_t owner_certificates;
+    uint64_t published_certificates;
+    uint64_t deferred_owner_drops;
+    uint64_t transition_overflow;
+    uint64_t transition_replacements;
     uint32_t pass_count;
     uint32_t resource_count;
     uint32_t graph_valid;
 } PeriodicStoreStats;
+
+typedef struct {
+    uint64_t certificate_id;
+    uint64_t form_id;
+} PeriodicPassDecision;
 
 typedef struct {
     uint64_t graph_generation;
@@ -66,8 +79,19 @@ void periodic_store_pass_begin(uint64_t pass_id);
 void periodic_store_resource(PeriodicResourceKey key, uint64_t generation,
                              uint32_t role, uint8_t access);
 void periodic_store_unknown(void);
-void periodic_store_pass_end(void);
+// A streamed pass provides a normalized signature of its dynamic command
+// state before closing. Passes without it cannot own a continuation.
+void periodic_store_pass_signature(uint64_t signature, uint64_t form_observation);
+PeriodicPassDecision periodic_store_pass_end(void);
+// Complete the pass after the renderer has either replayed it or consumed its
+// retained certificate. This records exact stable result versions before
+// publishing the owner observation to the compiler. A retained pass keeps the
+// versions named by the certificate.
+void periodic_store_pass_complete(int retained);
 void periodic_store_submit(uint64_t submission_id);
+// Anchor publication only exposes certificates already closed by the owner
+// compiler. It performs no comparison, closure or phase advancement.
+void periodic_store_publish_certificates(uint64_t anchor_id);
 
 // The renderer registers its guest dirty-page tracker once. Promotion and
 // protection happen on the compiler thread. The replay thread only performs a

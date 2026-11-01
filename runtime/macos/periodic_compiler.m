@@ -301,7 +301,7 @@ int periodic_compiler_probe(void) {
     if (!periodic_compiler_active()) return 1;
     const uint64_t begin[8] = {1}, pso[8] = {2}, address[8] = {0, 3, 4};
     const uint64_t draw[8] = {3, 0, 12}, boundary[8] = {0}, end[8] = {0};
-    for (uint64_t anchor = 0; anchor < 3; ++anchor) {
+    for (uint64_t anchor = 0; anchor < 2; ++anchor) {
         periodic_observe_packet(100, begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN | PERIODIC_PACKET_ICB_BREAK, NULL, 7000 + anchor);
         periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
@@ -314,6 +314,12 @@ int periodic_compiler_probe(void) {
         periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(105, end, 1, 0, 0, PERIODIC_PACKET_PASS_END | PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         periodic_anchor_publish(anchor);
+        periodic_form_flush();
+        if (!anchor) {
+            uint64_t template_id = 0;
+            if (!periodic_form_template_for_pass(7000, &template_id) || template_id != 1 ||
+                !periodic_form_certify(template_id)) return 1;
+        }
     }
     periodic_form_flush(); periodic_compiler_flush();
     const PeriodicCompiledForm *program = periodic_compiler_form(1);

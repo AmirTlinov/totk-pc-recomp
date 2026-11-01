@@ -23,6 +23,7 @@ extern void runtime_swkbd_probe(void);
 extern void mtl_probe_warm_pipelines(void);
 extern void mtl_probe_attachment_ledger(void);
 extern void mtl_probe_attachment_feedback(void);
+extern int mtl_probe_owner_skip(void);
 extern uint64_t runtime_now_ns(void);
 
 static void *probe_frame_thread(void *unused) {
@@ -147,6 +148,13 @@ int native_run_probe(const char *name) {
     if (!strcmp(name, "--probe-periodic-executor")) return periodic_executor_probe();
     if (!strcmp(name, "--probe-periodic-present")) return periodic_present_probe();
     if (!strcmp(name, "--probe-periodic-store")) return periodic_store_probe();
+    if (!strcmp(name, "--probe-owner-skip")) {
+        setenv("TOTK_NATIVE_4K144", "0", 1); setenv("TOTK_HEADLESS", "1", 1);
+        native_policy_init();
+        if (mtl_probe_owner_skip() != 1) runtime_fail("owner skip probe");
+        puts("{\"probe\":\"owner-skip\",\"status\":\"pass\",\"metal_render_passes\":0,\"argument_continuation\":true}");
+        return 0;
+    }
     if (!strcmp(name, "--probe-nvn-cpu")) { extern void runtime_gfx_probe(int); runtime_gfx_probe(0); return 0; }
     if (!strcmp(name, "--probe-warm-pipelines")) { mtl_probe_warm_pipelines(); return 0; }
     if (!strcmp(name, "--probe-attachment-ledger") || !strcmp(name, "--probe-attachment-feedback")) {
