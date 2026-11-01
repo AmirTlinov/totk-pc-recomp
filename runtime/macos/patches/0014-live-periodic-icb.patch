@@ -1,5 +1,5 @@
 diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
-index bdcba63..19cbffc 100644
+index bdcba63..790c6da 100644
 --- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
 +++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
 @@ -1,4 +1,5 @@
@@ -8,15 +8,24 @@ index bdcba63..19cbffc 100644
  #include "periodic_store.h"
  #include "prompt_textures.h"
  #include "input_prompts.h"
-@@ -227,6 +228,7 @@ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+@@ -227,6 +228,8 @@ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
  
  static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // 驻留集专用锁：res_add 会在持 g_mu 的路径里调用（arena_new），不能共用 g_mu | Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
  static NSHashTable *g_res_objects;
 +static _Atomic uint64_t g_periodic_buffer_generation = 1;
++static _Atomic uint64_t g_periodic_lifetime_generation = 1;
  /* TOTK residency accounting by registration site. The four macOS kernel panics (IOGPUFamily, after kIOReturnNoMemory)
     all show ~15 GB of wired memory on the 16 GB machine with totk-native on the Metal submission queue: the driver ran out
     of memory wiring what this residency set made resident. Live resident bytes are attributed to the res_add source line
-@@ -242,7 +244,7 @@ - (void)dealloc { atomic_fetch_sub(&g_res_site[site].alive, 1); atomic_fetch_sub
+@@ -235,14 +238,14 @@ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+ static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, alive_bytes; } g_res_site[RES_SITES];   // alive*: objects not yet deallocated (whether or not still resident)
+ /* Deallocation probe: an associated object whose dealloc runs when the Metal object itself is freed, so "removed from the
+    residency set but still alive" (retained elsewhere) can be told apart from "freed". */
+-@interface NvAllocTrack : NSObject { @public int site; uint64_t bytes; } @end
++@interface NvAllocTrack : NSObject { @public int site; uint64_t bytes; PeriodicBufferLifetime lifetime; } @end
+ @implementation NvAllocTrack
+ - (void)dealloc { atomic_fetch_sub(&g_res_site[site].alive, 1); atomic_fetch_sub(&g_res_site[site].alive_bytes, bytes); }   // runs while g_res_mu may be held (the residency set can hold the last reference): no lock here
+ @end
  static char g_alloc_track_key;
  static NSMapTable *g_res_site_of;   // resource (weak key) -> NSNumber source line
  static uint64_t g_res_live_bytes;
@@ -25,33 +34,48 @@ index bdcba63..19cbffc 100644
      if (!r) return;
      if (site < 0 || site >= RES_SITES) site = 0;
      pthread_mutex_lock(&g_res_mu);
-@@ -256,6 +258,8 @@ static void res_add_at(id<MTLResource> r, int site) {
-             NvAllocTrack *tr = [NvAllocTrack new]; tr->site = site; tr->bytes = sz; atomic_fetch_add(&g_res_site[site].alive, 1); atomic_fetch_add(&g_res_site[site].alive_bytes, sz);
+@@ -252,10 +255,17 @@ static void res_add_at(id<MTLResource> r, int site) {
+         uint64_t sz = (uint64_t)r.allocatedSize;
+         [g_res_objects addObject:r]; [g_res_site_of setObject:@(site) forKey:r];
+         g_res_site[site].adds++; g_res_site[site].live_bytes += sz; g_res_live_bytes += sz;
+-        if (!objc_getAssociatedObject(r, &g_alloc_track_key)) {
+-            NvAllocTrack *tr = [NvAllocTrack new]; tr->site = site; tr->bytes = sz; atomic_fetch_add(&g_res_site[site].alive, 1); atomic_fetch_add(&g_res_site[site].alive_bytes, sz);
++        NvAllocTrack *tr = objc_getAssociatedObject(r, &g_alloc_track_key);
++        if (!tr) {
++            tr = [NvAllocTrack new]; tr->site = site; tr->bytes = sz; atomic_fetch_add(&g_res_site[site].alive, 1); atomic_fetch_add(&g_res_site[site].alive_bytes, sz);
              objc_setAssociatedObject(r, &g_alloc_track_key, tr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
          }
-+        if ([r respondsToSelector:@selector(gpuAddress)] && [r respondsToSelector:@selector(length)])
++        if ([r respondsToSelector:@selector(gpuAddress)] && [r respondsToSelector:@selector(length)]) {
++            atomic_store_explicit(&tr->lifetime.generation,
++                                  atomic_fetch_add_explicit(&g_periodic_lifetime_generation, 1, memory_order_relaxed) + 1,
++                                  memory_order_release);
 +            atomic_fetch_add_explicit(&g_periodic_buffer_generation, 1, memory_order_relaxed);
++        }
      }
      g_res_dirty = 1;
      pthread_mutex_unlock(&g_res_mu);
-@@ -266,6 +270,8 @@ static void res_remove_body(id<MTLResource> r) {
+@@ -266,6 +276,11 @@ static void res_remove_body(id<MTLResource> r) {
      pthread_mutex_lock(&g_res_mu);
      [g_res removeAllocation:(id<MTLAllocation>)r];
      if ([g_res_objects containsObject:r]) {
-+        if ([r respondsToSelector:@selector(gpuAddress)] && [r respondsToSelector:@selector(length)])
++        if ([r respondsToSelector:@selector(gpuAddress)] && [r respondsToSelector:@selector(length)]) {
++            NvAllocTrack *tr = objc_getAssociatedObject(r, &g_alloc_track_key);
++            if (tr) atomic_store_explicit(&tr->lifetime.generation, 0, memory_order_release);
 +            atomic_fetch_add_explicit(&g_periodic_buffer_generation, 1, memory_order_relaxed);
++        }
          int site = ((NSNumber *)[g_res_site_of objectForKey:r]).intValue; uint64_t sz = (uint64_t)r.allocatedSize;
          g_res_site[site].removes++; g_res_site[site].live_bytes -= sz < g_res_site[site].live_bytes ? sz : g_res_site[site].live_bytes;
          g_res_live_bytes -= sz < g_res_live_bytes ? sz : g_res_live_bytes;
-@@ -274,6 +280,28 @@ static void res_remove_body(id<MTLResource> r) {
+@@ -274,6 +289,33 @@ static void res_remove_body(id<MTLResource> r) {
      g_res_dirty = 1;
      pthread_mutex_unlock(&g_res_mu);
  }
 +static uint64_t periodic_buffer_generation(void) {
 +    return atomic_load_explicit(&g_periodic_buffer_generation, memory_order_relaxed);
 +}
-+static int periodic_resolve_buffer(uint64_t address, uint64_t length, void **retained, uint64_t *offset) {
-+    if (!address || !retained || !offset) return 0;
++static int periodic_resolve_buffer(uint64_t address, uint64_t length, void **retained, uint64_t *offset,
++                                   PeriodicBufferLifetime **lifetime, uint64_t *generation) {
++    if (!address || !retained || !offset || !lifetime || !generation) return 0;
 +    uint64_t end = address + length;
 +    if (end < address) return 0;
 +    int found = 0;
@@ -61,7 +85,11 @@ index bdcba63..19cbffc 100644
 +        id<MTLBuffer> buffer = candidate;
 +        uint64_t base = buffer.gpuAddress, limit = base + buffer.length;
 +        if (limit < base || address < base || end > limit) continue;
-+        *retained = (void *)CFBridgingRetain(buffer); *offset = address - base; found = 1; break;
++        NvAllocTrack *tr = objc_getAssociatedObject(buffer, &g_alloc_track_key);
++        uint64_t live = tr ? atomic_load_explicit(&tr->lifetime.generation, memory_order_acquire) : 0;
++        if (!live) continue;
++        *retained = (void *)CFBridgingRetain(buffer); *offset = address - base;
++        *lifetime = &tr->lifetime; *generation = live; found = 1; break;
 +    }
 +    pthread_mutex_unlock(&g_res_mu);
 +    return found;
@@ -72,15 +100,15 @@ index bdcba63..19cbffc 100644
  static int g_res_remove_no_pool; // GPU probe negative control only
  static void res_remove(id<MTLResource> r) {
      if (!r) return;
-@@ -614,6 +642,7 @@ void mtl_init(void) {
+@@ -614,6 +656,7 @@ void mtl_init(void) {
      g_keep = [NSMutableArray array];
      g_nvn_deswz_gpu = nvn_deswz_gpu_init(g_dev) == 0;
      dm_res_report_register(mtl_res_counts);
-+    periodic_executor_init(g_dev, periodic_buffer_generation, periodic_resolve_buffer, periodic_make_resident);
++    periodic_executor_init(g_dev, periodic_resolve_buffer, periodic_make_resident);
      if (!g_nvn_deswz_gpu) MLOG("【红】显卡解排布初始化失败，预排布贴图回退 CPU");
      MLOG("Metal 设备 %s", g_dev.name.UTF8String);
      udc_selftest();
-@@ -1280,9 +1309,11 @@ @protocol TotkPeriodicMTLResource
+@@ -1280,9 +1323,11 @@ @protocol TotkPeriodicMTLResource
  static void periodic_note_mtl_resource(id resource, uint64_t offset, uint64_t length,
                                         uint32_t kind, uint32_t role, uint8_t access) {
      if (!resource || !periodic_store_active()) return;
@@ -94,7 +122,7 @@ index bdcba63..19cbffc 100644
  }
  static inline void blit_close(void) { if (g_blit) { periodic_encoder_end(g_blit); m4_end(g_blit); g_blit = nil; } }
  #include "nvn_render_stream.h"
-@@ -3743,6 +3774,12 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+@@ -3743,6 +3788,12 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
      MLOG("[usnap-index] enabled=%d hit=%llu miss=%llu verified=%llu",usnap_index_on(),(unsigned long long)g_usnap_index_hits,(unsigned long long)g_usnap_index_misses,(unsigned long long)g_usnap_index_verified);
      MLOG("[vertex-streams] enabled=%d bound=%llu omitted=%llu",vertex_streams_on(),(unsigned long long)g_vertex_streams_bound,(unsigned long long)g_vertex_streams_omitted);
      MLOG("[render-stream] enabled=%d passes=%llu packets=%llu", rs_enabled(), (unsigned long long)g_rs_passes, (unsigned long long)g_rs_packets);

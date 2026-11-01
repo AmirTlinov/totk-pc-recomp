@@ -784,7 +784,7 @@ int periodic_store_probe(void) {
     periodic_store_submit(12); periodic_store_flush();
     if (!periodic_store_execution_plan(&plan) || plan.retained_pass_count != 1 ||
         !(plan.retained[0] & 1) || !(plan.icb[0] & 1) || plan.icb_pass_count != 1 ||
-        plan.icb_cluster_count != 2 || plan.icb_draw_count != 2 ||
+        plan.icb_cluster_count != 1 || plan.icb_draw_count != 2 ||
         plan.form_ids[0] != 1 || plan.form_anchors[0] != 2) return 1;
     enum { BENCH_NOTES = 4096, BENCH_ROUNDS = 9 };
     double samples[BENCH_ROUNDS];

@@ -1,4 +1,4 @@
-// Metal 4 executor for already closed retained draw capsules.
+// Metal 4 executor for already closed retained draw batches.
 #pragma once
 
 #include <stdint.h>
@@ -18,6 +18,7 @@ void periodic_executor_report(void);
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
+#include <stdatomic.h>
 
 enum {
     PERIODIC_METAL_PSO,
@@ -41,15 +42,20 @@ enum {
     PERIODIC_METAL_END,
 };
 
-typedef uint64_t (*PeriodicBufferGenerationFn)(void);
+typedef struct {
+    _Atomic uint64_t generation;
+} PeriodicBufferLifetime;
+
 // Returns a retained MTLBuffer in buffer. The executor releases it after the
-// indirect command has taken its reference.
+// indirect command has taken its reference. Lifetime belongs to the retained
+// buffer and stays valid until that object is released.
 typedef int (*PeriodicResolveBufferFn)(uint64_t address, uint64_t length,
-                                      void **buffer, uint64_t *offset);
+                                      void **buffer, uint64_t *offset,
+                                      PeriodicBufferLifetime **lifetime,
+                                      uint64_t *generation);
 typedef void (*PeriodicMakeResidentFn)(void *allocation);
 
 void periodic_executor_init(id<MTLDevice> device,
-                            PeriodicBufferGenerationFn buffer_generation,
                             PeriodicResolveBufferFn resolve_buffer,
                             PeriodicMakeResidentFn make_resident);
 void periodic_executor_finish(void);
