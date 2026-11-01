@@ -136,6 +136,17 @@ static void warmup_does_not_create_catchup(void) {
 }
 
 int main(void) {
+    PeriodicAnchorCadence cadence = {0};
+    unsigned ticks = 0;
+    for (unsigned i = 0; i < 48; ++i) {
+        unsigned stride = periodic_clock_anchor_stride(&cadence, 120, 48, 1);
+        CHECK(stride == (i % 2 ? 3 : 2)); ticks += stride;
+    }
+    CHECK(ticks == 120);
+    CHECK(periodic_clock_anchor_stride(&cadence, 144, 48, 1) == 3);
+    CHECK(periodic_clock_anchor_stride(&cadence, 120, 48, 3) == 3);
+    CHECK(periodic_clock_anchor_stride(&cadence, 0, 48, 0) == 1);
+    CHECK(periodic_clock_anchor_stride(&cadence, 144, 0, 2) == 2);
     independent_domains();
     long_frames_keep_time();
     suspension_and_restore();

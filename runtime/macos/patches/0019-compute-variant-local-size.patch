@@ -1,0 +1,88 @@
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -5534,7 +5534,6 @@
+ static NSDictionary *rt_answers(int st);
+ static shader_state_key stage_sig(NvShader *sh, int st);
+ static NSData *stage_sig_data(const shader_state_key *key);
+-static NSArray *rt_local(const uint8_t *control, int st);
+ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
+     prog_t *p = (prog_t *)cp;
+     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
+@@ -5559,7 +5558,7 @@
+             for (int k = 0x6c0; k < 0x880; k += 4) { uint32_t w; memcpy(&w, control + k, 4); if (w) o += snprintf(b + o, sizeof b - o, " %03x:%x", k, w); }
+             o += snprintf(b + o, sizeof b - o, " | code:"); for (int k = 0; k < 0x30; k += 4) { uint32_t w; memcpy(&w, cd + k, 4); o += snprintf(b + o, sizeof b - o, " %x", w); }
+             MLOG("[ctl st%d]%s", st, b); } }
+-        NSString *variant=totk_rt_variant(@(key),st,control,(const uint8_t *)(uintptr_t)p->sd[i].data,rt_answers(st),rt_local(control,st));
++        NSString *variant=totk_rt_variant(@(key),st,control,(const uint8_t *)(uintptr_t)p->sd[i].data,rt_answers(st));
+         if(!variant){o->missing|=1<<st;o->ctl[st]=control;o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data;o->key[st]=@(key);continue;}   // iOS: not translated yet, its draws are skipped
+         NvShader *sh=shader_get([variant stringByAppendingString:@"_b"],st);
+         if(!sh)MDIE("TOTK shader translation/reflection unavailable for %s",variant.UTF8String);
+@@ -6221,7 +6220,7 @@
+         if (pr->miss_has[st] && stage_sig_equal(&sg, &pr->miss_sig[st])) return -1;
+         NSData *lookup = stage_sig_data(&sg); NvShader *v = pr->alt[st][lookup];
+         if (!v) {
+-            NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil);
++            NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st));
+             if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; return -1; }   // iOS: this signature's variant is not translated yet
+             v = shader_get([variant stringByAppendingString:@"_b"], st);
+             if (!v) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
+@@ -6266,19 +6265,6 @@
+     if (v == 3 && (!dfull || !sfull)) return 0;
+     if (dfull && !d && fs && fs->writes_depth && pred_negative() != 27) return 0;
+     return 1;
+-}
+-// Compute thread group size lives in the control section; not located yet, so compute shaders stop with this message.
+-/* Compute thread group size: control+0x748/0x74c/0x750. Evidence (12 TOTK kernels): the triple exists only in compute
+-   control sections; every kernel with 1,1,1 reads no thread-in-group id, and every kernel that reads it carries a
+-   larger size (8x8x1 twice, 9x5x1). New sizes are logged once. */
+-static NSArray *rt_local(const uint8_t *control, int st) {
+-    if (st != 5) return nil;
+-    uint32_t l[3]; memcpy(l, control + 0x748, 12);
+-    if (!l[0] || !l[1] || !l[2] || l[0] > 1024 || l[1] > 1024 || l[2] > 64 || (uint64_t)l[0] * l[1] * l[2] > 1024)
+-        MDIE("TOTK compute shader: implausible thread group size %u x %u x %u at control+0x748", l[0], l[1], l[2]);
+-    { static uint32_t seen[64][3]; static int ns; int k = 0; for (; k < ns; k++) if (!memcmp(seen[k], l, 12)) break;
+-      if (k == ns && ns < 64) { memcpy(seen[ns++], l, 12); MLOG("[shader] compute thread group size %u x %u x %u (control+0x748)", l[0], l[1], l[2]); } }
+-    return @[@(l[0]), @(l[1]), @(l[2])];
+ }
+ static MTLVertexFormat vfmt(int f) {
+     switch (f) {
+--- a/third_party/d2r_gfx/gfx/nvn/totk_shader_rt.h
++++ b/third_party/d2r_gfx/gfx/nvn/totk_shader_rt.h
+@@ -6,7 +6,7 @@
+ NSString *totk_rt_dir(void);
+ // Returns the variant name whose <dir>/<variant>_b.{metal,json} match the answers, translating when needed.
+ // stage: NVN shader stage (0 vertex, 1 fragment, 5 compute). answers: {"tex","img","attr","fout"} dictionaries.
+-NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local);   // nil on iOS when the variant is not translated yet (request recorded)
++NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers);   // nil on iOS when the variant is not translated yet (request recorded)
+ #endif
+ #include <stdint.h>
+ /* Variants new to the translation cache this run, the variants in the cache (-1 until counted in the background) and
+--- a/third_party/d2r_gfx/gfx/nvn/totk_shader_rt.m
++++ b/third_party/d2r_gfx/gfx/nvn/totk_shader_rt.m
+@@ -197,7 +197,7 @@
+     return v;
+ #endif
+ }
+-NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
++NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers) {
+     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+     pthread_mutex_lock(&g_rt_lock);
+     NSMutableArray *vs = variants_of(shader);
+@@ -230,7 +230,16 @@
+     if (![[NSData dataWithBytes:code + skip length:c1t - skip] writeToFile:code_path atomically:YES]) die("write shader code %s", code_path.UTF8String);
+     NSMutableDictionary *rq = [NSMutableDictionary dictionaryWithDictionary:@{@"variant": variant, @"stage": stage_name, @"code": code_path, @"c1": hex(code + c1o, c1t - c1o)}];
+     [rq addEntriesFromDictionary:answers];
+-    if (local) rq[@"local"] = local;
++    // Workgroup dimensions belong to the binary, including when changed
++    // texture/image bindings require a new variant of an existing program.
++    if (stage == 5) {
++        uint32_t local[3]; memcpy(local, control + 0x748, sizeof local);
++        if (!local[0] || !local[1] || !local[2] || local[0] > 1024 || local[1] > 1024 ||
++            local[2] > 64 || (uint64_t)local[0] * local[1] * local[2] > 1024)
++            die("shader %s: invalid compute workgroup %u x %u x %u", shader.UTF8String,
++                local[0], local[1], local[2]);
++        rq[@"local"] = @[@(local[0]), @(local[1]), @(local[2])];
++    }
+     rq[@"depth_minus_w"] = totk_depth_near_minus_w() ? @YES : @NO;   // nvnDeviceSetDepthMode: NEAR_IS_MINUS_W needs the GL -> Metal clip-z conversion in every vertex shader
+     if (no_translator()) {
+     // No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.

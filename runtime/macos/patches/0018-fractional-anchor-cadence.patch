@@ -1,0 +1,12 @@
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -13716,7 +13716,8 @@
+        advances game time by exactly that interval, so presenting faster would speed the game up. */
+     const uint64_t base_step = (uint64_t)(g_dm_present_link == 2 ? 2 : 1) * (frame_ticks ? frame_ticks : 1);
+     const int display_hz = mtl_display_hz();
+-    const uint64_t step = periodic_present_anchor_ticks(display_hz > 0 ? (unsigned)display_hz : 0,
++    static PeriodicAnchorCadence cadence;
++    const uint64_t step = periodic_present_anchor_ticks(&cadence, display_hz > 0 ? (unsigned)display_hz : 0,
+                                                          (unsigned)base_step);
+     uint64_t goal = started_tick + step;
+     uint64_t tick = atomic_load_explicit(&g_link_tick_n, memory_order_acquire);

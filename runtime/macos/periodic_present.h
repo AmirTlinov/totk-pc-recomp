@@ -33,7 +33,7 @@ void periodic_present_prepare(id<MTLDevice> device, PeriodicPresentResidencyFn r
 int periodic_present_enabled(void);
 // Convert a guest frame's normal display-link stride into the configured
 // anchor stride. Display ticks left between anchors belong to retained phases.
-unsigned periodic_present_anchor_ticks(unsigned display_hz, unsigned fallback_ticks);
+unsigned periodic_present_anchor_ticks(PeriodicAnchorCadence *, unsigned display_hz, unsigned fallback_ticks);
 // Capture the canvas once, immediately before the first UI draw. The same
 // canvas remains the post-UI source; anchor capture snapshots it again and the
 // phase pass keeps only pixels changed by UI at their original coordinates.

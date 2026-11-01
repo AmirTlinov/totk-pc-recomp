@@ -66,3 +66,9 @@ int periodic_clock_phase(const PeriodicAnchorClock *anchor,
 // Rational timestamp calculation prevents drift from truncating 1e9 / Hz on
 // every tick. It neither changes simulation nor closes an owner continuation.
 uint64_t periodic_clock_tick_time(uint64_t epoch_ns, uint64_t tick, unsigned hz);
+
+// Owned by the anchor scheduler. Fractional display strides keep 48 anchors at
+// both 120 Hz (2,3 ticks) and 144 Hz (3 ticks), without changing simulation time.
+typedef struct { unsigned display_hz, anchor_hz, minimum, remainder; } PeriodicAnchorCadence;
+unsigned periodic_clock_anchor_stride(PeriodicAnchorCadence *, unsigned display_hz,
+    unsigned anchor_hz, unsigned minimum_ticks);

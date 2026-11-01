@@ -234,11 +234,8 @@ void periodic_present_prepare(id<MTLDevice> device, PeriodicPresentResidencyFn r
 
 int periodic_present_enabled(void) { return presenter.enabled; }
 
-unsigned periodic_present_anchor_ticks(unsigned display_hz, unsigned fallback_ticks) {
-    if (!fallback_ticks) fallback_ticks = 1;
-    if (!presenter.anchor_hz || !display_hz) return fallback_ticks;
-    unsigned ticks = (display_hz + presenter.anchor_hz / 2) / presenter.anchor_hz;
-    return ticks > fallback_ticks ? ticks : fallback_ticks;
+unsigned periodic_present_anchor_ticks(PeriodicAnchorCadence *cadence, unsigned display_hz, unsigned fallback_ticks) {
+    return periodic_clock_anchor_stride(cadence, display_hz, presenter.anchor_hz, fallback_ticks);
 }
 
 static int capture_scene_texture(PeriodicSceneCapture *capture, id<MTLTexture> source) {
@@ -603,10 +600,11 @@ int periodic_present_probe(void) {
         id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:rd error:&error];
         probe_residency = residency;
         periodic_present_prepare(device, probe_add_allocation);
-        if (periodic_present_anchor_ticks(144, 1) != 3 ||
-            periodic_present_anchor_ticks(144, 2) != 3) return 1;
+        PeriodicAnchorCadence cadence = {0};
+        if (periodic_present_anchor_ticks(&cadence, 144, 1) != 3 ||
+            periodic_present_anchor_ticks(&cadence, 144, 2) != 3) return 1;
         presenter.enabled = 0;
-        if (periodic_present_anchor_ticks(144, 1) != 3) return 1;
+        if (periodic_present_anchor_ticks(&cadence, 144, 1) != 3) return 1;
         presenter.enabled = 1;
         id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
         id<MTL4CommandAllocator> scene_allocator = [device newCommandAllocator];

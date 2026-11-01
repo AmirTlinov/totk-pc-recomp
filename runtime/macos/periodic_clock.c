@@ -152,3 +152,17 @@ uint64_t periodic_clock_tick_time(uint64_t epoch_ns, uint64_t tick, unsigned hz)
     uint64_t fraction = (tick % hz) * NS_PER_SECOND / hz;
     return add_saturated(epoch_ns, add_saturated(whole * NS_PER_SECOND, fraction));
 }
+
+unsigned periodic_clock_anchor_stride(PeriodicAnchorCadence *c, unsigned display_hz,
+    unsigned anchor_hz, unsigned minimum_ticks) {
+    if (!minimum_ticks) minimum_ticks = 1;
+    if (c->display_hz != display_hz || c->anchor_hz != anchor_hz || c->minimum != minimum_ticks)
+        *c = (PeriodicAnchorCadence){display_hz, anchor_hz, minimum_ticks, 0};
+    if (!anchor_hz || !display_hz || (uint64_t)minimum_ticks * anchor_hz >= display_hz) {
+        c->remainder = 0;
+        return minimum_ticks;
+    }
+    uint64_t ticks = (uint64_t)display_hz + c->remainder;
+    c->remainder = ticks % anchor_hz;
+    return (unsigned)(ticks / anchor_hz);
+}

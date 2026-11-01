@@ -36,12 +36,14 @@ def main():
         assert source.is_file()
         duplicate = out / 'duplicate.metal'
         duplicate.write_bytes(source.read_bytes())
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        sources = [(source_hash, source), (source_hash, duplicate)]
         libraries = out / 'libraries'
-        assert compile_libraries([source, duplicate], libraries, 2) == 1
+        assert compile_libraries(sources, libraries, 2) == 1
         compiled = list(libraries.glob('*.metallib'))
         assert len(compiled) == 1 and compiled[0].stat().st_size > 0
         modified = compiled[0].stat().st_mtime_ns
-        assert compile_libraries([source, duplicate], libraries, 2) == 0
+        assert compile_libraries(sources, libraries, 2) == 0
         assert compiled[0].stat().st_mtime_ns == modified
         print(json.dumps(dict(status='pass', stages=['native translator', 'SPIRV-Cross', 'Metal compiler'],
                               scope='synthetic EXIT compute shader; no game or GPU execution')))
