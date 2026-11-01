@@ -26,10 +26,8 @@ static int scene_seen(uint64_t frame) {
 }
 
 static int anchor_scene_seen(uint64_t frame) {
-    // NVN identifies an anchor when QueuePresentTexture publishes it. The
-    // scene compose that produced that anchor ran while the previous present
-    // id was current, so its strict-size marker is one id behind.
-    return scene_seen(frame) || (frame > 0 && scene_seen(frame - 1));
+    // Replay and present carry the same producer-assigned frame identity.
+    return scene_seen(frame);
 }
 
 int native_policy_strict(void) { return strict_mode; }
@@ -100,7 +98,7 @@ void native_policy_init(void) {
         "DM_NVN_HILITE", "DM_NVN_SKIP_FS", "DM_NVN_SKIP_SMALL", "DM_NVN_NOFXAA",
     };
     for (unsigned i = 0; i < sizeof image_overrides / sizeof *image_overrides; ++i) unsetenv(image_overrides[i]);
-    fprintf(stderr, "[totk] native profile: scene/output 3840x2160, 144 Hz retained phase presentation, no scaling or MetalFX interpolation\n");
+    fprintf(stderr, "[totk] native profile: scene/output 3840x2160, 48 Hz anchors, 144 Hz display target; temporal scene phases unavailable\n");
 }
 
 int native_host_check(void) {

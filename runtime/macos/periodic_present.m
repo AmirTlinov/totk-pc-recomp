@@ -297,11 +297,8 @@ void periodic_present_note_camera(uint64_t frame, const float *camera, unsigned 
 
 PeriodicCamera periodic_present_camera(uint64_t anchor_frame) {
     uint64_t packed = 0;
-    for (unsigned behind = 0; behind < 2 && anchor_frame >= behind; ++behind) {
-        uint64_t frame = anchor_frame - behind;
-        unsigned slot = (unsigned)(frame % CAMERA_SLOTS);
-        if (periodic_camera_snapshot_load(&camera_forms[slot], frame, &packed)) break;
-    }
+    unsigned slot = (unsigned)(anchor_frame % CAMERA_SLOTS);
+    periodic_camera_snapshot_load(&camera_forms[slot], anchor_frame, &packed);
     uint32_t values[2] = {(uint32_t)packed, (uint32_t)(packed >> 32)};
     PeriodicCamera camera = {0};
     memcpy(&camera.vertical_fov, &values[0], sizeof camera.vertical_fov);
@@ -645,7 +642,7 @@ int periodic_present_probe(void) {
         (void)periodic_anchor_publish(41);
         float camera_block[84] = {0}; camera_block[62] = 2.0f; camera_block[70] = 0.9f;
         periodic_present_note_camera(41, camera_block, 84);
-        PeriodicCamera camera = periodic_present_camera(42);
+        PeriodicCamera camera = periodic_present_camera(41);
         if (fabsf(camera.vertical_fov - 0.9f) > 1e-6f || fabsf(camera.aspect - 2.0f) > 1e-6f) return 1;
 
         [scene_cb beginCommandBufferWithAllocator:scene_allocator];

@@ -1,0 +1,87 @@
+--- a/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
++++ b/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+@@ -2160,7 +2160,7 @@
+     if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e && atoi(e) > 0; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
+     return v;
+ }
+-static void submit_exec(int n, const uint64_t *h, void *ucap);
++static void submit_exec(int n, const uint64_t *h, void *ucap, uint64_t frame);
+ static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, PeriodicSimulationStamp simulation, NativeMousePhase phase_input);
+ static void *x_thread(void *unused) {
+     (void)unused; pthread_setname_np("totk-translate");
+@@ -2170,7 +2170,7 @@
+         while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+         xjob j = g_xq[g_xq_done % XQ];
+         pthread_mutex_unlock(&g_xq_mu);
+-        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); for (int i = 0; i < j.n; i++) copy_unref(copy_of(j.h[i])); free(j.h); }
++        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap, j.frame); for (int i = 0; i < j.n; i++) copy_unref(copy_of(j.h[i])); free(j.h); }
+         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
+         else {
+             present_exec(j.win, j.idx, j.period, j.crop, j.frame, j.simulation, j.phase_input);
+@@ -2259,7 +2259,8 @@
+         }
+     }
+     if (async_replay()) {
+-        xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
++        xjob j = {.kind = XJ_SUBMIT, .n = n, .frame = g_frame + 1,
++                  .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
+         if (!j.h) die("submit job");
+         for (int i = 0; i < n; i++) {
+             copy_prefix *pf = copy_of(h[i]);
+@@ -2271,11 +2272,14 @@
+         totk_tl(TL_SUB_OUT, 1, 0);
+         return;
+     }
+-    submit_exec(n, (const uint64_t *)h, NULL);
++    submit_exec(n, (const uint64_t *)h, NULL, g_frame + 1);
+     totk_tl(TL_SUB_OUT, 0, 0);
+ }
+-static void submit_exec(int n, const uint64_t *h, void *ucap) {
++static void submit_exec(int n, const uint64_t *h, void *ucap, uint64_t frame) {
+     gfx_enter();
++    // The recording belongs to the next present, even when replay lags behind
++    // the guest. Camera, resource and draw owners share that immutable identity.
++    mtl_set_frame(frame);
+     totk_tl(TL_REP_BEGIN, 0, 0);
+     pin_step(__atomic_load_n(&g_submits, __ATOMIC_RELAXED));   /* TOTK: free texture copies no recording refers to any more */
+     if (cmdlog_env()) for (int i = 0; i < n; i++) {
+@@ -2837,14 +2841,13 @@
+     LOG("[present-interval] %d pacing cases passed", checked);
+ }
+ int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
+-// The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
+-// replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
++// Present the same frame identity carried by its preceding submissions.
+ static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, PeriodicSimulationStamp simulation, NativeMousePhase phase_input) {
+     gfx_enter();
++    mtl_set_frame(frame);
+     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
+     if (frame && periodic_anchor_publish) periodic_anchor_publish(frame);
+     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop, simulation, phase_input);   // 只入队，立即返回 | enqueue only, return immediately
+-    if (frame) mtl_set_frame(frame);
+     gfx_leave();
+ }
+ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+@@ -2887,10 +2890,10 @@
+     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
+         xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9, .simulation = simulation, .phase_input = phase_input};
+         memcpy(j.crop, o->crop, sizeof j.crop);
+-        j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
++        j.frame = g_frame + 1;   // same identity as this frame's submit jobs
+         uint64_t no = x_push(&j);
+         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
+-    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0, simulation, phase_input);
++    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, g_frame + 1, simulation, phase_input);
+     if (stats) atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
+     uint64_t f = g_frame, ps = 0, dr = 0;
+     if (stats) {
+@@ -2990,8 +2993,7 @@
+             g_cs_calls / 300.0, g_cs_bytes / 300.0 / 1024, g_cs_same_calls / 300.0, g_cs_same_bytes / 300.0 / 1024);
+         g_cs_calls = g_cs_draws = g_cs_same_calls = g_cs_same_draws = g_cs_bytes = g_cs_same_bytes = 0;
+     }
+-    if (!async_replay()) mtl_set_frame(g_frame);
+-    else if (stats && g_frame % 300 == 0) { uint64_t d = atomic_exchange(&g_x_drains, 0), dn = atomic_exchange(&g_x_drain_ns, 0);
++    if (async_replay() && stats && g_frame % 300 == 0) { uint64_t d = atomic_exchange(&g_x_drains, 0), dn = atomic_exchange(&g_x_drain_ns, 0);
+         pthread_mutex_lock(&g_xq_mu); uint64_t q = g_xq_in - g_xq_done; pthread_mutex_unlock(&g_xq_mu);
+         LOG("[nvn] 翻译线程 至帧 %llu：排空等待 %llu 次 / %.1f ms（近 300 帧），队列中 %llu 项", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q); }
+     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）

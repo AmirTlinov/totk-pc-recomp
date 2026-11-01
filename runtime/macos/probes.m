@@ -189,9 +189,9 @@ int native_run_probe(const char *name) {
         if (mfx_enabled() || mfxup_enabled() || mfxup_output_enabled()) runtime_fail("native policy runtime scaling");
         native_check_scene(7,3840,2160);
         NativeFrame f=native_frame_capture(7,3840,2160,3840,2160);
-        // The compose happens under id 7 and its following present publishes
-        // anchor 8; both identities must carry the same strict-size proof.
-        if(f.scene_width!=3840 || native_frame_capture(8,3840,2160,3840,2160).scene_width!=3840 ||
+        // The submission and present share id 7. Adjacent frames cannot borrow
+        // its scene-size proof, even when GPU feedback arrives late.
+        if(f.scene_width!=3840 || native_frame_capture(8,3840,2160,3840,2160).scene_width ||
            native_frame_capture(9,3840,2160,3840,2160).scene_width)
             runtime_fail("frame scene identity");
         native_check_scene(71,3840,2160);

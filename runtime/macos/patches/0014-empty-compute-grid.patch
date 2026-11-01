@@ -1,0 +1,13 @@
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -11210,6 +11210,10 @@
+ }
+ static void dispatch(const p_dispatch *dp) {
+     zskip_clear();
++    // NVN can submit an empty grid. Metal requires every dispatched dimension
++    // to be positive; an empty dispatch has no shader or resource side effects.
++    if (!dp->x || !dp->y || !dp->z) return;
++    if (dp->x < 0 || dp->y < 0 || dp->z < 0) MDIE("negative compute dispatch dimensions");
+     if (!S.prog) { RED_ONCE(27, "派发前没有绑定程序"); return; }
+     __unsafe_unretained NvProg *cpr = prog_get(S.prog);
+     if (prog_fit(cpr) < 0) { if (native_policy_strict()) MDIE("required native compute shader variant failed"); return; }

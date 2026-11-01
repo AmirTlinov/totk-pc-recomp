@@ -1,0 +1,278 @@
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -3,6 +3,10 @@
+ static PeriodicGPUChunkTicket g_periodic_gpu_chunk;
+ #include "periodic_state.h"
+ #include "periodic_present.h"
++#include "periodic_ui.h"
++static PeriodicUIProgram *g_periodic_ui;
++static id<MTLTexture> g_periodic_ui_canvas;
++static uint64_t g_periodic_ui_owner;
+ #include "prompt_textures.h"
+ #include "input_prompts.h"
+ // NVN 空设备的 Metal 执行层，见 nvn_mtl.h。
+@@ -2152,6 +2156,9 @@
+     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
+     up_flush();
++    PeriodicUIProgram *ui_program = g_periodic_ui;
++    if (ui_program) periodic_ui_compare(ui_program, g_cb, g_periodic_ui_canvas);
++    g_periodic_ui = NULL; g_periodic_ui_canvas = nil; g_periodic_ui_owner = 0;
+     uint64_t fence = ++g_fence;
+     if (g_vis_ring_i >= 0) g_vis_ring[g_vis_ring_i].fence = fence;
+     // 完成后的 CPU 可见效果：拷贝一份操作表进回调
+@@ -2170,6 +2177,9 @@
+     }
+     NSArray<dispatch_block_t> *commit_blocks = [g_commit_blocks copy];
+     TotkCommitOptions *o = [TotkCommitOptions new];
++    if (ui_program) [o addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
++        periodic_ui_completed(ui_program, feedback.error != nil);
++    }];
+     int gpu_stats = mtl_perf_stats_on();
+     uint64_t gpu_f = atomic_load(&g_cur_frame);
+     if (gpu_stats) gpu_tag_begin(gpu_f);
+@@ -4713,6 +4723,12 @@
+     }
+     if (periodic_present_enabled())
+         rs_scene_capture(g_cb, c, atomic_load_explicit(&g_cur_frame, memory_order_relaxed));
++    if (periodic_ui_enabled() && !g_periodic_ui) {
++        blit_close(); rs_sync();
++        g_periodic_ui_owner = R.rt.color[0]->serial;
++        g_periodic_ui_canvas = c;
++        g_periodic_ui = periodic_ui_begin(g_cb, atomic_load(&g_cur_frame), g_periodic_ui_owner, c);
++    }
+     g_mfx.scene_done = 1;
+ }
+ static id<MTL4RenderCommandEncoder> rp_begin_mask(int clear_only, uint32_t color_mask, NvProg *bar_pr);
+@@ -4897,7 +4913,7 @@
+       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
+     ser_gate();
+     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
+-    else if (periodic_present_enabled() || uw_ratio()) canvas_learn(pd);   // retained scene boundary and key 4 UI squeeze
++    else if (periodic_present_enabled() || periodic_ui_enabled() || uw_ratio()) canvas_learn(pd);   // retained scene boundary and key 4 UI squeeze
+     if (periodic_present_enabled()) periodic_camera_pass_setup(pd);
+     bar_prepare_pass(pd, bar_pr);
+     pg_prepare_pass(bar_pr != nil, g_sub_chunks ? g_chunk_size : g_chunk_first);
+@@ -10499,6 +10515,7 @@
+     if(!zero){zero=[g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared];res_add(zero);zero_gpu=zero.gpuAddress;}
+     enc_r_vbuf(en,30,zero_gpu);
+ }
++#include "nvn_periodic_ui.h"
+ static void mfxup_queue_residency(void) {   // the upscaler's own output textures, once they exist
+     static int added; if (added) return;
+     id<MTLResidencySet> r = mfxup_residency(); if (r) { [g_q4 addResidencySet:r]; added = 1; }
+@@ -10813,7 +10830,7 @@
+     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
+         PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
+     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key) &&
+-        (mfx_enabled() || periodic_present_enabled()))
++        (mfx_enabled() || periodic_present_enabled() || periodic_ui_enabled()))
+         mfx_snapshot_scene();   // retain the finished scene before the first UI draw
+     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) g_uw_ui = 1;   // key 4: the UI begins
+     g_rt_snap_req = !g_enc ? rt_samp : 0;
+@@ -10972,6 +10989,8 @@
+         case 4: case 7: mp = MTLPrimitiveTypeTriangle; break; case 5: mp = MTLPrimitiveTypeTriangleStrip; break;
+         default: RED_ONCE(19, "图元类型 %d 未实现", prim); g_draw_skip[11]++; return;
+     }
++    if (g_periodic_ui && (dw ? dw->count > 0 : di->count > 0))
++        ui_record_draw(pr, ps, cur_ds, dw, di, mp);
+     if (g_vis_counting && perdraw_vis_on() && g_enc_has_vis && g_vis && g_vis_n < VIS_SLOTS - 256) {
+         /* TOTK_ANOMALY: this draw gets its own slot, which also counts towards the game's samples-passed counter (a report
+            sums every slot since the reset): consecutive slots of one buffer extend the list's last entry. */
+@@ -11800,6 +11819,29 @@
+         if (g_cg_pending && !cg_op_safe(h.op)) { g_cg.reason[1]++; cg_flush(); }   // TOTK: cube-face-set groups pend only across state / binding ops (nvn_cube_group.h)
+         if (g_hoist_n && hoist_take(p)) { if (g_fz.active && p == g_fz.rt2_op) { g_fz.phase = 2; g_rt_merged = 0; PD("F %llu 合并通道进入后一个通道的绘制", g_stat_pass); } p += h.size; continue; }   // 已提前执行的纯清除通道 / 已并入的后一个通道开头   // 进入后一个通道：前一个通道的同目标续用到此为止，后一个通道读前一个通道附件由 fz_p2_draw 证本像素，不再按续用规则切开 | A pure-clear render pass already executed early / the start of a later pass already merged in   // Entering the later pass: the same-target continuation of the earlier pass ends here; the later pass reading the earlier pass's attachment is proven to be same-pixel by fz_p2_draw, and is no longer split by the continuation rule
+         const void *a = p + 8;
++        if (periodic_ui_recording(g_periodic_ui)) {
++            const tex_t *written = NULL;
++            switch (h.op) {
++            case OP_DISPATCH: {
++                const p_dispatch *grid=a;
++                if (grid->x && grid->y && grid->z) periodic_ui_reject(g_periodic_ui,"compute action after UI entry");
++                break;
++            }
++            case OP_COPY_B2T: written=((const p_copy_b2t *)a)->tex; break;
++            case OP_COPY_T2T: written=((const p_copy_t2t *)a)->dst; break;
++            case OP_CLEAR_TEX: written=((const p_clear_tex *)a)->tex; break;
++            case OP_CLEAR_COLOR: {
++                int i=((const p_clear_color *)a)->index;
++                if(i>=0 && i<R.rt.n && i<8) written=R.rt.color[i]; break;
++            }
++            case OP_CLEAR_DS: written=R.rt.depth; break;
++            default: break;
++            }
++            if (written) {
++                if (written->serial==g_periodic_ui_owner) periodic_ui_reject(g_periodic_ui,"UI canvas rewritten after entry");
++                else periodic_ui_write_range(g_periodic_ui,(uint64_t)written->mem,written->L.size);
++            }
++        }
+         switch (h.op) {
+             case OP_END: g_exec_cur = NULL;
+                 if (g_hoist_n && !g_ret_n && !g_nrest) {
+@@ -13509,8 +13551,8 @@
+ uint64_t mtl_present(const tex_t *t, double period, const int crop[4], PeriodicSimulationStamp simulation, NativeMousePhase phase_input) {
+     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
+     if (mfx_latch() && !mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;   // key 2 / flag mfx_interp: the next frame is fully on or off
+-    if (t && !mfx_enabled() && (periodic_present_enabled() || uw_ratio())) uw_note_present(t);   // retained canvas search; MFX does it in mfx_present_frame
+-    if (periodic_present_enabled() && !mfx_enabled())
++    if (t && !mfx_enabled() && (periodic_present_enabled() || periodic_ui_enabled() || uw_ratio())) uw_note_present(t);   // retained canvas search; MFX does it in mfx_present_frame
++    if ((periodic_present_enabled() || periodic_ui_enabled()) && !mfx_enabled())
+         g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0;
+     mtl_wb_eager();
+     g_uw_ui = 0;
+--- /dev/null
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_periodic_ui.h
+@@ -0,0 +1,153 @@
++/* UI owns the exact original draw program and immutable resolved inputs. This
++   boundary runs once per UI draw, independently of render-stream packetization. */
++static uint64_t ui_copy_bound(uint64_t address, size_t size, id<MTLBuffer> buffer) {
++    const uint8_t *bytes = bound_uniform_bytes(address, size, buffer);
++    if (!bytes) { periodic_ui_reject(g_periodic_ui, "unresolved buffer version"); return 0; }
++    return periodic_ui_bytes(g_periodic_ui, bytes, size);
++}
++static uint64_t ui_copy_guest(uint64_t address, size_t size) {
++    void *buffer; uint64_t offset, gpu;
++    if (!size || size > (64u << 20) || pend_hits(address, size) ||
++        !mtl_gpu_addr(address, size, &buffer, &offset, &gpu)) {
++        periodic_ui_reject(g_periodic_ui, "mutable or unbounded geometry buffer"); return 0;
++    }
++    return ui_copy_bound(gpu, size, (__bridge id<MTLBuffer>)buffer);
++}
++static int ui_copy_arguments(NvShader *sh, unsigned stage, PeriodicUIDraw *draw) {
++    if (!sh || !sh->ae) return 1;
++    NSUInteger length = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
++    if (!sh->ab_buf || !length || length > NVN_REFL_MAXB * sizeof(uint64_t) || sh->rf.abi >= 31) return 0;
++    uint64_t slots[NVN_REFL_MAXB] = {0};
++    memcpy(slots, (const uint8_t *)sh->ab_buf.contents + sh->ab_off, length);
++    registry_lock();
++    for (int i = 0; i < sh->rf.nb && periodic_ui_recording(g_periodic_ui); ++i) {
++        const nvn_rbind *b = &sh->rf.b[i];
++        unsigned reg = b->reg, aid = b->aid;
++        if (aid >= length / sizeof(uint64_t) || b->rw) { periodic_ui_reject(g_periodic_ui, "writable UI binding"); break; }
++        switch (b->kind) {
++        case NVN_RB_CBUF: {
++            const p_bind_buf *u = reg < 16 ? &S.ubo[stage][reg] : NULL;
++            void *buffer; uint64_t offset;
++            if (!u || !u->size || !mtl_addr(u->addr, u->size, &buffer, &offset)) {
++                periodic_ui_reject(g_periodic_ui, "missing UI uniform"); break;
++            }
++            slots[aid] = ui_copy_bound(slots[aid], u->size, (__bridge id<MTLBuffer>)buffer);
++            break;
++        }
++        case NVN_RB_C1: {
++            id<MTLBuffer> buffer = sh->c1buf ? sh->c1buf : zero_bank();
++            // The compiler-owned constant range is immutable for the shader's
++            // lifetime. Keep its allocation instead of copying an entire bank.
++            periodic_ui_hold(g_periodic_ui, buffer, 1); break;
++        }
++        case NVN_RB_SUPPORT:
++            periodic_ui_hold(g_periodic_ui, support_buf(), 1); break;
++        case NVN_RB_DRV0: case NVN_RB_DRV2: {
++            int bank = b->kind == NVN_RB_DRV2 ? 2 : 0;
++            if (sh->rf.drv_read[bank]) { periodic_ui_reject(g_periodic_ui, "indirect UI driver dependency"); break; }
++            periodic_ui_hold(g_periodic_ui, zero_bank(), 1); break;
++        }
++        case NVN_RB_SAMP: case NVN_RB_SAMPT: {
++            int sid = reg < 128 ? (int)((b->kind == NVN_RB_SAMPT ? S.tex[stage][reg] : S.samp[stage][reg]) >> 20) : 0;
++            id<MTLSamplerState> sampler = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
++            if (!sampler) sampler = dummy_samp();
++            if (sampler.gpuResourceID._impl != slots[aid]) { periodic_ui_reject(g_periodic_ui, "sampler generation changed"); break; }
++            periodic_ui_hold(g_periodic_ui, sampler, 0); break;
++        }
++        case NVN_RB_TEX: {
++            int tid = reg < 128 ? (int)(S.tex[stage][reg] & 0xfffff) : 0;
++            void *pointer = NULL; if (tid) tex_fast_rid(tid, &pointer);
++            id<MTLTexture> texture = (__bridge id<MTLTexture>)pointer;
++            if (!texture) texture = dummy_tex(b->dtt, b->dpf);
++            else {
++                if (tid < g_ntreg) texture = rtsnap_bound(g_treg[tid].t.serial, texture);
++                if ((b->dtt == MTLTextureType2DArray && texture.textureType == MTLTextureType2D) ||
++                    (b->dtt == MTLTextureType2D && texture.textureType == MTLTextureType2DArray))
++                    texture = tex_type_view(texture, (MTLTextureType)b->dtt);
++            }
++            if (!texture || texture.gpuResourceID._impl != slots[aid] || texture == g_periodic_ui_canvas ||
++                texture.parentTexture == g_periodic_ui_canvas) {
++                periodic_ui_reject(g_periodic_ui, "framebuffer feedback or changed texture binding"); break;
++            }
++            if (tid && tid < g_ntreg) periodic_ui_read_range(g_periodic_ui,
++                (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size);
++            slots[aid] = periodic_ui_texture(g_periodic_ui, texture); break;
++        }
++        default: periodic_ui_reject(g_periodic_ui, "unsupported UI resource binding"); break;
++        }
++    }
++    registry_unlock();
++    if (!periodic_ui_recording(g_periodic_ui)) return 0;
++    uint64_t address = periodic_ui_bytes(g_periodic_ui, slots, length);
++    if (stage) { draw->fragment[sh->rf.abi] = address; draw->fragment_mask |= 1u << sh->rf.abi; }
++    else { draw->vertex[sh->rf.abi] = address; draw->vertex_mask |= 1u << sh->rf.abi; }
++    return address != 0;
++}
++static void ui_record_draw(NvProg *program, id<MTLRenderPipelineState> pipeline,
++    id<MTLDepthStencilState> depth, const p_draw *dw, const p_draw_idx *di, MTLPrimitiveType primitive) {
++    if (!periodic_ui_recording(g_periodic_ui)) return;
++    if (!R.rt.n || !R.rt.color[0] || R.rt.color[0]->serial != g_periodic_ui_owner) {
++        for (int i=0;i<R.rt.n && i<8;++i) if (R.rt.color[i]) periodic_ui_write_range(g_periodic_ui,
++            (uint64_t)R.rt.color[i]->mem,R.rt.color[i]->L.size);
++        if (R.rt.depth) periodic_ui_write_range(g_periodic_ui,(uint64_t)R.rt.depth->mem,R.rt.depth->L.size);
++        if (program) for (unsigned stage=0;stage<2;++stage) if (program->sh[stage])
++            for (int i=0;i<program->sh[stage]->rf.nb;++i) if (program->sh[stage]->rf.b[i].rw)
++                periodic_ui_reject(g_periodic_ui,"external draw writes shader storage");
++        return;
++    }
++    if (
++        !program || !program->sh[0] || !uw_ui_vs(program->sh[0]->key) ||
++        g_pass.dfmt || g_pass.sfmt || g_pass.samples != 1 || g_lay.active || g_pass.mfx) {
++        periodic_ui_reject(g_periodic_ui, "UI owner has non-UI work or unsupported attachments"); return;
++    }
++    for (unsigned i = 1; i < 8; ++i) if (g_pass.cfmt[i]) {
++        periodic_ui_reject(g_periodic_ui, "UI multiple render targets"); return;
++    }
++    PeriodicUIDraw d = {.pipeline=pipeline, .depth=depth, .viewport=g_es.vp, .scissor=g_es.sc,
++        .primitive=(uint32_t)primitive, .cull=g_es.cull, .winding=g_es.wind, .fill=g_es.fill, .clip=g_es.clip};
++    memcpy(d.bias, g_es.bias, sizeof d.bias); memcpy(d.blend, g_es.bc, sizeof d.blend);
++    if (!ui_copy_arguments(program->sh[0], 0, &d) || !ui_copy_arguments(program->sh[1], 1, &d)) {
++        periodic_ui_reject(g_periodic_ui, "unresolved UI argument program"); return;
++    }
++    uint16_t mask = vertex_stream_mask(program->sh[0]);
++    for (unsigned stream = 0; stream < 14; ++stream) if (mask & (1u << stream)) {
++        d.vertex[16 + stream] = ui_copy_guest(S.vbuf[stream].address, S.vbuf[stream].size);
++        d.vertex_mask |= 1u << (16 + stream);
++    }
++    if (mask & 0xc000) { periodic_ui_reject(g_periodic_ui, "reserved UI vertex stream"); return; }
++    const uint64_t zero[8] = {0};
++    d.vertex[30] = periodic_ui_bytes(g_periodic_ui, zero, sizeof zero); d.vertex_mask |= 1u << 30;
++    if (dw) {
++        d.count = dw->count; d.first = dw->first; d.instances = dw->instances > 1 ? dw->instances : 1; d.base_instance = dw->base_instance;
++        if (dw->prim == 7) {
++            if (dw->count > 262144) { periodic_ui_reject(g_periodic_ui, "quad index range"); return; }
++            d.indexed = 1; d.count = dw->count / 4 * 6; d.index_type = MTLIndexTypeUInt32;
++            d.index_length = (size_t)d.count * 4; d.base_vertex = dw->first;
++            uint32_t *indices = malloc(d.index_length);
++            if (!indices) { periodic_ui_reject(g_periodic_ui, "quad storage allocation"); return; }
++            for (uint32_t q = 0; q < dw->count / 4; ++q) {
++                uint32_t b = q * 4, v[6] = {b,b+1,b+2,b,b+2,b+3}; memcpy(indices+q*6,v,sizeof v);
++            }
++            d.index_address = periodic_ui_bytes(g_periodic_ui, indices, d.index_length); free(indices);
++        }
++    } else {
++        if (di->prim == 7) { periodic_ui_reject(g_periodic_ui, "unsupported UI index format"); return; }
++        d.indexed = 1; d.count = di->count; d.instances = di->instances ? di->instances : 1;
++        d.base_vertex = di->base_vertex; d.base_instance = di->base_instance;
++        d.index_type = di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
++        d.index_length = (size_t)d.count * (di->itype == 1 ? 2 : 4);
++        if (di->itype == 0) {
++            void *buffer; uint64_t offset;
++            if (pend_hits(di->ibuf,d.count) || !mtl_addr(di->ibuf,d.count,&buffer,&offset)) {
++                periodic_ui_reject(g_periodic_ui,"GPU-written UI byte indices"); return;
++            }
++            const uint8_t *bytes=(const uint8_t *)[(__bridge id<MTLBuffer>)buffer contents]+offset;
++            uint16_t *indices=malloc((size_t)d.count*2);
++            if (!indices) { periodic_ui_reject(g_periodic_ui,"byte index allocation"); return; }
++            for (uint32_t i=0;i<d.count;++i) indices[i]=bytes[i]==255?65535:bytes[i];
++            d.index_type=MTLIndexTypeUInt16;d.index_length=(size_t)d.count*2;
++            d.index_address=periodic_ui_bytes(g_periodic_ui,indices,d.index_length);free(indices);
++        } else d.index_address = ui_copy_guest(di->ibuf, d.index_length);
++    }
++    if (periodic_ui_recording(g_periodic_ui)) periodic_ui_append(g_periodic_ui, &d);
++}
