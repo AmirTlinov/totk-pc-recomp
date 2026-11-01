@@ -1,0 +1,318 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+index 9ee2240..54fbeb1 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -1239,7 +1239,36 @@ static int arg_bind_cache_on(void) {
+ static inline void es_begin(id e);   // render state cache, defined with the state wrappers below
+ /* TOTK: the shared copy / dispatch encoder (g_blit) may still be open after a dispatch: any other encoder on g_cb closes it
+    first (a Metal command buffer encodes one encoder at a time). */
+-static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
++static __unsafe_unretained id g_periodic_encoder;
++static uint64_t g_periodic_encoder_serial;
++static void periodic_encoder_begin(id encoder, uint32_t kind) {
++    if (!periodic_store_active() || !encoder) return;
++    if (g_periodic_encoder) periodic_store_unknown();
++    periodic_store_pass_begin((UINT64_C(3) << 62) | ((uint64_t)kind << 56) | ++g_periodic_encoder_serial);
++    g_periodic_encoder = encoder;
++}
++static void periodic_encoder_end(id encoder) {
++    if (encoder && encoder == g_periodic_encoder) {
++        periodic_store_pass_end();
++        g_periodic_encoder = nil;
++    }
++}
++static void periodic_note_guest_buffer(uint64_t address, uint64_t length, uint32_t role, uint8_t access) {
++    if (!address || !periodic_store_active()) return;
++    periodic_store_resource((PeriodicResourceKey){.owner=1, .offset=address,
++        .length=length ? length : 1, .kind=2}, g_sub_serial, role, access);
++}
++@protocol TotkPeriodicMTLResource
++@property(readonly) MTLResourceID gpuResourceID;
++@end
++static void periodic_note_mtl_resource(id resource, uint64_t offset, uint64_t length,
++                                       uint32_t kind, uint32_t role, uint8_t access) {
++    if (!resource || !periodic_store_active()) return;
++    uint64_t identity = ((id<TotkPeriodicMTLResource>)resource).gpuResourceID._impl;
++    periodic_store_resource((PeriodicResourceKey){.owner=identity, .offset=offset,
++        .length=length ? length : 1, .kind=kind}, identity, role, access);
++}
++static inline void blit_close(void) { if (g_blit) { periodic_encoder_end(g_blit); m4_end(g_blit); g_blit = nil; } }
+ #include "nvn_render_stream.h"
+ static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { blit_close(); bar_prepare_encoder();
+     if (rs_stream_pass()) { id e = rs_pass_begin(d, g_vt, g_ft, g_cb, bar_start_mode(), (uint64_t)bar_vis()); es_begin(e); return e; }   // TOTK: encode stage (nvn_render_stream.h)
+@@ -1293,18 +1322,30 @@ static inline void enc_r_address(id<MTL4RenderCommandEncoder> e, unsigned stage,
+ static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
+ static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
+ static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
+-static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; bar_history_reset(); [e setArgumentTable:g_ct]; return e; }
++static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; periodic_encoder_begin(e, 2); if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; bar_history_reset(); [e setArgumentTable:g_ct]; return e; }
+ static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
+-static inline void enc_c_end(id e) { m4_end(e); }
++static inline void enc_c_end(id e) { periodic_encoder_end(e); m4_end(e); }
+ static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
+ static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; [g_ct setAddress:gpu atIndex:i]; }
+ static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
+ static inline id enc_b_begin(id cb) { return [cb respondsToSelector:@selector(beginCommandBufferWithAllocator:)] ? [cb computeCommandEncoder] : [cb blitCommandEncoder]; }
+-static inline void enc_b_end(id e) { m4_end(e); }
+-static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) { [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
+-static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o) { [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
+-static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
+-static inline void enc_b_copy_texture(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin so, MTLSize z, id<MTLTexture> d, NSUInteger dl, NSUInteger dv, MTLOrigin doo) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:so sourceSize:z toTexture:d destinationSlice:dl destinationLevel:dv destinationOrigin:doo]; }
++static inline void enc_b_end(id e) { periodic_encoder_end(e); m4_end(e); }
++static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) {
++    periodic_note_mtl_resource(s, so, n, 4, 0x7000, PERIODIC_RESOURCE_READ);
++    periodic_note_mtl_resource(d, doff, n, 4, 0x7001, PERIODIC_RESOURCE_WRITE);
++    [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
++static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o) {
++    periodic_note_mtl_resource(s, so, img * MAX(z.depth, 1), 4, 0x7010, PERIODIC_RESOURCE_READ);
++    periodic_note_mtl_resource(d, 0, 1, 3, 0x7011, PERIODIC_RESOURCE_WRITE);
++    [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
++static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) {
++    periodic_note_mtl_resource(s, 0, 1, 3, 0x7020, PERIODIC_RESOURCE_READ);
++    periodic_note_mtl_resource(d, doff, img * MAX(z.depth, 1), 4, 0x7021, PERIODIC_RESOURCE_WRITE);
++    [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
++static inline void enc_b_copy_texture(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin so, MTLSize z, id<MTLTexture> d, NSUInteger dl, NSUInteger dv, MTLOrigin doo) {
++    periodic_note_mtl_resource(s, 0, 1, 3, 0x7030, PERIODIC_RESOURCE_READ);
++    periodic_note_mtl_resource(d, 0, 1, 3, 0x7031, PERIODIC_RESOURCE_WRITE);
++    [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:so sourceSize:z toTexture:d destinationSlice:dl destinationLevel:dv destinationOrigin:doo]; }
+ static void blit_note(void);   // 逐通道转储：拷贝 / 缓冲更新结束了渲染通道（定义在 PD 之后） | Per-pass dump: a copy / buffer update ended the render pass (defined after PD)
+ static void pd_update_bytes(const void *data, uint64_t dst, uint64_t n, uint64_t seq);
+ static void pd_xfer(const char *what, uint64_t src, uint64_t dst, uint64_t n);   // TOTK pass dump: 'X' lines for GPU copies / inline uniform updates (defined after PD)
+@@ -1317,7 +1358,7 @@ static inline void enc_r_address(id<MTL4RenderCommandEncoder> e, unsigned stage,
+ static int blit_bar_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BLIT_BAR"); v = !e || atoi(e); } return v; }
+ static id<MTL4ComputeCommandEncoder> blit_kind(int buffer_alias) { blit_note(); if (!g_blit) { g_blit_opens++; g_blit_splits += g_enc != nil; } rp_end();
+     if (buffer_alias && !g_copy_probe_no_alias) g_blit_alias = 1; // rp_end may itself open and close a copy encoder
+-    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; bar_history_reset(); }
++    if (!g_blit) { rs_sync(); ser_gate(); pt_mark(g_cb, 'B', nil); g_blit = enc_b_begin(g_cb); periodic_encoder_begin(g_blit, 1); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; bar_history_reset(); }
+     else if (blit_bar_on()) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:blit_vis()];
+     return g_blit; }
+ static id<MTL4ComputeCommandEncoder> blit(void) { return blit_kind(0); }
+@@ -1619,7 +1660,10 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+     void *sb, *db; uint64_t so, dof;
+     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
+         MDIE("缓冲拷贝地址不在任何内存池内 src=%#llx dst=%#llx n=%#llx", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+-    enc_b_copy_buffer(blit_buffer((__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n), (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
++    id<MTL4ComputeCommandEncoder> encoder = blit_buffer((__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
++    periodic_note_guest_buffer(src, n, 0x8200, PERIODIC_RESOURCE_READ);
++    periodic_note_guest_buffer(dst, n, 0x8201, PERIODIC_RESOURCE_WRITE);
++    enc_b_copy_buffer(encoder, (__bridge id<MTLBuffer>)sb, so, (__bridge id<MTLBuffer>)db, dof, n);
+ }
+ 
+ // TOTK: uniform updates carry their data inline in the (host-owned) recording; stage it in this submit's
+@@ -1727,6 +1771,7 @@ static void upd_flush(void) {
+         id<MTLBuffer> sb; size_t so = arena_alloc((size_t)(hi - lo), &sb);
+         pend_materialize(lo, (uint8_t *)sb.contents + so, (size_t)(hi - lo), 0);   // every byte here is covered by a logged update: the newest one wins
+         if (!b) b = blit();
++        periodic_note_guest_buffer(lo, hi - lo, 0x8210, PERIODIC_RESOURCE_WRITE);
+         enc_b_copy_buffer(b, sb, so, (__bridge id<MTLBuffer>)db, dof, hi - lo);
+         i = j;
+     }
+@@ -1797,7 +1842,9 @@ static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
+     }
+     if (ub_rename_on()) { g_ren_fallback++; upd_flush(); }   // pending table full: keep the order with a real copy
+     usnap_drop(dst, n);   // TOTK: the update reaches memory on the GPU timeline; later readers read it there
+-    enc_b_copy_buffer(blit_buffer(sb, so, (__bridge id<MTLBuffer>)db, dof, n), sb, so, (__bridge id<MTLBuffer>)db, dof, n);
++    id<MTL4ComputeCommandEncoder> encoder = blit_buffer(sb, so, (__bridge id<MTLBuffer>)db, dof, n);
++    periodic_note_guest_buffer(dst, n, 0x8211, PERIODIC_RESOURCE_WRITE);
++    enc_b_copy_buffer(encoder, sb, so, (__bridge id<MTLBuffer>)db, dof, n);
+ }
+ static void post(post_op o) {
+     if (g_npost == g_postcap) { g_postcap = g_postcap ? g_postcap * 2 : 64; g_post = realloc(g_post, g_postcap * sizeof *g_post); }
+@@ -3792,16 +3839,19 @@ static void periodic_note_pass_attachments(MTL4RenderPassDescriptor *pd) {
+         if (attachment.loadAction == MTLLoadActionLoad) access |= PERIODIC_RESOURCE_READ;
+         periodic_store_resource(periodic_tex_key(R.rt.color[i], 0), attachment.texture.gpuResourceID._impl,
+                                 0x100u + (uint32_t)i, access);
++        periodic_note_mtl_resource(attachment.texture, 0, 1, 3, 0x180u + (uint32_t)i, access);
+     }
+     if (R.rt.depth && pd.depthAttachment.texture) {
+         uint8_t access = PERIODIC_RESOURCE_WRITE;
+         if (pd.depthAttachment.loadAction == MTLLoadActionLoad) access |= PERIODIC_RESOURCE_READ;
+         periodic_store_resource(periodic_tex_key(R.rt.depth, 0), pd.depthAttachment.texture.gpuResourceID._impl, 0x108, access);
++        periodic_note_mtl_resource(pd.depthAttachment.texture, 0, 1, 3, 0x188, access);
+     }
+     if (R.rt.depth && pd.stencilAttachment.texture) {
+         uint8_t access = PERIODIC_RESOURCE_WRITE;
+         if (pd.stencilAttachment.loadAction == MTLLoadActionLoad) access |= PERIODIC_RESOURCE_READ;
+         periodic_store_resource(periodic_tex_key(R.rt.depth, 0), pd.stencilAttachment.texture.gpuResourceID._impl, 0x109, access);
++        periodic_note_mtl_resource(pd.stencilAttachment.texture, 0, 1, 3, 0x189, access);
+     }
+ }
+ /* TOTK_MFX=interp (totk_mfx.m): the canvas is the float target the game composes the frame in and then copies to the
+@@ -4930,7 +4980,7 @@ @implementation NvShader @end
+ @interface NvProg : NSObject { @public NvShader *sh[6];
+     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
+     const uint8_t *ctl[6], *code[6]; NSString *key[6]; shader_state_key sig[6]; NSMutableDictionary<NSData *, NvShader *> *alt[6];
+-    void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw, udc_unknown_write; uint32_t udc_cmask, udc_imgw_mask[5], udc_img_mask[5]; uint64_t udc_tex_mask[5][2];   // udc_*: draw and barrier summaries of sh[] (valid while sh[] is the same)
++    void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw, udc_unknown_write; uint32_t udc_cmask, udc_imgw_mask[6], udc_img_mask[6]; uint64_t udc_tex_mask[6][2];   // udc_*: draw and barrier summaries of sh[] (valid while sh[] is the same)
+     int missing, miss_has[6]; shader_state_key miss_sig[6]; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
+ @implementation NvProg @end
+ /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
+@@ -5929,14 +5979,14 @@ static void prog_draw_summary(NvProg *pr) {
+             for (int i = 0; i < sh->rf.nb; i++) {
+                 const nvn_rbind *b = &sh->rf.b[i];
+                 if (b->kind == NVN_RB_IMG) img = 1;
+-                if (sh->stage < 5 && (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && b->reg < 128)
++                if (sh->stage < 6 && (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && b->reg < 128)
+                     pr->udc_tex_mask[sh->stage][b->reg >> 6] |= UINT64_C(1) << (b->reg & 63);
+-                if (sh->stage < 5 && b->kind == NVN_RB_IMG && b->reg < 32)
++                if (sh->stage < 6 && b->kind == NVN_RB_IMG && b->reg < 32)
+                     pr->udc_img_mask[sh->stage] |= 1u << b->reg;
+                 if (!b->rw) continue;
+                 if (b->kind == NVN_RB_IMG) {
+                     imgw = 1;
+-                    if (sh->stage < 5 && b->reg < 32) pr->udc_imgw_mask[sh->stage] |= 1u << b->reg;
++                    if (sh->stage < 6 && b->reg < 32) pr->udc_imgw_mask[sh->stage] |= 1u << b->reg;
+                     else unknown_write = 1;
+                 } else unknown_write = 1;
+             } }
+@@ -5964,12 +6014,12 @@ static uint64_t periodic_handle_generation(uint64_t handle) {
+     return atomic_load_explicit(&g_towner[tid], memory_order_relaxed);
+ }
+ 
+-static void periodic_note_draw(NvProg *pr) {
++static void periodic_note_program(NvProg *pr) {
+     if (!periodic_store_active()) return;
+     if (!pr) { periodic_store_unknown(); return; }
+     prog_draw_summary(pr);
+     if (pr->udc_unknown_write) periodic_store_unknown();
+-    for (int stage = 0; stage < 5; ++stage) {
++    for (int stage = 0; stage < 6; ++stage) {
+         for (int word = 0; word < 2; ++word) {
+             uint64_t slots = pr->udc_tex_mask[stage][word];
+             while (slots) {
+@@ -5977,6 +6027,10 @@ static void periodic_note_draw(NvProg *pr) {
+                 periodic_store_resource(periodic_handle_key(S.tex[stage][slot]), periodic_handle_generation(S.tex[stage][slot]),
+                                         0x1000u + (uint32_t)(stage << 8) + (uint32_t)slot,
+                                         PERIODIC_RESOURCE_READ);
++                uint64_t generation = periodic_handle_generation(S.tex[stage][slot]);
++                periodic_store_resource((PeriodicResourceKey){.owner=generation, .length=1, .kind=3}, generation,
++                                        0x1800u + (uint32_t)(stage << 8) + (uint32_t)slot,
++                                        PERIODIC_RESOURCE_READ);
+             }
+         }
+         uint32_t images = pr->udc_img_mask[stage];
+@@ -5986,6 +6040,9 @@ static void periodic_note_draw(NvProg *pr) {
+             if (pr->udc_imgw_mask[stage] & (1u << slot)) access |= PERIODIC_RESOURCE_WRITE;
+             periodic_store_resource(periodic_handle_key(S.img[stage][slot]), periodic_handle_generation(S.img[stage][slot]),
+                                     0x2000u + (uint32_t)(stage << 8) + (uint32_t)slot, access);
++            uint64_t generation = periodic_handle_generation(S.img[stage][slot]);
++            periodic_store_resource((PeriodicResourceKey){.owner=generation, .length=1, .kind=3}, generation,
++                                    0x2800u + (uint32_t)(stage << 8) + (uint32_t)slot, access);
+         }
+     }
+ }
+@@ -7864,6 +7921,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+         }
+         if (b->kind == NVN_RB_CBUF) {
+             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
++            if (u && u->addr) periodic_note_guest_buffer(u->addr, u->size,
++                0x3000u + (uint32_t)(nvn_stage << 8) + (uint32_t)reg, PERIODIC_RESOURCE_READ);
+             // Ready uniform copies live in resident, fence-retained arenas.
+             // Their original pool was validated when the copy was created.
+             // Keep live-memory/UI/diagnostic accesses on the full resolver.
+@@ -7881,6 +7940,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+             }
+             void *mb; uint64_t mo, gpu;
+             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
++            periodic_note_mtl_resource((__bridge id<MTLBuffer>)mb, mo, u->size, 4,
++                0x3800u + (uint32_t)(nvn_stage << 8) + (uint32_t)reg, PERIODIC_RESOURCE_READ);
+             use_rec("buf", u->addr, u->size, 0, NULL);
+             uint64_t ren = copy_checked ? (update_seq ? upd_shadow_create(u->addr, u->size, update_seq) : 0)
+                 : g_nupd ? upd_shadow(u->addr, u->size) : 0;
+@@ -7983,8 +8044,14 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+             }
+             void *mb; uint64_t mo, gpu;
+             if (va && g_nupd && upd_overlap_seq(va, va + 65536)) { g_ren_late++; RED_ONCE(60, "uniform 槽里的存储缓冲指针 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)va); }
++            if (va) periodic_note_guest_buffer(va, 65536,
++                0x4000u + (uint32_t)(nvn_stage << 8) + (uint32_t)reg,
++                PERIODIC_RESOURCE_READ | (b->rw ? PERIODIC_RESOURCE_WRITE : 0));
+             if (va && b->rw) usnap_drop(va, 65536);   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
+-            if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
++            if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { periodic_note_mtl_resource((__bridge id<MTLBuffer>)mb, mo, 65536, 4,
++                    0x4800u + (uint32_t)(nvn_stage << 8) + (uint32_t)reg,
++                    PERIODIC_RESOURCE_READ | (b->rw ? PERIODIC_RESOURCE_WRITE : 0));
++                use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+             else { RED_ONCE(40, "阶段 %d uniform 槽 %d 偏移 %u 处的存储缓冲指针 %#llx 不在内存池里（uniform %s）", nvn_stage, reg, b->off, (unsigned long long)va, u && u->addr ? "已绑" : "未绑"); slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead);
+                 /* TOTK diagnostic (first 12): which bound uniform block of this stage holds a pool pointer at this offset, and the head of every bound block */
+                 static uint64_t dn; if (dn < 12 && sh) { dn++; char line[1400]; size_t o = 0;
+@@ -7995,6 +8062,9 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+             if (bl) PD("B %llu st%d sbufu reg%d+%u -> %#llx%s", g_stat_pass, nvn_stage, reg, b->off, (unsigned long long)va, pr > 0 ? " (pending write)" : "");
+         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B：存储缓冲 / 计算阶段 uniform 是设备指针，按 NVN 槽取地址 | B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
+             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
++            if (u && u->addr) periodic_note_guest_buffer(u->addr, u->size,
++                (b->kind == NVN_RB_UBOP ? 0x5000u : 0x6000u) + (uint32_t)(nvn_stage << 8) + (uint32_t)reg,
++                PERIODIC_RESOURCE_READ | (b->rw ? PERIODIC_RESOURCE_WRITE : 0));
+             void *mb; uint64_t mo, gpu;
+             { /* TOTK: DM_NVN_WATCH_SB=<shader key prefix>:<reg>: arm the guest read/write watch on this storage buffer (see runtime_watch_set) */
+               static const char *wsb = NULL; static int wsb_init, wsb_reg = -1, wsb_done; if (!wsb_init) { wsb_init = 1; const char *e = getenv("DM_NVN_WATCH_SB"); if (e && strchr(e, ':')) { size_t L = strchr(e, ':') - e; char *k = malloc(L + 1); memcpy(k, e, L); k[L] = 0; wsb = k; wsb_reg = atoi(strchr(e, ':') + 1); } }
+@@ -8008,7 +8078,10 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
+             const usnap_t *usc = !ren && b->kind == NVN_RB_UBOP && u && u->addr ? usnap_find(u->addr, u->size ? u->size : 1) : NULL;   // TOTK: compute uniforms as of the submit call
+             if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
+             else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); USE(dummy_buf(), MTLResourceUsageRead); }
+-            else if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
++            else if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { periodic_note_mtl_resource((__bridge id<MTLBuffer>)mb, mo, u->size, 4,
++                    0x6800u + (uint32_t)(nvn_stage << 8) + (uint32_t)reg,
++                    PERIODIC_RESOURCE_READ | (b->rw ? PERIODIC_RESOURCE_WRITE : 0));
++                use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
+             if (bl) { /* TOTK: first 16 bytes and the count of non-zero 32-bit words (CPU view of the pool: what earlier GPU work left there) */
+                 uint64_t nz = 0, nw = 0; uint32_t w4[4] = {0, 0, 0, 0}; void *mb2; uint64_t mo2;
+@@ -10435,6 +10508,10 @@ static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
+         if(!(mask&(1u<<stream))){omitted++;continue;}
+         void *mb;uint64_t mo,gpu;
+         if(mtl_gpu_addr(S.vbuf[stream].address,1,&mb,&mo,&gpu)) {
++            periodic_note_guest_buffer(S.vbuf[stream].address, S.vbuf[stream].size,
++                0x8000u + stream, PERIODIC_RESOURCE_READ);
++            periodic_note_mtl_resource((__bridge id<MTLBuffer>)mb, mo, S.vbuf[stream].size, 4,
++                0x8800u + stream, PERIODIC_RESOURCE_READ);
+             enc_r_vbuf(en,16+stream,gpu);use_rec("buf",S.vbuf[stream].address,S.vbuf[stream].size,0,NULL);bound++;
+         }
+     }
+@@ -10988,7 +11065,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
+ #endif
+     udc_note_draw(pr);
+     if ((dw && (dw->prim != 7 ? dw->count > 0 : dw->count >= 4)) || (di && di->count > 0)) {
+-        periodic_note_draw(pr);
++        periodic_note_program(pr);
+         bar_note_draw(pr);
+     }
+     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
+@@ -11008,6 +11085,11 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
+         void *mb; uint64_t mo;
+         uint64_t gpu;
+         if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "索引缓冲不在内存池里"); return; }
++        periodic_note_guest_buffer(di->ibuf, (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4),
++            0x8100, PERIODIC_RESOURCE_READ);
++        periodic_note_mtl_resource((__bridge id<MTLBuffer>)mb, mo,
++            (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4),
++            4, 0x8900, PERIODIC_RESOURCE_READ);
+         if (di->itype == 0) {   // TOTK: Metal has no 8-bit indices; widen to 16 bits in this submit's arena (restart 0xFF -> 0xFFFF)
+             id<MTLBuffer> wide; size_t woff;
+             int wi = wide_find(di);
+@@ -11126,7 +11208,7 @@ stages with device visibility (blit()), as the end / start barriers of two encod
+ static id<MTL4ComputeCommandEncoder> disp_enc(void) {
+     int open = g_blit != nil;
+     g_disp_n++; g_disp_shared += open;
+-    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
++    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); periodic_encoder_begin(g_blit, 2); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
+     else if (!g_disp_probe_nobar) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:bar_vis()];
+     [g_blit setArgumentTable:g_ct]; args_dirty_all();
+     if (g_disp_n % 20000 == 0) MLOG("[nvn] 计算派发 至 %llu 次：其中 %llu 次（%.0f%%）接在已开的计算编码器里，没有另开编码器", (unsigned long long)g_disp_n, (unsigned long long)g_disp_shared, 100.0 * (double)g_disp_shared / (double)g_disp_n);
+@@ -11164,6 +11246,9 @@ static void dispatch(const p_dispatch *dp) {
+         }
+         rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+         id<MTLComputeCommandEncoder> ce = pg_compute();
++        periodic_note_guest_buffer(u->addr, 16, 0x8500, PERIODIC_RESOURCE_READ);
++        periodic_note_guest_buffer(a0->addr, a0->size, 0x8501, PERIODIC_RESOURCE_READ);
++        periodic_note_guest_buffer(a1->addr, a1->size, 0x8502, PERIODIC_RESOURCE_READ | PERIODIC_RESOURCE_WRITE);
+         enc_c_pso(ce, ps);
+         enc_c_args(ce, ((__bridge id<MTLBuffer>)ub).gpuAddress + uo, 0); enc_c_args(ce, ((__bridge id<MTLBuffer>)sb).gpuAddress + so, 1); enc_c_args(ce, ((__bridge id<MTLBuffer>)db).gpuAddress + dof, 2);   // 内嵌计算核：冷路径，直接取地址 | Built-in compute kernel: cold path, take the addresses directly
+         enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(32, 1, 1));
+@@ -11180,6 +11265,7 @@ static void dispatch(const p_dispatch *dp) {
+     enc_c_pso(ce, ps);
+     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
+     encode_args(ce, cs, 5, 0);
++    periodic_note_program(cpr);
+     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.8s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
+     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
+     if (!reuse) enc_c_end(ce);

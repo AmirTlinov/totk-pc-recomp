@@ -39,8 +39,9 @@ typedef struct {
     PeriodicResourceKey key;
     uint64_t generation;
     uint64_t readers[STORE_GRAPH_WORDS];
+    uint64_t writers[STORE_GRAPH_WORDS];
     int32_t last_writer;
-    uint32_t next;
+    uint32_t next, owner_next;
 } GraphResource;
 
 typedef struct {
@@ -54,6 +55,7 @@ typedef struct {
     uint64_t unknown[STORE_GRAPH_WORDS];
     GraphResource resources[STORE_RESOURCE_LIMIT];
     uint32_t buckets[STORE_RESOURCE_BUCKETS];
+    uint32_t owner_buckets[STORE_RESOURCE_BUCKETS];
     uint32_t pass_count;
     uint32_t resource_count;
     uint32_t valid;
@@ -107,6 +109,17 @@ static int key_equal(const PeriodicResourceKey *a, const PeriodicResourceKey *b)
     return !memcmp(a, b, sizeof *a);
 }
 
+static uint64_t owner_hash(const PeriodicResourceKey *key) {
+    uint64_t shape = (uint64_t)key->kind << 32 | key->plane;
+    return mix64(key->owner) ^ mix64(shape);
+}
+
+static int key_overlaps(const PeriodicResourceKey *a, const PeriodicResourceKey *b) {
+    if (a->owner != b->owner || a->kind != b->kind || a->plane != b->plane) return 0;
+    uint64_t al = a->length ? a->length : 1, bl = b->length ? b->length : 1;
+    return a->offset <= b->offset ? al > b->offset - a->offset : bl > a->offset - b->offset;
+}
+
 static void bit_set(uint64_t bits[STORE_GRAPH_WORDS], unsigned index) {
     bits[index >> 6] |= UINT64_C(1) << (index & 63);
 }
@@ -147,6 +160,9 @@ static GraphResource *graph_resource(GraphSnapshot *graph, const PeriodicResourc
     resource->last_writer = -1;
     resource->next = graph->buckets[bucket];
     graph->buckets[bucket] = graph->resource_count;
+    unsigned owner_bucket = (unsigned)(owner_hash(key) % STORE_RESOURCE_BUCKETS);
+    resource->owner_next = graph->owner_buckets[owner_bucket];
+    graph->owner_buckets[owner_bucket] = graph->resource_count;
     return resource;
 }
 
@@ -161,6 +177,30 @@ static const GraphResource *find_resource(const GraphSnapshot *graph, const Peri
 
 static void add_edge(GraphSnapshot *graph, unsigned from, unsigned to) {
     if (from < graph->pass_count && to < graph->pass_count && from != to) bit_set(graph->edges[from], to);
+}
+
+static int graph_use(GraphSnapshot *graph, unsigned pass, const StoreUse *use) {
+    unsigned owner_bucket = (unsigned)(owner_hash(&use->key) % STORE_RESOURCE_BUCKETS);
+    for (uint32_t entry = graph->owner_buckets[owner_bucket]; entry;
+         entry = graph->resources[entry - 1].owner_next) {
+        GraphResource *resource = &graph->resources[entry - 1];
+        if (!key_overlaps(&resource->key, &use->key)) continue;
+        if (resource->last_writer >= 0) add_edge(graph, (unsigned)resource->last_writer, pass);
+        if (use->access & PERIODIC_RESOURCE_READ) bit_set(resource->readers, pass);
+        if (use->access & PERIODIC_RESOURCE_WRITE) {
+            bit_set(resource->writers, pass);
+            resource->last_writer = (int32_t)pass;
+        }
+    }
+    GraphResource *resource = graph_resource(graph, &use->key, 1);
+    if (!resource) return 0;
+    if (use->generation > resource->generation) resource->generation = use->generation;
+    if (use->access & PERIODIC_RESOURCE_READ) bit_set(resource->readers, pass);
+    if (use->access & PERIODIC_RESOURCE_WRITE) {
+        bit_set(resource->writers, pass);
+        resource->last_writer = (int32_t)pass;
+    }
+    return 1;
 }
 
 static void expand_cone(const GraphSnapshot *graph, uint64_t bits[STORE_GRAPH_WORDS]) {
@@ -221,18 +261,12 @@ static void compile_submission(size_t count, uint64_t submission_id, int invalid
             const StoreUse *use = &record->uses[i];
             uint64_t shape = (uint64_t)use->role | ((uint64_t)use->access << 32);
             graph->shape_hash = hash_bytes(graph->shape_hash, &shape, sizeof shape);
-            GraphResource *resource = graph_resource(graph, &use->key, 1);
-            if (!resource) {
+            if (!graph_use(graph, pass, use)) {
                 bit_set(graph->unknown, pass);
                 for (unsigned prior = 0; prior < pass; ++prior) add_edge(graph, prior, pass);
                 last_unknown = (int)pass;
                 continue;
             }
-            if (use->generation > resource->generation) resource->generation = use->generation;
-            if ((use->access & (PERIODIC_RESOURCE_READ | PERIODIC_RESOURCE_WRITE)) && resource->last_writer >= 0)
-                add_edge(graph, (unsigned)resource->last_writer, pass);
-            if (use->access & PERIODIC_RESOURCE_READ) bit_set(resource->readers, pass);
-            if (use->access & PERIODIC_RESOURCE_WRITE) resource->last_writer = (int32_t)pass;
         }
     }
     if (invalid) {
@@ -253,8 +287,10 @@ static void compile_submission(size_t count, uint64_t submission_id, int invalid
         const GraphResource *old = previous->generation ? find_resource(previous, &resource->key) : NULL;
         if (old && old->generation == resource->generation) continue;
         changed++;
-        for (unsigned word = 0; word < STORE_GRAPH_WORDS; ++word)
+        for (unsigned word = 0; word < STORE_GRAPH_WORDS; ++word) {
             graph->invalidated[word] |= resource->readers[word];
+            graph->invalidated[word] |= resource->writers[word];
+        }
     }
     for (unsigned word = 0; word < STORE_GRAPH_WORDS; ++word) graph->invalidated[word] |= graph->unknown[word];
     expand_cone(graph, graph->invalidated);
@@ -345,7 +381,10 @@ void periodic_store_resource(PeriodicResourceKey key, uint64_t generation,
                              uint32_t role, uint8_t access) {
     StoreRecord *record = store.open;
     if (!record || !key.owner || !(access & (PERIODIC_RESOURCE_READ | PERIODIC_RESOURCE_WRITE))) return;
-    unsigned bucket = (unsigned)(key_hash(&key) & (STORE_USE_BUCKETS - 1));
+    if (!key.length) key.length = 1;
+    int range_resource = key.kind == 2 || key.kind == 4;
+    uint64_t use_hash = range_resource ? owner_hash(&key) ^ mix64(role) : key_hash(&key);
+    unsigned bucket = (unsigned)(use_hash & (STORE_USE_BUCKETS - 1));
     for (unsigned probes = 0; probes < STORE_USE_BUCKETS; ++probes) {
         int16_t entry = store.use_buckets[bucket];
         if (entry < 0) {
@@ -357,6 +396,19 @@ void periodic_store_resource(PeriodicResourceKey key, uint64_t generation,
         }
         StoreUse *use = &record->uses[(unsigned)entry];
         if (key_equal(&use->key, &key)) {
+            use->access |= access;
+            if (generation > use->generation) use->generation = generation;
+            return;
+        }
+        if (range_resource && use->key.kind == key.kind && use->key.owner == key.owner &&
+            use->key.plane == key.plane && use->role == role) {
+            uint64_t begin = use->key.offset < key.offset ? use->key.offset : key.offset;
+            uint64_t use_end = use->key.offset + use->key.length;
+            uint64_t key_end = key.offset + key.length;
+            uint64_t end = use_end > key_end ? use_end : key_end;
+            if (end < begin) { record->unknown = 1; return; }
+            use->key.offset = begin;
+            use->key.length = end - begin;
             use->access |= access;
             if (generation > use->generation) use->generation = generation;
             return;
@@ -443,12 +495,35 @@ PeriodicStoreStats periodic_store_stats(void) {
     return stats;
 }
 
+int periodic_store_execution_plan(PeriodicExecutionPlan *plan) {
+    if (!plan || !periodic_store_active()) return 0;
+    int index; const GraphSnapshot *graph = acquire_graph(&index);
+    *plan = (PeriodicExecutionPlan) {
+        .graph_generation=graph->generation,
+        .submission_id=graph->submission_id,
+        .pass_count=graph->pass_count,
+        .graph_valid=graph->valid,
+    };
+    _Static_assert(STORE_GRAPH_WORDS == PERIODIC_EXECUTION_WORDS, "execution bitset ABI");
+    memcpy(plan->execute, graph->invalidated, sizeof plan->execute);
+    release_graph(index);
+    return plan->graph_generation != 0;
+}
+
 size_t periodic_store_resource_cone(PeriodicResourceKey key, uint64_t *pass_ids, size_t capacity) {
     if (!periodic_store_active()) return 0;
     int index; const GraphSnapshot *graph = acquire_graph(&index);
     uint64_t bits[STORE_GRAPH_WORDS] = {0};
-    const GraphResource *resource = find_resource(graph, &key);
-    if (resource) memcpy(bits, resource->readers, sizeof bits);
+    unsigned owner_bucket = (unsigned)(owner_hash(&key) % STORE_RESOURCE_BUCKETS);
+    for (uint32_t entry = graph->owner_buckets[owner_bucket]; entry;
+         entry = graph->resources[entry - 1].owner_next) {
+        const GraphResource *resource = &graph->resources[entry - 1];
+        if (!key_overlaps(&resource->key, &key)) continue;
+        for (unsigned word = 0; word < STORE_GRAPH_WORDS; ++word) {
+            bits[word] |= resource->readers[word];
+            bits[word] |= resource->writers[word];
+        }
+    }
     for (unsigned word = 0; word < STORE_GRAPH_WORDS; ++word) bits[word] |= graph->unknown[word];
     expand_cone(graph, bits);
     size_t count = 0;
@@ -491,7 +566,7 @@ int periodic_store_probe(void) {
     }
     uint64_t cone[8] = {0};
     size_t n = periodic_store_resource_cone(a, cone, 8);
-    if (n != 1 || cone[0] != 20) return 1;
+    if (n != 2 || cone[0] != 10 || cone[1] != 20) return 1;
     n = periodic_store_resource_cone(c, cone, 8);
     if (n != 1 || cone[0] != 30) return 1;
     PeriodicResourceKey rotated = a; rotated.owner = 4;
@@ -504,6 +579,20 @@ int periodic_store_probe(void) {
     if (stats.pass_count != 4 || stats.resource_count != 3 || !stats.graph_valid || stats.dropped_passes ||
         stats.observed_passes != 16 || stats.observed_submissions != 4 ||
         stats.same_shape_submissions != 3 || stats.graph_generation != 4) return 1;
+    PeriodicResourceKey pool = {.owner=8, .offset=64, .length=128, .kind=2};
+    PeriodicResourceKey overlap = {.owner=8, .offset=128, .length=64, .kind=2};
+    PeriodicResourceKey disjoint = {.owner=8, .offset=256, .length=64, .kind=2};
+    periodic_store_pass_begin(50); periodic_store_resource(pool, 1, 400, PERIODIC_RESOURCE_WRITE); periodic_store_pass_end();
+    periodic_store_pass_begin(60); periodic_store_resource(overlap, 1, 401, PERIODIC_RESOURCE_READ); periodic_store_pass_end();
+    periodic_store_pass_begin(70); periodic_store_resource(disjoint, 1, 402, PERIODIC_RESOURCE_READ); periodic_store_pass_end();
+    periodic_store_submit(5); periodic_store_flush();
+    n = periodic_store_resource_cone(pool, cone, 8);
+    if (n != 2 || cone[0] != 50 || cone[1] != 60) return 1;
+    n = periodic_store_resource_cone(disjoint, cone, 8);
+    if (n != 1 || cone[0] != 70) return 1;
+    PeriodicExecutionPlan plan;
+    if (!periodic_store_execution_plan(&plan) || plan.submission_id != 5 || plan.pass_count != 3 || !plan.graph_valid)
+        return 1;
     enum { BENCH_NOTES = 4096, BENCH_ROUNDS = 9 };
     double samples[BENCH_ROUNDS];
     for (unsigned round = 0; round < BENCH_ROUNDS; ++round) {

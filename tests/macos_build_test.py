@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from macos.build import BUILD, compile_runtime, digest, preserve_source_times, probe_headers, stage_sources
-from macos.prepare import llvm_bin
+from macos.prepare import llvm_bin, preparation_identity
 
 
 class PreparationTests(unittest.TestCase):
@@ -83,7 +83,7 @@ class NativeLinkTests(unittest.TestCase):
             headers = ('runtime_tables.h', 'romfs_config.h', 'shared_fonts_config.h', 'native_layout.h', 'native_prompt_textures.h')
             (out / 'preparation.json').write_text(json.dumps({
                 'fixture': 'link-only, no game data', 'version': 'v143',
-                'source_id': (tree.parent.parent / '.source-id').read_text(),
+                'preparation_id': preparation_identity(tree, 'v143'),
                 'layout_sha256': digest(ROOT / 'recomp/layout.py'),
                 'headers': {name: digest(out / name) for name in headers},
             }))
