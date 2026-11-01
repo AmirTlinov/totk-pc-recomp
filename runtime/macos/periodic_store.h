@@ -8,6 +8,7 @@ enum {
     PERIODIC_RESOURCE_READ = 1u << 0,
     PERIODIC_RESOURCE_WRITE = 1u << 1,
     PERIODIC_EXECUTION_WORDS = 8,
+    PERIODIC_EXECUTION_PASSES = 512,
 };
 
 typedef struct {
@@ -40,7 +41,11 @@ typedef struct {
     uint64_t graph_generation;
     uint64_t submission_id;
     uint64_t execute[PERIODIC_EXECUTION_WORDS];
+    uint64_t retained[PERIODIC_EXECUTION_WORDS];
+    uint64_t form_ids[PERIODIC_EXECUTION_PASSES];
+    uint64_t form_anchors[PERIODIC_EXECUTION_PASSES];
     uint32_t pass_count;
+    uint32_t retained_pass_count;
     uint32_t graph_valid;
 } PeriodicExecutionPlan;
 

@@ -9,7 +9,7 @@
 
 enum { RECORD_CAPACITY = 1u << 16, FORM_CLOSE_RETURNS = 3, ANCHOR_SLOTS = 256,
        FORM_CAPACITY = 4096, FORM_BUCKETS = 8192, FORM_COMMAND_LIMIT = 8192,
-       PENDING_FORM_CAPACITY = 512 };
+       PENDING_FORM_CAPACITY = 512, PASS_MAP_CAPACITY = 1u << 15 };
 enum { RECORD_PACKET, RECORD_ANCHOR, RECORD_STOP };
 
 typedef struct {
@@ -17,6 +17,7 @@ typedef struct {
     uint32_t op;
     uint8_t static_mask, dynamic_mask, resource_mask, flags, resource_count;
     uint64_t anchor_id;
+    uint64_t pass_id;
     uint64_t fields[8];
     PeriodicResourceRef resources[4];
 } ObserverRecord;
@@ -39,11 +40,19 @@ typedef struct {
     size_t count, capacity;
     uint64_t hash;
     uint64_t last_anchor;
+    uint64_t pass_id;
+    uint64_t id;
     uint32_t consecutive_returns;
     uint32_t closed;
     uint32_t invalid;
     uint32_t next;
 } CompiledForm;
+
+typedef struct {
+    _Atomic uint64_t pass_id;
+    _Atomic uint64_t form_id;
+    _Atomic uint64_t anchor_id;
+} PassForm;
 
 static struct {
     ObserverRecord *records;
@@ -54,11 +63,13 @@ static struct {
     _Atomic uint64_t dropped, loss_epoch;
     _Atomic uint64_t observed_packets, observed_anchors;
     _Atomic uint64_t learned_forms, closed_forms, invalidated_forms;
+    _Atomic uint64_t mapped_passes;
     _Atomic uint64_t state_generation;
     struct { _Atomic uint64_t anchor, generation; } anchors[ANCHOR_SLOTS];
     _Atomic int active, stopping;
     pthread_t compiler;
     CompiledForm *forms;
+    PassForm pass_forms[PASS_MAP_CAPACITY];
     uint32_t buckets[FORM_BUCKETS];
     size_t form_count;
 } state;
@@ -72,6 +83,14 @@ static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+static uint64_t mix64(uint64_t value) {
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
 }
 
 static int reserve_commands(CompiledForm *form, size_t count) {
@@ -88,6 +107,29 @@ static int reserve_commands(CompiledForm *form, size_t count) {
 static int same_form(const CompiledForm *a, const CompiledForm *b) {
     return a->hash == b->hash && a->count == b->count &&
            !memcmp(a->commands, b->commands, a->count * sizeof *a->commands);
+}
+
+static void publish_pass_form(uint64_t pass_id, uint64_t form_id, uint64_t anchor_id) {
+    if (!pass_id || !form_id) return;
+    PassForm *mapping = &state.pass_forms[mix64(pass_id) & (PASS_MAP_CAPACITY - 1)];
+    atomic_store_explicit(&mapping->pass_id, 0, memory_order_release);
+    atomic_store_explicit(&mapping->form_id, form_id, memory_order_relaxed);
+    atomic_store_explicit(&mapping->anchor_id, anchor_id, memory_order_relaxed);
+    atomic_store_explicit(&mapping->pass_id, pass_id, memory_order_release);
+    atomic_fetch_add_explicit(&state.mapped_passes, 1, memory_order_relaxed);
+}
+
+int periodic_form_for_pass(uint64_t pass_id, uint64_t *form_id, uint64_t *anchor_id) {
+    if (!pass_id || !periodic_form_active()) return 0;
+    PassForm *mapping = &state.pass_forms[mix64(pass_id) & (PASS_MAP_CAPACITY - 1)];
+    uint64_t first = atomic_load_explicit(&mapping->pass_id, memory_order_acquire);
+    if (first != pass_id) return 0;
+    uint64_t form = atomic_load_explicit(&mapping->form_id, memory_order_relaxed);
+    uint64_t anchor = atomic_load_explicit(&mapping->anchor_id, memory_order_relaxed);
+    if (atomic_load_explicit(&mapping->pass_id, memory_order_acquire) != first) return 0;
+    if (form_id) *form_id = form;
+    if (anchor_id) *anchor_id = anchor;
+    return form != 0;
 }
 
 static void forget_forms(void) {
@@ -110,6 +152,7 @@ static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
             form->closed = 1;
             atomic_fetch_add_explicit(&state.closed_forms, 1, memory_order_relaxed);
         }
+        if (form->closed) publish_pass_form(candidate->pass_id, form->id, anchor_id);
         return;
     }
     if (state.form_count == FORM_CAPACITY) {
@@ -117,6 +160,7 @@ static void retain_form(CompiledForm *candidate, uint64_t anchor_id) {
         return;
     }
     candidate->last_anchor = anchor_id;
+    candidate->id = state.form_count + 1;
     candidate->consecutive_returns = 1;
     candidate->next = state.buckets[bucket];
     state.buckets[bucket] = (uint32_t)state.form_count + 1;
@@ -228,6 +272,7 @@ static void *compile_forms(void *unused) {
                 memset(&candidate, 0, sizeof candidate);
                 candidate.hash = UINT64_C(1469598103934665603);
             }
+            candidate.pass_id = record->pass_id;
             in_pass = 1;
         }
         if (in_pass) append_command(&candidate, record);
@@ -297,13 +342,14 @@ int periodic_form_active(void) { return atomic_load_explicit(&state.active, memo
 
 void periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t static_mask,
                              uint8_t dynamic_mask, uint8_t resource_mask, uint8_t flags,
-                             const PeriodicResourceRef resources[8]) {
+                             const PeriodicResourceRef resources[8], uint64_t pass_id) {
     if (!periodic_form_active()) return;
     uint64_t position;
     ObserverRecord *record = reserve_record(&position);
     if (!record) return;
     record->kind=RECORD_PACKET; record->op=op; record->static_mask=static_mask;
     record->dynamic_mask=dynamic_mask; record->resource_mask=resource_mask; record->flags=flags;
+    record->pass_id=pass_id;
     memcpy(record->fields, fields, sizeof record->fields);
     unsigned count = 0;
     for (unsigned i = 0; i < 8; ++i) if (resource_mask & (1u << i)) {
@@ -360,6 +406,7 @@ PeriodicFormStats periodic_form_stats(void) {
         .dropped_records=atomic_load_explicit(&state.dropped, memory_order_relaxed),
         .learned_forms=atomic_load_explicit(&state.learned_forms, memory_order_relaxed),
         .closed_forms=atomic_load_explicit(&state.closed_forms, memory_order_relaxed),
+        .mapped_passes=atomic_load_explicit(&state.mapped_passes, memory_order_relaxed),
         .invalidated_forms=atomic_load_explicit(&state.invalidated_forms, memory_order_relaxed),
         .state_generation=atomic_load_explicit(&state.state_generation, memory_order_relaxed),
     };
@@ -372,11 +419,12 @@ void periodic_form_finish(void) {
     atomic_store_explicit(&state.stopping, 1, memory_order_relaxed);
     pthread_join(state.compiler, NULL);
     if (atomic_load_explicit(&state.observed_anchors, memory_order_relaxed))
-        fprintf(stderr, "[totk] periodic forms: %llu anchors, %llu packets, %llu learned, %llu closed, %llu invalidated, %llu dropped\n",
+        fprintf(stderr, "[totk] periodic forms: %llu anchors, %llu packets, %llu learned, %llu closed, %llu mapped passes, %llu invalidated, %llu dropped\n",
                 (unsigned long long)atomic_load_explicit(&state.observed_anchors, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&state.observed_packets, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&state.learned_forms, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&state.closed_forms, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&state.mapped_passes, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&state.invalidated_forms, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&state.dropped, memory_order_relaxed));
     forget_forms();
@@ -391,22 +439,24 @@ int periodic_form_probe(void) {
     const uint64_t begin[8] = {11}, state_packet[8] = {7}, draw_a[8] = {3, 0, 120}, end[8] = {0};
     for (uint64_t anchor = 0; anchor < 3; ++anchor) {
         uint64_t draw[8]; memcpy(draw, draw_a, sizeof draw); draw[1] = anchor * 4;
-        periodic_observe_packet(100, begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN, NULL);
-        periodic_observe_packet(101, state_packet, 1, 0, 0, 0, NULL);
-        periodic_observe_packet(102, draw, 5, 2, 0, PERIODIC_PACKET_DRAW, NULL);
-        periodic_observe_packet(103, end, 1, 0, 0, PERIODIC_PACKET_PASS_END, NULL);
+        periodic_observe_packet(100, begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN, NULL, 1000 + anchor);
+        periodic_observe_packet(101, state_packet, 1, 0, 0, 0, NULL, 0);
+        periodic_observe_packet(102, draw, 5, 2, 0, PERIODIC_PACKET_DRAW, NULL, 0);
+        periodic_observe_packet(103, end, 1, 0, 0, PERIODIC_PACKET_PASS_END, NULL, 0);
         periodic_anchor_publish(anchor);
     }
     periodic_form_flush();
     PeriodicFormStats stats = periodic_form_stats();
-    if (stats.closed_forms != 1 || stats.learned_forms != 1 || stats.dropped_records ||
+    uint64_t form_id = 0, mapped_anchor = 0;
+    if (!periodic_form_for_pass(1002, &form_id, &mapped_anchor) || form_id != 1 || mapped_anchor != 2) return 1;
+    if (stats.closed_forms != 1 || stats.learned_forms != 1 || stats.mapped_passes != 1 || stats.dropped_records ||
         stats.observed_packets != 12 || stats.observed_anchors != 3 || stats.state_generation != 3) return 1;
     enum { BENCH_PACKETS = 4096, BENCH_ROUNDS = 9 };
     double samples[BENCH_ROUNDS];
     for (unsigned round = 0; round < BENCH_ROUNDS; ++round) {
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         for (unsigned i = 0; i < BENCH_PACKETS; ++i)
-            periodic_observe_packet(104, draw_a, 0, 7, 0, 0, NULL);
+            periodic_observe_packet(104, draw_a, 0, 7, 0, 0, NULL, 0);
         samples[round] = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / (double)BENCH_PACKETS;
         periodic_form_flush();
     }
@@ -417,6 +467,6 @@ int periodic_form_probe(void) {
     }
     double observe_ns = samples[BENCH_ROUNDS / 2];
     if (periodic_form_stats().dropped_records) return 1;
-    printf("{\"probe\":\"periodic-form\",\"status\":\"pass\",\"closed_forms\":1,\"hot_path_allocations\":0,\"observe_ns\":%.3f}\n", observe_ns);
+    printf("{\"probe\":\"periodic-form\",\"status\":\"pass\",\"closed_forms\":1,\"mapped_passes\":1,\"hot_path_allocations\":0,\"observe_ns\":%.3f}\n", observe_ns);
     return 0;
 }

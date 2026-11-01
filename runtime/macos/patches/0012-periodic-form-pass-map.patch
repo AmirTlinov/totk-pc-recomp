@@ -1,0 +1,46 @@
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+index 1e6fca6..be3b27c 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -1003,6 +1003,7 @@ static void up_owner_check(const char *where) {
+ static void cg_flush(void); static int cg_op_safe(unsigned op); static int cg_rt_match(const p_set_rt *r); static void cg_stats_line(void);
+ static void skv_set(int on); static int skv_retest(void);   // invisible-draw skipping: runtime switch (flag skip_invisible) and the retest period
+ static uint64_t g_sub_serial;   // 第几次提交（并行预编「每次提交只预测一次」用） | Submission index (used by the parallel precompile's 'predict only once per submission')
++static uint64_t g_periodic_render_pass_id;
+ static void periodic_guest_tracker_register(void);
+ enum { BAR_RENDER_WRITES = 128 };
+ static uint64_t g_bar_render_writes[BAR_RENDER_WRITES];
+@@ -3845,8 +3846,9 @@ static PeriodicResourceKey periodic_tex_key(const tex_t *texture, uint32_t plane
+ }
+ 
+ static void periodic_note_pass_attachments(MTL4RenderPassDescriptor *pd) {
++    g_periodic_render_pass_id = g_pass.serial;
+     if (!periodic_store_active()) return;
+-    periodic_store_pass_begin(g_pass.serial);
++    periodic_store_pass_begin(g_periodic_render_pass_id);
+     for (int i = 0; i < R.rt.n && i < 8; ++i) {
+         MTLRenderPassColorAttachmentDescriptor *attachment = pd.colorAttachments[i];
+         if (!attachment.texture || !R.rt.color[i]) continue;
+diff --git a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+index 60ed1eb..d9812fe 100644
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+@@ -84,7 +84,8 @@ static inline void rs_observe(const nvn_encode_packet *p) {
+         case RS_STORE: fixed = 0x07; break;
+         default: dynamic = 0xff; break;
+     }
+-    periodic_observe_packet((uint32_t)p->op, p->u, fixed, dynamic, resources, flags, refs);
++    periodic_observe_packet((uint32_t)p->op, p->u, fixed, dynamic, resources, flags, refs,
++                            p->op == RS_BEGIN ? p->u[6] : 0);
+ }
+ static inline uint64_t rs_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *vt, id<MTL4ArgumentTable> *ft, const nvn_encode_packet *p) {
+@@ -223,7 +224,7 @@ static id rs_pass_begin(MTL4RenderPassDescriptor *d, id<MTL4ArgumentTable> vt, i
+     if (g_rs_active) MDIE("render stream: pass begun while another streamed pass is open");
+     g_rs_active = 1; g_rs_passes++;
+     rs_put((nvn_encode_packet){.op = RS_BEGIN, .u = {(uint64_t)(uintptr_t)CFBridgingRetain(d), (uint64_t)(uintptr_t)(__bridge void *)vt, (uint64_t)(uintptr_t)(__bridge void *)ft,
+-                                                     (uint64_t)(uintptr_t)(__bridge void *)cb, (uint64_t)bar_start, vis}}, 1);
++                                                     (uint64_t)(uintptr_t)(__bridge void *)cb, (uint64_t)bar_start, vis, g_periodic_render_pass_id}}, 1);
+     return g_rs_sentinel;
+ }
+ static int rs_using(id e) {

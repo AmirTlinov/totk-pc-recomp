@@ -23,6 +23,7 @@ typedef struct {
     uint64_t dropped_records;
     uint64_t learned_forms;
     uint64_t closed_forms;
+    uint64_t mapped_passes;
     uint64_t invalidated_forms;
     uint64_t state_generation;
 } PeriodicFormStats;
@@ -34,7 +35,11 @@ void periodic_form_finish(void);
 int periodic_form_active(void);
 void periodic_observe_packet(uint32_t op, const uint64_t fields[8], uint8_t static_mask,
                              uint8_t dynamic_mask, uint8_t resource_mask, uint8_t flags,
-                             const PeriodicResourceRef resources[8]);
+                             const PeriodicResourceRef resources[8], uint64_t pass_id);
+
+// Closed forms are related to the concrete pass occurrence after compilation.
+// The map is a bounded recent-history table for anchor-plan compilation.
+int periodic_form_for_pass(uint64_t pass_id, uint64_t *form_id, uint64_t *anchor_id);
 
 // An anchor is a guest-rendered state. A phase renderer may publish additional
 // states without advancing the guest simulation clock.
