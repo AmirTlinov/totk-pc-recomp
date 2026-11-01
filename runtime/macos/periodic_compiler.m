@@ -45,48 +45,36 @@ static void queue_form(uint64_t form_id) {
     atomic_fetch_add_explicit(&compiler.queued_forms, 1, memory_order_relaxed);
 }
 
-static void finish_cluster(PeriodicICBCluster *clusters, uint32_t *count,
-                           uint32_t first, uint32_t commands, uint32_t draws,
-                           uint32_t dynamic_slots, uint32_t resource_slots) {
-    if (!commands || !draws) return;
-    clusters[(*count)++] = (PeriodicICBCluster) {
-        .first_command=first,
-        .command_count=commands,
-        .draw_count=draws,
-        .dynamic_slot_count=dynamic_slots,
-        .resource_slot_count=resource_slots,
-        .icb_eligible=draws >= 2 && commands <= PERIODIC_ICB_PACKET_LIMIT,
-    };
-}
-
 static PeriodicCompiledForm *compile_form(uint64_t form_id) {
     PeriodicFormSnapshot snapshot;
     if (!periodic_form_snapshot(form_id, &snapshot) || !snapshot.command_count) return NULL;
     PeriodicICBCluster *clusters = calloc(snapshot.command_count, sizeof *clusters);
     if (!clusters) return NULL;
-    uint32_t cluster_count = 0, first = 0, commands = 0, draws = 0, dynamic_slots = 0, resource_slots = 0;
+    int64_t last_argument_change = -1;
+    for (uint32_t i = 0; i < snapshot.command_count; ++i)
+        if (snapshot.commands[i].flags & PERIODIC_PACKET_ARGUMENT_CHANGE)
+            last_argument_change = i;
+    uint32_t cluster_count = 0;
     uint32_t total_draws = 0, eligible_draws = 0, total_dynamic = 0, total_resources = 0;
     for (uint32_t i = 0; i < snapshot.command_count; ++i) {
         const PeriodicFormCommand *command = &snapshot.commands[i];
-        if (!(command->flags & PERIODIC_PACKET_ICB_COMMAND)) {
-            if (commands) {
-                finish_cluster(clusters, &cluster_count, first, commands, draws, dynamic_slots, resource_slots);
-                if (draws >= 2 && commands <= PERIODIC_ICB_PACKET_LIMIT) eligible_draws += draws;
-            }
-            commands = draws = dynamic_slots = resource_slots = 0;
-            continue;
+        if (command->flags & PERIODIC_PACKET_ICB_COMMAND) {
+            total_dynamic += (uint32_t)__builtin_popcount(command->dynamic_mask);
+            total_resources += (uint32_t)__builtin_popcount(command->resource_mask);
         }
-        if (!commands) first = i;
-        commands++;
-        dynamic_slots += (uint32_t)__builtin_popcount(command->dynamic_mask);
-        resource_slots += (uint32_t)__builtin_popcount(command->resource_mask);
-        if (command->flags & PERIODIC_PACKET_DRAW) { draws++; total_draws++; }
-        total_dynamic += (uint32_t)__builtin_popcount(command->dynamic_mask);
-        total_resources += (uint32_t)__builtin_popcount(command->resource_mask);
-    }
-    if (commands) {
-        finish_cluster(clusters, &cluster_count, first, commands, draws, dynamic_slots, resource_slots);
-        if (draws >= 2 && commands <= PERIODIC_ICB_PACKET_LIMIT) eligible_draws += draws;
+        if (!(command->flags & PERIODIC_PACKET_DRAW)) continue;
+        total_draws++;
+        if (!(command->flags & PERIODIC_PACKET_ICB_COMMAND)) continue;
+        int eligible = (int64_t)i > last_argument_change;
+        clusters[cluster_count++] = (PeriodicICBCluster) {
+            .first_command=i,
+            .command_count=1,
+            .draw_count=1,
+            .dynamic_slot_count=(uint32_t)__builtin_popcount(command->dynamic_mask),
+            .resource_slot_count=(uint32_t)__builtin_popcount(command->resource_mask),
+            .icb_eligible=eligible,
+        };
+        eligible_draws += eligible;
     }
     PeriodicCompiledForm *program = calloc(1, sizeof *program);
     if (!program) { free(clusters); return NULL; }
@@ -295,12 +283,14 @@ int periodic_compiler_probe(void) {
     const uint64_t draw[8] = {3, 0, 12}, boundary[8] = {0}, end[8] = {0};
     for (uint64_t anchor = 0; anchor < 3; ++anchor) {
         periodic_observe_packet(100, begin, 1, 0, 0, PERIODIC_PACKET_PASS_BEGIN | PERIODIC_PACKET_ICB_BREAK, NULL, 7000 + anchor);
-        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
-        periodic_observe_packet(102, address, 3, 0, 4, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
+        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(102, address, 3, 0, 4,
+            PERIODIC_PACKET_ICB_BREAK | PERIODIC_PACKET_ARGUMENT_CHANGE, NULL, 0);
         for (unsigned draw_index = 0; draw_index < 3; ++draw_index)
             periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(104, boundary, 0, 1, 0, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
-        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_BREAK, NULL, 0);
+        periodic_observe_packet(101, pso, 0, 0, 1, PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(103, draw, 1, 6, 0, PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(105, end, 1, 0, 0, PERIODIC_PACKET_PASS_END | PERIODIC_PACKET_ICB_BREAK, NULL, 0);
         periodic_anchor_publish(anchor);
@@ -308,9 +298,9 @@ int periodic_compiler_probe(void) {
     periodic_form_flush(); periodic_compiler_flush();
     const PeriodicCompiledForm *program = periodic_compiler_form(1);
     PeriodicCompilerStats stats = periodic_compiler_stats();
-    if (!program || program->cluster_count != 2 || program->draw_count != 4 ||
-        program->eligible_draw_count != 3 || program->dynamic_slot_count != 8 ||
-        program->resource_slot_count != 0 || stats.compiled_forms != 1 || stats.dropped_forms || !probe_metal_icb()) return 1;
-    printf("{\"probe\":\"periodic-compiler\",\"status\":\"pass\",\"forms\":1,\"clusters\":2,\"draws\":4,\"icb_eligible_draws\":3,\"metal4_icb\":true}\n");
+    if (!program || program->cluster_count != 5 || program->draw_count != 5 ||
+        program->eligible_draw_count != 4 || program->dynamic_slot_count != 10 ||
+        program->resource_slot_count != 2 || stats.compiled_forms != 1 || stats.dropped_forms || !probe_metal_icb()) return 1;
+    printf("{\"probe\":\"periodic-compiler\",\"status\":\"pass\",\"forms\":1,\"clusters\":5,\"draws\":5,\"icb_eligible_draws\":4,\"metal4_icb\":true}\n");
     return 0;
 }

@@ -11,8 +11,10 @@
 #include <string.h>
 #include <time.h>
 
-enum { EXECUTOR_CACHE_SLOTS = 1024, EXECUTOR_CACHE_WAYS = 4 };
+enum { EXECUTOR_CACHE_SLOTS = 16384, EXECUTOR_CACHE_WAYS = 4, EXECUTOR_CAPSULE_LIMIT = 8 };
 enum { CACHE_EMPTY, CACHE_COMPILING, CACHE_READY, CACHE_FAILED, CACHE_WRITING };
+enum { STATE_PSO, STATE_DSS, STATE_CULL, STATE_WINDING, STATE_FILL, STATE_BIAS,
+       STATE_CLIP, STATE_COUNT };
 
 typedef struct {
     uint32_t op;
@@ -29,7 +31,7 @@ typedef struct {
     uint32_t packet_count;
     uint32_t draw_count;
     uint32_t uses_index_buffer;
-    ExecutorPacket packets[PERIODIC_ICB_PACKET_LIMIT];
+    ExecutorPacket packets[EXECUTOR_CAPSULE_LIMIT];
     __strong id<MTLIndirectCommandBuffer> commands;
 } ExecutorCache;
 
@@ -38,7 +40,13 @@ static struct {
     PeriodicBufferGenerationFn buffer_generation;
     PeriodicResolveBufferFn resolve_buffer;
     PeriodicMakeResidentFn make_resident;
+    uint32_t state_mask;
+    int allow_indexed;
     ExecutorCache *cache;
+    uint32_t *compile_slots;
+    _Alignas(64) _Atomic uint64_t compile_read;
+    _Alignas(64) _Atomic uint64_t compile_write;
+    uint64_t producer_write, producer_read_cache;
     _Atomic uint64_t tracked_passes, rejected_passes, queued_clusters, compiled_clusters;
     _Atomic uint64_t executed_clusters, fallback_clusters, executed_draws;
     _Atomic int active, stopping;
@@ -49,11 +57,27 @@ static struct {
         const PeriodicCompiledForm *program;
         uint64_t form_id;
         uint32_t command_index, cluster_index;
-        uint32_t packet_count;
-        ExecutorPacket packets[PERIODIC_ICB_PACKET_LIMIT];
+        __unsafe_unretained id<MTL4ArgumentTable> vertex_table;
+        __unsafe_unretained id<MTL4ArgumentTable> fragment_table;
+        ExecutorPacket states[STATE_COUNT];
+        uint8_t state_valid[STATE_COUNT];
         int tracking;
     } current;
 } executor;
+
+static int queue_compile(uint32_t slot) {
+    uint64_t write = executor.producer_write;
+    uint64_t read = executor.producer_read_cache;
+    if (write - read == EXECUTOR_CACHE_SLOTS) {
+        read = atomic_load_explicit(&executor.compile_read, memory_order_acquire);
+        executor.producer_read_cache = read;
+    }
+    if (write - read == EXECUTOR_CACHE_SLOTS) return 0;
+    executor.compile_slots[write & (EXECUTOR_CACHE_SLOTS - 1)] = slot;
+    executor.producer_write = write + 1;
+    atomic_store_explicit(&executor.compile_write, write + 1, memory_order_release);
+    return 1;
+}
 
 static uint64_t mix64(uint64_t value) {
     value ^= value >> 30; value *= UINT64_C(0xbf58476d1ce4e5b9);
@@ -67,6 +91,56 @@ static int command_matches(const PeriodicFormCommand *expected, uint32_t op,
     for (unsigned field = 0; field < 8; ++field)
         if ((expected->static_mask & (1u << field)) && expected->fields[field] != fields[field]) return 0;
     return 1;
+}
+
+static int state_slot(uint32_t op) {
+    switch (op) {
+        case PERIODIC_METAL_PSO: return STATE_PSO;
+        case PERIODIC_METAL_DSS: return STATE_DSS;
+        case PERIODIC_METAL_CULL: return STATE_CULL;
+        case PERIODIC_METAL_WINDING: return STATE_WINDING;
+        case PERIODIC_METAL_FILL: return STATE_FILL;
+        case PERIODIC_METAL_BIAS: return STATE_BIAS;
+        case PERIODIC_METAL_CLIP: return STATE_CLIP;
+        default: return -1;
+    }
+}
+
+static int is_draw(uint32_t op) {
+    return op == PERIODIC_METAL_DRAW || op == PERIODIC_METAL_INSTANCED ||
+           op == PERIODIC_METAL_INDEXED;
+}
+
+static void release_packet_object(const ExecutorPacket *packet) {
+    if ((packet->op == PERIODIC_METAL_PSO || packet->op == PERIODIC_METAL_DSS) &&
+        packet->fields[0]) CFRelease((CFTypeRef)(uintptr_t)packet->fields[0]);
+}
+
+static void retain_packet_object(const ExecutorPacket *packet) {
+    if ((packet->op == PERIODIC_METAL_PSO || packet->op == PERIODIC_METAL_DSS) &&
+        packet->fields[0]) CFRetain((CFTypeRef)(uintptr_t)packet->fields[0]);
+}
+
+static void encode_state(id<MTL4RenderCommandEncoder> encoder, const ExecutorPacket *packet) {
+    const uint64_t *u = packet->fields;
+    switch (packet->op) {
+        case PERIODIC_METAL_PSO:
+            [encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)(void *)(uintptr_t)u[0]];
+            break;
+        case PERIODIC_METAL_DSS:
+            [encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)(void *)(uintptr_t)u[0]];
+            break;
+        case PERIODIC_METAL_CULL: [encoder setCullMode:(MTLCullMode)u[0]]; break;
+        case PERIODIC_METAL_WINDING: [encoder setFrontFacingWinding:(MTLWinding)u[0]]; break;
+        case PERIODIC_METAL_FILL: [encoder setTriangleFillMode:(MTLTriangleFillMode)u[0]]; break;
+        case PERIODIC_METAL_BIAS: {
+            float value[3]; memcpy(value, u, sizeof value);
+            [encoder setDepthBias:value[0] slopeScale:value[1] clamp:value[2]];
+            break;
+        }
+        case PERIODIC_METAL_CLIP: [encoder setDepthClipMode:(MTLDepthClipMode)u[0]]; break;
+        default: break;
+    }
 }
 
 static void encode_draw(id<MTL4RenderCommandEncoder> encoder, const ExecutorPacket *packet) {
@@ -91,6 +165,26 @@ static void encode_draw(id<MTL4RenderCommandEncoder> encoder, const ExecutorPack
     }
 }
 
+static void restore_state(void) {
+    for (unsigned slot = 0; slot < STATE_COUNT; ++slot)
+        if (executor.current.state_valid[slot])
+            encode_state(executor.current.encoder, &executor.current.states[slot]);
+}
+
+static void reset_current(void) {
+    for (unsigned slot = 0; slot < STATE_COUNT; ++slot)
+        if (executor.current.state_valid[slot]) release_packet_object(&executor.current.states[slot]);
+    memset(&executor.current, 0, sizeof executor.current);
+}
+
+static void capture_state(uint32_t op, const uint64_t fields[8]) {
+    unsigned slot = (unsigned)state_slot(op);
+    if (executor.current.state_valid[slot]) release_packet_object(&executor.current.states[slot]);
+    executor.current.states[slot].op = op;
+    memcpy(executor.current.states[slot].fields, fields, sizeof executor.current.states[slot].fields);
+    executor.current.state_valid[slot] = 1;
+}
+
 static uint64_t cache_key(uint64_t form_id, uint32_t cluster_index,
                           const ExecutorPacket *packets, uint32_t count,
                           uint64_t generation, int uses_index_buffer) {
@@ -113,30 +207,38 @@ static int packets_equal(const ExecutorCache *cache, const ExecutorPacket *packe
     return !memcmp(cache->packets, packets, (size_t)count * sizeof *packets);
 }
 
-static void finish_cluster(void) {
-    uint32_t count = executor.current.packet_count;
-    if (!count) return;
-    int uses_index_buffer = 0;
-    for (uint32_t packet = 0; packet < count; ++packet)
-        uses_index_buffer |= executor.current.packets[packet].op == PERIODIC_METAL_INDEXED;
-    uint64_t generation = executor.buffer_generation ? executor.buffer_generation() : 0;
-    uint64_t key = cache_key(executor.current.form_id, executor.current.cluster_index,
-                             executor.current.packets, count, generation, uses_index_buffer);
+static void execute_draw_capsule(uint32_t cluster_index, uint32_t op, const uint64_t fields[8]) {
+    ExecutorPacket packets[EXECUTOR_CAPSULE_LIMIT] = {0};
+    uint32_t count = 0;
+    for (unsigned slot = 0; slot < STATE_COUNT; ++slot)
+        if (executor.current.state_valid[slot]) packets[count++] = executor.current.states[slot];
+    packets[count].op = op;
+    memcpy(packets[count++].fields, fields, sizeof packets[0].fields);
+    int uses_index_buffer = op == PERIODIC_METAL_INDEXED;
+    uint64_t generation = uses_index_buffer && executor.buffer_generation
+        ? executor.buffer_generation() : 0;
+    uint64_t key = cache_key(executor.current.form_id, cluster_index, packets, count,
+                             generation, uses_index_buffer);
     unsigned first = (unsigned)(mix64(key) & (EXECUTOR_CACHE_SLOTS - 1));
     for (unsigned way = 0; way < EXECUTOR_CACHE_WAYS; ++way) {
         ExecutorCache *cache = &executor.cache[(first + way) & (EXECUTOR_CACHE_SLOTS - 1)];
         if (atomic_load_explicit(&cache->state, memory_order_acquire) == CACHE_READY &&
-            packets_equal(cache, executor.current.packets, count, generation, key)) {
+            packets_equal(cache, packets, count, generation, key)) {
+            if (executor.current.vertex_table)
+                [executor.current.encoder setArgumentTable:executor.current.vertex_table
+                                                  atStages:MTLRenderStageVertex];
+            if (executor.current.fragment_table)
+                [executor.current.encoder setArgumentTable:executor.current.fragment_table
+                                                  atStages:MTLRenderStageFragment];
             [executor.current.encoder executeCommandsInBuffer:cache->commands
                                                      withRange:NSMakeRange(0, cache->draw_count)];
             atomic_fetch_add_explicit(&executor.executed_clusters, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&executor.executed_draws, cache->draw_count, memory_order_relaxed);
-            executor.current.packet_count = 0;
             return;
         }
     }
-    for (uint32_t packet = 0; packet < count; ++packet)
-        encode_draw(executor.current.encoder, &executor.current.packets[packet]);
+    restore_state();
+    encode_draw(executor.current.encoder, &packets[count - 1]);
     atomic_fetch_add_explicit(&executor.fallback_clusters, 1, memory_order_relaxed);
     for (unsigned way = 0; way < EXECUTOR_CACHE_WAYS; ++way) {
         ExecutorCache *cache = &executor.cache[(first + way) & (EXECUTOR_CACHE_SLOTS - 1)];
@@ -148,37 +250,75 @@ static void finish_cluster(void) {
         cache->form_id = executor.current.form_id;
         cache->cluster_index = executor.current.cluster_index;
         cache->packet_count = count;
-        cache->draw_count = count;
+        cache->draw_count = 1;
         cache->buffer_generation = generation;
         cache->uses_index_buffer = uses_index_buffer;
-        memcpy(cache->packets, executor.current.packets, (size_t)count * sizeof *cache->packets);
+        memcpy(cache->packets, packets, (size_t)count * sizeof *cache->packets);
+        for (uint32_t packet = 0; packet < count; ++packet)
+            retain_packet_object(&cache->packets[packet]);
         atomic_store_explicit(&cache->state, CACHE_COMPILING, memory_order_release);
-        atomic_fetch_add_explicit(&executor.queued_clusters, 1, memory_order_relaxed);
+        if (queue_compile((uint32_t)(cache - executor.cache)))
+            atomic_fetch_add_explicit(&executor.queued_clusters, 1, memory_order_relaxed);
+        else {
+            for (uint32_t packet = 0; packet < count; ++packet)
+                release_packet_object(&cache->packets[packet]);
+            atomic_store_explicit(&cache->state, CACHE_FAILED, memory_order_release);
+        }
         break;
     }
-    executor.current.packet_count = 0;
 }
 
 static int build_cache(ExecutorCache *cache) {
     MTLIndirectCommandBufferDescriptor *descriptor = [MTLIndirectCommandBufferDescriptor new];
-    descriptor.commandTypes = MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawIndexed;
-    descriptor.inheritPipelineState = YES;
+    int has_pipeline = 0, has_depth_stencil = 0, has_depth_bias = 0, has_depth_clip = 0;
+    int has_cull = 0, has_winding = 0, has_fill = 0, indexed = 0;
+    for (uint32_t index = 0; index < cache->packet_count; ++index) {
+        switch (cache->packets[index].op) {
+            case PERIODIC_METAL_PSO: has_pipeline = 1; break;
+            case PERIODIC_METAL_DSS: has_depth_stencil = 1; break;
+            case PERIODIC_METAL_BIAS: has_depth_bias = 1; break;
+            case PERIODIC_METAL_CLIP: has_depth_clip = 1; break;
+            case PERIODIC_METAL_CULL: has_cull = 1; break;
+            case PERIODIC_METAL_WINDING: has_winding = 1; break;
+            case PERIODIC_METAL_FILL: has_fill = 1; break;
+            case PERIODIC_METAL_INDEXED: indexed = 1; break;
+            default: break;
+        }
+    }
+    descriptor.commandTypes = indexed ? MTLIndirectCommandTypeDrawIndexed : MTLIndirectCommandTypeDraw;
+    descriptor.inheritPipelineState = !has_pipeline;
     descriptor.inheritBuffers = YES;
-    descriptor.inheritDepthStencilState = YES;
-    descriptor.inheritDepthBias = YES;
-    descriptor.inheritDepthClipMode = YES;
-    descriptor.inheritCullMode = YES;
-    descriptor.inheritFrontFacingWinding = YES;
-    descriptor.inheritTriangleFillMode = YES;
+    descriptor.inheritDepthStencilState = !has_depth_stencil;
+    descriptor.inheritDepthBias = !has_depth_bias;
+    descriptor.inheritDepthClipMode = !has_depth_clip;
+    descriptor.inheritCullMode = !has_cull;
+    descriptor.inheritFrontFacingWinding = !has_winding;
+    descriptor.inheritTriangleFillMode = !has_fill;
     id<MTLIndirectCommandBuffer> commands = [executor.device
         newIndirectCommandBufferWithDescriptor:descriptor maxCommandCount:cache->draw_count
         options:MTLResourceStorageModeShared];
     if (!commands) return 0;
+    id<MTLIndirectRenderCommand> command = [commands indirectRenderCommandAtIndex:0];
     for (uint32_t index = 0; index < cache->packet_count; ++index) {
         const ExecutorPacket *packet = &cache->packets[index];
         const uint64_t *u = packet->fields;
-        id<MTLIndirectRenderCommand> command = [commands indirectRenderCommandAtIndex:index];
         switch (packet->op) {
+            case PERIODIC_METAL_PSO:
+                [command setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)(void *)(uintptr_t)u[0]];
+                if (executor.make_resident) executor.make_resident((void *)(uintptr_t)u[0]);
+                break;
+            case PERIODIC_METAL_DSS:
+                [command setDepthStencilState:(__bridge id<MTLDepthStencilState>)(void *)(uintptr_t)u[0]];
+                break;
+            case PERIODIC_METAL_CULL: [command setCullMode:(MTLCullMode)u[0]]; break;
+            case PERIODIC_METAL_WINDING: [command setFrontFacingWinding:(MTLWinding)u[0]]; break;
+            case PERIODIC_METAL_FILL: [command setTriangleFillMode:(MTLTriangleFillMode)u[0]]; break;
+            case PERIODIC_METAL_BIAS: {
+                float value[3]; memcpy(value, u, sizeof value);
+                [command setDepthBias:value[0] slopeScale:value[1] clamp:value[2]];
+                break;
+            }
+            case PERIODIC_METAL_CLIP: [command setDepthClipMode:(MTLDepthClipMode)u[0]]; break;
             case PERIODIC_METAL_DRAW:
                 [command drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1]
                             vertexCount:(NSUInteger)u[2] instanceCount:1 baseInstance:0];
@@ -210,17 +350,21 @@ static void *compile_clusters(void *unused) {
     (void)unused;
     pthread_setname_np("TOTK periodic ICB");
     for (;;) @autoreleasepool {
-        int found = 0;
-        for (unsigned slot = 0; slot < EXECUTOR_CACHE_SLOTS; ++slot) {
-            ExecutorCache *cache = &executor.cache[slot];
-            if (atomic_load_explicit(&cache->state, memory_order_acquire) != CACHE_COMPILING) continue;
-            found = 1;
-            int built = build_cache(cache);
-            if (built) atomic_fetch_add_explicit(&executor.compiled_clusters, 1, memory_order_relaxed);
-            atomic_store_explicit(&cache->state, built ? CACHE_READY : CACHE_FAILED, memory_order_release);
+        uint64_t read = atomic_load_explicit(&executor.compile_read, memory_order_relaxed);
+        uint64_t write = atomic_load_explicit(&executor.compile_write, memory_order_acquire);
+        if (read == write) {
+            if (atomic_load_explicit(&executor.stopping, memory_order_relaxed)) break;
+            struct timespec pause = {.tv_nsec=1000000}; nanosleep(&pause, NULL);
+            continue;
         }
-        if (atomic_load_explicit(&executor.stopping, memory_order_relaxed)) break;
-        if (!found) { struct timespec pause = {.tv_nsec=1000000}; nanosleep(&pause, NULL); }
+        ExecutorCache *cache = &executor.cache[executor.compile_slots[read & (EXECUTOR_CACHE_SLOTS - 1)]];
+        int built = atomic_load_explicit(&cache->state, memory_order_acquire) == CACHE_COMPILING &&
+                    build_cache(cache);
+        for (uint32_t packet = 0; packet < cache->packet_count; ++packet)
+            release_packet_object(&cache->packets[packet]);
+        if (built) atomic_fetch_add_explicit(&executor.compiled_clusters, 1, memory_order_relaxed);
+        atomic_store_explicit(&cache->state, built ? CACHE_READY : CACHE_FAILED, memory_order_release);
+        atomic_store_explicit(&executor.compile_read, read + 1, memory_order_release);
     }
     return NULL;
 }
@@ -235,9 +379,16 @@ void periodic_executor_init(id<MTLDevice> device,
     executor.buffer_generation = buffer_generation;
     executor.resolve_buffer = resolve_buffer;
     executor.make_resident = make_resident;
+    const char *state_mask = getenv("TOTK_PERIODIC_ICB_STATE_MASK");
+    executor.state_mask = state_mask ? (uint32_t)strtoul(state_mask, NULL, 0) : (1u << STATE_COUNT) - 1u;
+    const char *indexed = getenv("TOTK_PERIODIC_ICB_INDEXED");
+    executor.allow_indexed = !indexed || strcmp(indexed, "0");
     executor.cache = calloc(EXECUTOR_CACHE_SLOTS, sizeof *executor.cache);
-    if (!executor.cache || pthread_create(&executor.compiler, NULL, compile_clusters, NULL)) {
-        free(executor.cache); executor.cache = NULL; executor.device = nil; return;
+    executor.compile_slots = calloc(EXECUTOR_CACHE_SLOTS, sizeof *executor.compile_slots);
+    if (!executor.cache || !executor.compile_slots ||
+        pthread_create(&executor.compiler, NULL, compile_clusters, NULL)) {
+        free(executor.cache); free(executor.compile_slots);
+        executor.cache = NULL; executor.compile_slots = NULL; executor.device = nil; return;
     }
     atomic_store_explicit(&executor.active, 1, memory_order_release);
     atexit(periodic_executor_finish);
@@ -247,7 +398,7 @@ int periodic_executor_active(void) { return atomic_load_explicit(&executor.activ
 
 int periodic_executor_begin(uint64_t form_id, id<MTL4RenderCommandEncoder> encoder,
                             const uint64_t fields[8]) {
-    memset(&executor.current, 0, sizeof executor.current);
+    reset_current();
     if (!periodic_executor_active() || !form_id || !encoder ||
         !periodic_form_snapshot(form_id, &executor.current.form) ||
         !(executor.current.program = periodic_compiler_form(form_id)) ||
@@ -255,6 +406,8 @@ int periodic_executor_begin(uint64_t form_id, id<MTL4RenderCommandEncoder> encod
         !command_matches(&executor.current.form.commands[0], PERIODIC_METAL_BEGIN, fields)) return 0;
     executor.current.encoder = encoder;
     executor.current.form_id = form_id;
+    executor.current.vertex_table = (__bridge id<MTL4ArgumentTable>)(void *)(uintptr_t)fields[1];
+    executor.current.fragment_table = (__bridge id<MTL4ArgumentTable>)(void *)(uintptr_t)fields[2];
     executor.current.command_index = 1;
     executor.current.tracking = 1;
     atomic_fetch_add_explicit(&executor.tracked_passes, 1, memory_order_relaxed);
@@ -266,52 +419,54 @@ int periodic_executor_packet(uint32_t op, const uint64_t fields[8]) {
     uint32_t command_index = executor.current.command_index;
     if (command_index >= executor.current.form.command_count ||
         !command_matches(&executor.current.form.commands[command_index], op, fields)) {
-        finish_cluster();
-        executor.current.tracking = 0;
+        restore_state();
+        reset_current();
         atomic_fetch_add_explicit(&executor.rejected_passes, 1, memory_order_relaxed);
         return 0;
     }
+    const PeriodicFormCommand *expected = &executor.current.form.commands[command_index];
     while (executor.current.cluster_index < executor.current.program->cluster_count) {
         const PeriodicICBCluster *cluster = &executor.current.program->clusters[executor.current.cluster_index];
-        if (command_index < cluster->first_command + cluster->command_count) break;
+        if (command_index <= cluster->first_command) break;
         executor.current.cluster_index++;
     }
     const PeriodicICBCluster *cluster = executor.current.cluster_index < executor.current.program->cluster_count
         ? &executor.current.program->clusters[executor.current.cluster_index] : NULL;
-    int handled = cluster && cluster->icb_eligible && command_index >= cluster->first_command &&
-                  command_index < cluster->first_command + cluster->command_count;
-    if (handled) {
-        if (executor.current.packet_count == PERIODIC_ICB_PACKET_LIMIT) {
-            finish_cluster(); executor.current.tracking = 0;
-            atomic_fetch_add_explicit(&executor.rejected_passes, 1, memory_order_relaxed);
-            return 0;
-        }
-        ExecutorPacket *packet = &executor.current.packets[executor.current.packet_count++];
-        packet->op = op; memcpy(packet->fields, fields, sizeof packet->fields);
+    int slot = state_slot(op);
+    if (slot >= 0 && (executor.state_mask & (1u << slot)) &&
+        (expected->flags & PERIODIC_PACKET_ICB_COMMAND)) {
+        capture_state(op, fields);
+        executor.current.command_index++;
+        return 1;
     }
     executor.current.command_index++;
-    if (handled && executor.current.command_index == cluster->first_command + cluster->command_count) {
-        finish_cluster();
-        executor.current.cluster_index++;
+    if (is_draw(op)) {
+        int handled = cluster && cluster->icb_eligible && command_index == cluster->first_command &&
+                      (op != PERIODIC_METAL_INDEXED || executor.allow_indexed);
+        if (handled) {
+            execute_draw_capsule(executor.current.cluster_index, op, fields);
+            executor.current.cluster_index++;
+            return 1;
+        }
+        restore_state();
+        return 0;
     }
     if (op == PERIODIC_METAL_END) {
-        if (executor.current.command_index != executor.current.form.command_count) {
-            executor.current.tracking = 0;
+        int complete = executor.current.command_index == executor.current.form.command_count;
+        reset_current();
+        if (!complete)
             atomic_fetch_add_explicit(&executor.rejected_passes, 1, memory_order_relaxed);
-        } else executor.current.tracking = 0;
+        return 0;
     }
-    return handled;
+    if (cluster && command_index >= cluster->first_command + cluster->command_count)
+        executor.current.cluster_index++;
+    return 0;
 }
 
 void periodic_executor_flush(void) {
     if (!periodic_executor_active()) return;
-    for (;;) {
-        int pending = 0;
-        for (unsigned slot = 0; slot < EXECUTOR_CACHE_SLOTS; ++slot) {
-            uint32_t state = atomic_load_explicit(&executor.cache[slot].state, memory_order_acquire);
-            pending |= state == CACHE_WRITING || state == CACHE_COMPILING;
-        }
-        if (!pending) return;
+    while (atomic_load_explicit(&executor.compile_read, memory_order_acquire) !=
+           atomic_load_explicit(&executor.compile_write, memory_order_acquire)) {
         struct timespec pause = {.tv_nsec=100000}; nanosleep(&pause, NULL);
     }
 }
@@ -328,20 +483,29 @@ PeriodicExecutorStats periodic_executor_stats(void) {
     };
 }
 
+void periodic_executor_report(void) {
+    PeriodicExecutorStats stats = periodic_executor_stats();
+    if (stats.tracked_passes)
+        fprintf(stderr, "[totk] periodic executor: %llu tracked, %llu rejected; %llu queued, %llu compiled; %llu ICB clusters / %llu draws executed, %llu fallbacks\n",
+                (unsigned long long)stats.tracked_passes, (unsigned long long)stats.rejected_passes,
+                (unsigned long long)stats.queued_clusters, (unsigned long long)stats.compiled_clusters,
+                (unsigned long long)stats.executed_clusters, (unsigned long long)stats.executed_draws,
+                (unsigned long long)stats.fallback_clusters);
+}
+
 void periodic_executor_finish(void) {
     if (!periodic_executor_active()) return;
     periodic_executor_flush();
+    reset_current();
     if (!atomic_exchange_explicit(&executor.active, 0, memory_order_acq_rel)) return;
     atomic_store_explicit(&executor.stopping, 1, memory_order_release);
     pthread_join(executor.compiler, NULL);
-    PeriodicExecutorStats stats = periodic_executor_stats();
-    if (stats.tracked_passes)
-        fprintf(stderr, "[totk] periodic executor: %llu tracked passes, %llu ICB clusters / %llu draws executed, %llu fallbacks, %llu rejected\n",
-                (unsigned long long)stats.tracked_passes, (unsigned long long)stats.executed_clusters,
-                (unsigned long long)stats.executed_draws, (unsigned long long)stats.fallback_clusters,
-                (unsigned long long)stats.rejected_passes);
-    for (unsigned slot = 0; slot < EXECUTOR_CACHE_SLOTS; ++slot) executor.cache[slot].commands = nil;
-    free(executor.cache); executor.cache = NULL; executor.device = nil;
+    periodic_executor_report();
+    for (unsigned slot = 0; slot < EXECUTOR_CACHE_SLOTS; ++slot) {
+        executor.cache[slot].commands = nil;
+    }
+    free(executor.cache); free(executor.compile_slots);
+    executor.cache = NULL; executor.compile_slots = NULL; executor.device = nil;
 }
 
 static __strong id<MTLResidencySet> probe_residency;
@@ -377,10 +541,32 @@ int periodic_executor_probe(void) {
         probe_index_buffer.gpuAddress, probe_index_buffer.length, 1, 0, 1};
     const uint64_t draw_b_variant[8] = {MTLPrimitiveTypeTriangle, 3, MTLIndexTypeUInt16,
         probe_index_buffer.gpuAddress, probe_index_buffer.length, 1, 0, 1};
+    const uint64_t object_shape[8] = {0};
+    const uint64_t cull[8] = {MTLCullModeNone};
+    const uint64_t winding[8] = {MTLWindingClockwise};
+    const uint64_t fill[8] = {MTLTriangleFillModeFill};
+    const uint64_t clip[8] = {MTLDepthClipModeClip};
+    uint64_t bias[8] = {0};
+    const float bias_values[3] = {0.0f, 0.0f, 0.0f};
+    memcpy(bias, bias_values, sizeof bias_values);
     const uint64_t end[8] = {0};
     for (uint64_t anchor = 0; anchor < 3; ++anchor) {
         periodic_observe_packet(PERIODIC_METAL_BEGIN, begin, 0x30, 0, 0x0f,
             PERIODIC_PACKET_PASS_BEGIN | PERIODIC_PACKET_ICB_BREAK, NULL, 8000 + anchor);
+        periodic_observe_packet(PERIODIC_METAL_PSO, object_shape, 0, 0, 0x01,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(PERIODIC_METAL_DSS, object_shape, 0, 0, 0x01,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(PERIODIC_METAL_CULL, cull, 0, 0x01, 0,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(PERIODIC_METAL_WINDING, winding, 0, 0x01, 0,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(PERIODIC_METAL_FILL, fill, 0, 0x01, 0,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(PERIODIC_METAL_BIAS, bias, 0, 0xff, 0,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
+        periodic_observe_packet(PERIODIC_METAL_CLIP, clip, 0, 0x01, 0,
+            PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(PERIODIC_METAL_INDEXED, draw_a, 0x05, 0xf2, 0x08,
             PERIODIC_PACKET_DRAW | PERIODIC_PACKET_ICB_COMMAND, NULL, 0);
         periodic_observe_packet(PERIODIC_METAL_INDEXED, draw_b, 0x05, 0xf2, 0x08,
@@ -401,15 +587,17 @@ int periodic_executor_probe(void) {
     pd.vertexFunction = [library newFunctionWithName:@"v"]; pd.fragmentFunction = [library newFunctionWithName:@"f"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm; pd.supportIndirectCommandBuffers = YES;
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+    dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = NO;
+    id<MTLDepthStencilState> depth_stencil = [device newDepthStencilStateWithDescriptor:dd];
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModeShared;
     id<MTLTexture> texture = [device newTextureWithDescriptor:td];
     MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new]; rd.initialCapacity = 4;
     probe_residency = [device newResidencySetWithDescriptor:rd error:&error];
     periodic_executor_init(device, probe_buffer_generation, probe_resolve_buffer, probe_make_resident);
-    if (!device || !pipeline || !texture || !probe_residency || !probe_index_buffer ||
+    if (!device || !pipeline || !depth_stencil || !texture || !probe_residency || !probe_index_buffer ||
         !periodic_executor_active()) return 1;
-    [probe_residency addAllocation:(id<MTLAllocation>)pipeline];
     [probe_residency addAllocation:(id<MTLAllocation>)texture];
     [probe_residency addAllocation:(id<MTLAllocation>)probe_index_buffer];
     [probe_residency commit];
@@ -424,8 +612,16 @@ int periodic_executor_probe(void) {
         rp.colorAttachments[0].texture = texture; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
         id<MTL4RenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:rp];
-        [encoder setRenderPipelineState:pipeline];
+        uint64_t pso[8] = {(uint64_t)(uintptr_t)CFBridgingRetain(pipeline)};
+        uint64_t dss[8] = {(uint64_t)(uintptr_t)CFBridgingRetain(depth_stencil)};
         if (!periodic_executor_begin(form_id, encoder, begin) ||
+            !periodic_executor_packet(PERIODIC_METAL_PSO, pso) ||
+            !periodic_executor_packet(PERIODIC_METAL_DSS, dss) ||
+            !periodic_executor_packet(PERIODIC_METAL_CULL, cull) ||
+            !periodic_executor_packet(PERIODIC_METAL_WINDING, winding) ||
+            !periodic_executor_packet(PERIODIC_METAL_FILL, fill) ||
+            !periodic_executor_packet(PERIODIC_METAL_BIAS, bias) ||
+            !periodic_executor_packet(PERIODIC_METAL_CLIP, clip) ||
             !periodic_executor_packet(PERIODIC_METAL_INDEXED, first_draw) ||
             !periodic_executor_packet(PERIODIC_METAL_INDEXED, second_draw)) return 1;
         periodic_executor_packet(PERIODIC_METAL_END, end);
@@ -444,8 +640,8 @@ int periodic_executor_probe(void) {
     PeriodicExecutorStats stats = periodic_executor_stats();
     if (center[0] < 30 || center[0] > 34 || center[1] < 94 || center[1] > 98 ||
         center[2] < 158 || center[2] > 162 || center[3] != 255 ||
-        stats.compiled_clusters != 2 || stats.executed_clusters != 2 || stats.executed_draws != 4 ||
-        stats.fallback_clusters != 2 || stats.rejected_passes) return 1;
-    printf("{\"probe\":\"periodic-executor\",\"status\":\"pass\",\"indexed\":true,\"cache_variants\":2,\"compiled_clusters\":2,\"executed_clusters\":2,\"executed_draws\":4,\"hot_path_allocations\":0}\n");
+        stats.compiled_clusters != 4 || stats.executed_clusters != 4 || stats.executed_draws != 4 ||
+        stats.fallback_clusters != 4 || stats.rejected_passes) return 1;
+    printf("{\"probe\":\"periodic-executor\",\"status\":\"pass\",\"indexed\":true,\"retained_state\":true,\"cache_variants\":2,\"compiled_capsules\":4,\"executed_capsules\":4,\"executed_draws\":4,\"hot_path_allocations\":0}\n");
     return 0;
 }

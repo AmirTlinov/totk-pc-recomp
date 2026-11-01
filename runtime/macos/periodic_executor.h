@@ -1,7 +1,20 @@
-// Metal 4 executor for already closed retained draw clusters.
+// Metal 4 executor for already closed retained draw capsules.
 #pragma once
 
 #include <stdint.h>
+
+typedef struct {
+    uint64_t tracked_passes;
+    uint64_t rejected_passes;
+    uint64_t queued_clusters;
+    uint64_t compiled_clusters;
+    uint64_t executed_clusters;
+    uint64_t fallback_clusters;
+    uint64_t executed_draws;
+} PeriodicExecutorStats;
+
+PeriodicExecutorStats periodic_executor_stats(void);
+void periodic_executor_report(void);
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -35,16 +48,6 @@ typedef int (*PeriodicResolveBufferFn)(uint64_t address, uint64_t length,
                                       void **buffer, uint64_t *offset);
 typedef void (*PeriodicMakeResidentFn)(void *allocation);
 
-typedef struct {
-    uint64_t tracked_passes;
-    uint64_t rejected_passes;
-    uint64_t queued_clusters;
-    uint64_t compiled_clusters;
-    uint64_t executed_clusters;
-    uint64_t fallback_clusters;
-    uint64_t executed_draws;
-} PeriodicExecutorStats;
-
 void periodic_executor_init(id<MTLDevice> device,
                             PeriodicBufferGenerationFn buffer_generation,
                             PeriodicResolveBufferFn resolve_buffer,
@@ -61,6 +64,5 @@ int periodic_executor_packet(uint32_t op, const uint64_t fields[8]);
 
 // Cold-path synchronization for probes and shutdown.
 void periodic_executor_flush(void);
-PeriodicExecutorStats periodic_executor_stats(void);
 int periodic_executor_probe(void);
 #endif

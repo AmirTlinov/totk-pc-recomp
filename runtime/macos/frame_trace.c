@@ -1,6 +1,7 @@
 // Presentation callbacks only enqueue records. Formatting and disk I/O belong
 // to the writer; a full queue fails the capture instead of losing evidence.
 #include "native_policy.h"
+#include "periodic_executor.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -79,6 +80,7 @@ void native_trace_finish(void) {
 
 _Noreturn void native_exit(int status) {
     native_trace_finish();
+    periodic_executor_report();
     _exit(status);
 }
 
