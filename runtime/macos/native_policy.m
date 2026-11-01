@@ -84,7 +84,7 @@ void native_policy_init(void) {
         {"TOTK_FPS_LIMIT", "144"}, {"TOTK_FPS60", "1"}, {"TOTK_UNCAPPED", "0"},
         {"TOTK_REALTIME", "1"}, {"TOTK_CLOTH", "1"}, {"TOTK_ASYNC_REPLAY", "1"},
         {"TOTK_MFX", "0"}, {"TOTK_MFX_UPSCALE", "0"}, {"TOTK_MFX_OUTPUT", "0"},
-        {"TOTK_PERIODIC_PHASE", "1"},
+        {"TOTK_PERIODIC_PHASE", "1"}, {"TOTK_PERIODIC_ANCHOR_HZ", "48"},
         {"TOTK_GPU_ALLOW_SUBMIT", "1"}, {"TOTK_GPU_WIDEN", "1"},
         {"TOTK_GPU_BLOCKRT", "1"}, {"TOTK_GPU_MIDCLEAR", "1"},
         // Keep vertex work overlapped across independent render passes. The
