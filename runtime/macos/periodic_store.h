@@ -28,6 +28,8 @@ typedef struct {
     uint64_t same_shape_submissions;
     uint64_t changed_resources;
     uint64_t invalidated_passes;
+    uint64_t promoted_guest_ranges;
+    uint64_t rejected_guest_ranges;
     uint64_t graph_generation;
     uint32_t pass_count;
     uint32_t resource_count;
@@ -42,6 +44,10 @@ typedef struct {
     uint32_t graph_valid;
 } PeriodicExecutionPlan;
 
+typedef uint64_t (*PeriodicGuestProtectFn)(uint64_t address, uint64_t length);
+typedef int (*PeriodicGuestChangedFn)(uint64_t address, uint64_t length, uint64_t stamp);
+typedef uint64_t (*PeriodicGuestEpochFn)(void);
+
 // The replay thread is the sole producer. It writes directly into a bounded
 // tape slot; no allocation, lock or compiler work occurs in these calls.
 void periodic_store_init(void);
@@ -53,6 +59,15 @@ void periodic_store_resource(PeriodicResourceKey key, uint64_t generation,
 void periodic_store_unknown(void);
 void periodic_store_pass_end(void);
 void periodic_store_submit(uint64_t submission_id);
+
+// The renderer registers its guest dirty-page tracker once. Promotion and
+// protection happen on the compiler thread. The replay thread only performs a
+// bounded table lookup and, when the global dirty epoch changed, a range check.
+void periodic_store_set_guest_tracker(PeriodicGuestProtectFn protect_range,
+                                      PeriodicGuestChangedFn range_changed,
+                                      PeriodicGuestEpochFn current_epoch);
+uint64_t periodic_store_guest_generation(PeriodicResourceKey key,
+                                         uint64_t fallback_generation);
 
 // Cold-path and executor-facing graph queries. Returned pass IDs are ordered
 // as they occurred in the latest completed submission.

@@ -14,10 +14,15 @@ enum {
     STORE_USE_BUCKETS = 256,
     STORE_RESOURCE_LIMIT = 4096,
     STORE_RESOURCE_BUCKETS = 8192,
+    STORE_PROMOTION_CAPACITY = 32768,
+    STORE_PROMOTION_PROBES = 16,
+    STORE_PROMOTION_RETURNS = 3,
+    STORE_PROMOTION_MAX_BYTES = 64 * 1024 * 1024,
     STORE_GRAPH_WORDS = (STORE_PASS_LIMIT + 63) / 64,
     STORE_SNAPSHOTS = 3,
 };
 enum { STORE_RECORD_PASS, STORE_RECORD_SUBMIT };
+enum { PROMOTION_EMPTY, PROMOTION_WATCHING, PROMOTION_STABLE, PROMOTION_REJECTED };
 
 typedef struct {
     PeriodicResourceKey key;
@@ -61,10 +66,20 @@ typedef struct {
     uint32_t valid;
 } GraphSnapshot;
 
+typedef struct {
+    _Atomic uint32_t state;
+    PeriodicResourceKey key;
+    uint64_t stamp;
+    _Atomic uint64_t checked_epoch;
+    uint64_t last_submission;
+    uint32_t returns;
+} GuestPromotion;
+
 static struct {
     StoreRecord *records;
     StoreRecord *compile_passes;
     GraphSnapshot *snapshots;
+    GuestPromotion *promotions;
     _Alignas(64) _Atomic uint64_t read;
     _Alignas(64) _Atomic uint64_t write;
     _Atomic uint64_t processed;
@@ -75,6 +90,10 @@ static struct {
     _Atomic uint64_t loss_epoch;
     _Atomic uint64_t same_shape_submissions, changed_resources, invalidated_passes;
     _Atomic uint64_t graph_generation;
+    _Atomic uint64_t promoted_guest_ranges, rejected_guest_ranges;
+    _Atomic(PeriodicGuestProtectFn) protect_guest;
+    _Atomic(PeriodicGuestChangedFn) guest_changed;
+    _Atomic(PeriodicGuestEpochFn) guest_epoch;
     _Atomic int published;
     _Atomic int active, stopping;
     pthread_t compiler;
@@ -118,6 +137,27 @@ static int key_overlaps(const PeriodicResourceKey *a, const PeriodicResourceKey 
     if (a->owner != b->owner || a->kind != b->kind || a->plane != b->plane) return 0;
     uint64_t al = a->length ? a->length : 1, bl = b->length ? b->length : 1;
     return a->offset <= b->offset ? al > b->offset - a->offset : bl > a->offset - b->offset;
+}
+
+static GuestPromotion *promotion_find(const PeriodicResourceKey *key, int create) {
+    unsigned bucket = (unsigned)(key_hash(key) & (STORE_PROMOTION_CAPACITY - 1));
+    for (unsigned probe = 0; probe < STORE_PROMOTION_PROBES; ++probe) {
+        GuestPromotion *promotion = &store.promotions[bucket];
+        uint32_t state = atomic_load_explicit(&promotion->state, memory_order_acquire);
+        if (state == PROMOTION_EMPTY) {
+            if (!create) return NULL;
+            promotion->key = *key;
+            promotion->stamp = 0;
+            promotion->last_submission = 0;
+            promotion->returns = 0;
+            atomic_store_explicit(&promotion->checked_epoch, 0, memory_order_relaxed);
+            atomic_store_explicit(&promotion->state, PROMOTION_WATCHING, memory_order_release);
+            return promotion;
+        }
+        if (key_equal(&promotion->key, key)) return promotion;
+        bucket = (bucket + 1) & (STORE_PROMOTION_CAPACITY - 1);
+    }
+    return NULL;
 }
 
 static void bit_set(uint64_t bits[STORE_GRAPH_WORDS], unsigned index) {
@@ -222,6 +262,52 @@ static void expand_cone(const GraphSnapshot *graph, uint64_t bits[STORE_GRAPH_WO
     }
 }
 
+static int resource_has_overlapping_writer(const GraphSnapshot *graph, const GraphResource *candidate) {
+    unsigned bucket = (unsigned)(owner_hash(&candidate->key) % STORE_RESOURCE_BUCKETS);
+    for (uint32_t entry = graph->owner_buckets[bucket]; entry;
+         entry = graph->resources[entry - 1].owner_next) {
+        const GraphResource *resource = &graph->resources[entry - 1];
+        if (key_overlaps(&candidate->key, &resource->key) && bit_count(resource->writers)) return 1;
+    }
+    return 0;
+}
+
+static void update_guest_promotions(GraphSnapshot *graph) {
+    PeriodicGuestProtectFn protect = atomic_load_explicit(&store.protect_guest, memory_order_acquire);
+    if (!protect) return;
+    for (unsigned i = 0; i < graph->resource_count; ++i) {
+        GraphResource *resource = &graph->resources[i];
+        if (resource->key.kind != 2 || !bit_count(resource->readers) ||
+            resource->key.length > STORE_PROMOTION_MAX_BYTES) continue;
+        GuestPromotion *promotion = promotion_find(&resource->key, 1);
+        if (!promotion) continue;
+        uint32_t state = atomic_load_explicit(&promotion->state, memory_order_acquire);
+        if (state == PROMOTION_REJECTED) continue;
+        if (resource_has_overlapping_writer(graph, resource)) {
+            if (state == PROMOTION_STABLE || state == PROMOTION_WATCHING) {
+                atomic_store_explicit(&promotion->state, PROMOTION_REJECTED, memory_order_release);
+                atomic_fetch_add_explicit(&store.rejected_guest_ranges, 1, memory_order_relaxed);
+            }
+            continue;
+        }
+        if (state == PROMOTION_STABLE) continue;
+        if (promotion->last_submission + 1 == graph->submission_id) promotion->returns++;
+        else promotion->returns = 1;
+        promotion->last_submission = graph->submission_id;
+        if (promotion->returns < STORE_PROMOTION_RETURNS) continue;
+        uint64_t stamp = protect(resource->key.offset, resource->key.length);
+        if (!stamp) {
+            atomic_store_explicit(&promotion->state, PROMOTION_REJECTED, memory_order_release);
+            atomic_fetch_add_explicit(&store.rejected_guest_ranges, 1, memory_order_relaxed);
+            continue;
+        }
+        promotion->stamp = stamp;
+        atomic_store_explicit(&promotion->checked_epoch, stamp, memory_order_relaxed);
+        atomic_store_explicit(&promotion->state, PROMOTION_STABLE, memory_order_release);
+        atomic_fetch_add_explicit(&store.promoted_guest_ranges, 1, memory_order_relaxed);
+    }
+}
+
 static int writable_snapshot(void) {
     int published = atomic_load_explicit(&store.published, memory_order_acquire);
     for (int step = 1; step <= STORE_SNAPSHOTS; ++step) {
@@ -275,11 +361,13 @@ static void compile_submission(size_t count, uint64_t submission_id, int invalid
             for (unsigned prior = 0; prior < pass; ++prior) add_edge(graph, prior, pass);
         }
     }
+    update_guest_promotions(graph);
 
     int previous_index = atomic_load_explicit(&store.published, memory_order_acquire);
     const GraphSnapshot *previous = &store.snapshots[previous_index];
-    if (graph->valid && previous->valid && previous->generation && previous->shape_hash == graph->shape_hash &&
-        previous->pass_count == graph->pass_count)
+    int same_shape = graph->valid && previous->valid && previous->generation &&
+        previous->shape_hash == graph->shape_hash && previous->pass_count == graph->pass_count;
+    if (same_shape)
         atomic_fetch_add_explicit(&store.same_shape_submissions, 1, memory_order_relaxed);
     uint64_t changed = 0;
     for (unsigned i = 0; i < graph->resource_count; ++i) {
@@ -292,6 +380,8 @@ static void compile_submission(size_t count, uint64_t submission_id, int invalid
             graph->invalidated[word] |= resource->writers[word];
         }
     }
+    if (previous->generation && !same_shape)
+        for (unsigned pass = 0; pass < graph->pass_count; ++pass) bit_set(graph->invalidated, pass);
     for (unsigned word = 0; word < STORE_GRAPH_WORDS; ++word) graph->invalidated[word] |= graph->unknown[word];
     expand_cone(graph, graph->invalidated);
     uint64_t generation = atomic_fetch_add_explicit(&store.graph_generation, 1, memory_order_relaxed) + 1;
@@ -342,19 +432,50 @@ static void initialize_store(void) {
     store.records = calloc(STORE_RING_CAPACITY, sizeof *store.records);
     store.compile_passes = calloc(STORE_PASS_LIMIT, sizeof *store.compile_passes);
     store.snapshots = calloc(STORE_SNAPSHOTS, sizeof *store.snapshots);
-    if (!store.records || !store.compile_passes || !store.snapshots) goto fail;
+    store.promotions = calloc(STORE_PROMOTION_CAPACITY, sizeof *store.promotions);
+    if (!store.records || !store.compile_passes || !store.snapshots || !store.promotions) goto fail;
     atomic_store_explicit(&store.published, 0, memory_order_relaxed);
     if (pthread_create(&store.compiler, NULL, compile_graphs, NULL)) goto fail;
     atomic_store_explicit(&store.active, 1, memory_order_release);
     atexit(periodic_store_finish);
     return;
 fail:
-    free(store.records); free(store.compile_passes); free(store.snapshots);
-    store.records = NULL; store.compile_passes = NULL; store.snapshots = NULL;
+    free(store.records); free(store.compile_passes); free(store.snapshots); free(store.promotions);
+    store.records = NULL; store.compile_passes = NULL; store.snapshots = NULL; store.promotions = NULL;
 }
 
 void periodic_store_init(void) { pthread_once(&store_once, initialize_store); }
 int periodic_store_active(void) { return atomic_load_explicit(&store.active, memory_order_relaxed); }
+
+void periodic_store_set_guest_tracker(PeriodicGuestProtectFn protect_range,
+                                      PeriodicGuestChangedFn range_changed,
+                                      PeriodicGuestEpochFn current_epoch) {
+    atomic_store_explicit(&store.guest_epoch, current_epoch, memory_order_release);
+    atomic_store_explicit(&store.guest_changed, range_changed, memory_order_release);
+    atomic_store_explicit(&store.protect_guest, protect_range, memory_order_release);
+}
+
+uint64_t periodic_store_guest_generation(PeriodicResourceKey key, uint64_t fallback_generation) {
+    if (!periodic_store_active() || key.kind != 2 || !store.promotions) return fallback_generation;
+    GuestPromotion *promotion = promotion_find(&key, 0);
+    if (!promotion || atomic_load_explicit(&promotion->state, memory_order_acquire) != PROMOTION_STABLE)
+        return fallback_generation;
+    PeriodicGuestEpochFn epoch = atomic_load_explicit(&store.guest_epoch, memory_order_acquire);
+    if (!epoch) return fallback_generation;
+    uint64_t dirty_epoch = epoch();
+    uint64_t checked = atomic_load_explicit(&promotion->checked_epoch, memory_order_relaxed);
+    if (checked == dirty_epoch) return 1;
+    PeriodicGuestChangedFn changed = atomic_load_explicit(&store.guest_changed, memory_order_acquire);
+    if (!changed || changed(key.offset, key.length, promotion->stamp)) {
+        uint32_t stable = PROMOTION_STABLE;
+        if (atomic_compare_exchange_strong_explicit(&promotion->state, &stable, PROMOTION_REJECTED,
+                                                    memory_order_acq_rel, memory_order_acquire))
+            atomic_fetch_add_explicit(&store.rejected_guest_ranges, 1, memory_order_relaxed);
+        return fallback_generation;
+    }
+    atomic_store_explicit(&promotion->checked_epoch, dirty_epoch, memory_order_relaxed);
+    return 1;
+}
 
 void periodic_store_pass_begin(uint64_t pass_id) {
     if (!periodic_store_active()) return;
@@ -486,6 +607,8 @@ PeriodicStoreStats periodic_store_stats(void) {
         .same_shape_submissions=atomic_load_explicit(&store.same_shape_submissions, memory_order_relaxed),
         .changed_resources=atomic_load_explicit(&store.changed_resources, memory_order_relaxed),
         .invalidated_passes=atomic_load_explicit(&store.invalidated_passes, memory_order_relaxed),
+        .promoted_guest_ranges=atomic_load_explicit(&store.promoted_guest_ranges, memory_order_relaxed),
+        .rejected_guest_ranges=atomic_load_explicit(&store.rejected_guest_ranges, memory_order_relaxed),
         .graph_generation=atomic_load_explicit(&store.graph_generation, memory_order_relaxed),
         .pass_count=graph->pass_count,
         .resource_count=graph->resource_count,
@@ -541,8 +664,26 @@ void periodic_store_finish(void) {
     if (!atomic_exchange_explicit(&store.active, 0, memory_order_acq_rel)) return;
     atomic_store_explicit(&store.stopping, 1, memory_order_release);
     pthread_join(store.compiler, NULL);
-    free(store.records); free(store.compile_passes); free(store.snapshots);
-    store.records = NULL; store.compile_passes = NULL; store.snapshots = NULL;
+    if (atomic_load_explicit(&store.observed_submissions, memory_order_relaxed))
+        fprintf(stderr, "[totk] periodic store: %llu submissions, %llu passes, %llu promoted guest ranges, %llu rejected, %llu graph generations\n",
+                (unsigned long long)atomic_load_explicit(&store.observed_submissions, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&store.observed_passes, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&store.promoted_guest_ranges, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&store.rejected_guest_ranges, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&store.graph_generation, memory_order_relaxed));
+    free(store.records); free(store.compile_passes); free(store.snapshots); free(store.promotions);
+    store.records = NULL; store.compile_passes = NULL; store.snapshots = NULL; store.promotions = NULL;
+}
+
+static uint64_t probe_dirty_epoch = 10;
+static int probe_range_dirty;
+static uint64_t probe_epoch(void) { return probe_dirty_epoch; }
+static uint64_t probe_protect(uint64_t address, uint64_t length) {
+    return address && length ? probe_dirty_epoch : 0;
+}
+static int probe_changed(uint64_t address, uint64_t length, uint64_t stamp) {
+    (void)address; (void)length; (void)stamp;
+    return probe_range_dirty;
 }
 
 static PeriodicResourceKey probe_key(uint64_t owner) {
@@ -553,6 +694,7 @@ int periodic_store_probe(void) {
     setenv("TOTK_PERIODIC_FORMS", "1", 1);
     periodic_store_init();
     if (!periodic_store_active()) return 1;
+    periodic_store_set_guest_tracker(probe_protect, probe_changed, probe_epoch);
     PeriodicResourceKey a = probe_key(1), b = probe_key(2), c = probe_key(3);
     for (uint64_t submission = 1; submission <= 3; ++submission) {
         uint64_t generation = submission == 3 ? 2 : 1;
@@ -593,6 +735,25 @@ int periodic_store_probe(void) {
     PeriodicExecutionPlan plan;
     if (!periodic_store_execution_plan(&plan) || plan.submission_id != 5 || plan.pass_count != 3 || !plan.graph_valid)
         return 1;
+    PeriodicResourceKey stable = {.owner=1, .offset=4096, .length=256, .kind=2};
+    for (uint64_t submission = 6; submission <= 8; ++submission) {
+        uint64_t generation = periodic_store_guest_generation(stable, submission);
+        periodic_store_pass_begin(80); periodic_store_resource(stable, generation, 500, PERIODIC_RESOURCE_READ); periodic_store_pass_end();
+        periodic_store_submit(submission); periodic_store_flush();
+    }
+    if (periodic_store_guest_generation(stable, 9) != 1) return 1;
+    probe_dirty_epoch++;
+    if (periodic_store_guest_generation(stable, 9) != 1) return 1;
+    probe_range_dirty = 1; probe_dirty_epoch++;
+    if (periodic_store_guest_generation(stable, 9) != 9) return 1;
+    PeriodicStoreStats promoted = periodic_store_stats();
+    if (promoted.promoted_guest_ranges != 1 || promoted.rejected_guest_ranges < 2) return 1;
+    PeriodicResourceKey access_change = probe_key(90);
+    periodic_store_pass_begin(90); periodic_store_resource(access_change, 1, 900, PERIODIC_RESOURCE_READ); periodic_store_pass_end();
+    periodic_store_submit(10); periodic_store_flush();
+    periodic_store_pass_begin(90); periodic_store_resource(access_change, 1, 900, PERIODIC_RESOURCE_WRITE); periodic_store_pass_end();
+    periodic_store_submit(11); periodic_store_flush();
+    if (!periodic_store_execution_plan(&plan) || !(plan.execute[0] & 1)) return 1;
     enum { BENCH_NOTES = 4096, BENCH_ROUNDS = 9 };
     double samples[BENCH_ROUNDS];
     for (unsigned round = 0; round < BENCH_ROUNDS; ++round) {
@@ -608,8 +769,8 @@ int periodic_store_probe(void) {
         while (j >= 0 && samples[j] > value) { samples[j + 1] = samples[j]; --j; }
         samples[j + 1] = value;
     }
-    printf("{\"probe\":\"periodic-store\",\"status\":\"pass\",\"passes\":%u,\"resources\":%u,\"same_shape\":%llu,\"hot_path_allocations\":0,\"note_ns\":%.3f}\n",
+    printf("{\"probe\":\"periodic-store\",\"status\":\"pass\",\"passes\":%u,\"resources\":%u,\"same_shape\":%llu,\"promoted_ranges\":%llu,\"hot_path_allocations\":0,\"note_ns\":%.3f}\n",
            stats.pass_count, stats.resource_count, (unsigned long long)stats.same_shape_submissions,
-           samples[BENCH_ROUNDS / 2]);
+           (unsigned long long)promoted.promoted_guest_ranges, samples[BENCH_ROUNDS / 2]);
     return 0;
 }
