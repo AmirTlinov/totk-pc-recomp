@@ -249,9 +249,69 @@ static void asynchronous_retirement(void) {
     CHECK(!pthread_join(worker, NULL)); collect();
     CHECK(!dm_nvn_pin_has_serial(texture.serial));
 }
+static void addressed_scene_calls(void) {
+    Recorder child, parent; init(&child); init(&parent);
+    NativeSceneAddress a = {0x1000, 7, 0x4000, 1, 2};
+    NativeSceneAddress b = {0x2000, 8, 0x4000, 1, 2};
+    h_nvnCommandBufferBeginRecording(&child.cb);
+    NativeSceneInvocation outer = nvn_scene_begin(&child.cb, a);
+    size_t first = recording_meta(CB(&child.cb))->logical_bytes;
+    h_nvnCommandBufferSetScissor(&child.cb, 0, 0, 16, 16);
+    NativeSceneInvocation nested = nvn_scene_begin(&child.cb, b);
+    size_t second = recording_meta(CB(&child.cb))->logical_bytes;
+    h_nvnCommandBufferSetScissor(&child.cb, 1, 1, 16, 16);
+    nvn_scene_end(&child.cb, nested);
+    size_t third = recording_meta(CB(&child.cb))->logical_bytes;
+    h_nvnCommandBufferSetScissor(&child.cb, 2, 2, 16, 16);
+    nvn_scene_end(&child.cb, outer);
+    size_t outside = recording_meta(CB(&child.cb))->logical_bytes;
+    h_nvnCommandBufferSetScissor(&child.cb, 3, 3, 16, 16);
+    NVNcommandHandle hc = h_nvnCommandBufferEndRecording(&child.cb);
+    const NvnCommandOwner *co = nvn_command_owner_acquire(hc);
+    CHECK(nvn_command_scene_at(co, first).owner == a.owner);
+    CHECK(nvn_command_scene_at(co, second).owner == b.owner);
+    CHECK(nvn_command_scene_at(co, third).owner == a.owner);
+    CHECK(!nvn_command_scene_at(co, outside).owner);
+    CHECK(nvn_command_owner_info(co)->has_scene);
+    h_nvnCommandBufferBeginRecording(&parent.cb);
+    h_nvnCommandBufferCallCommands(&parent.cb, 1, &hc);
+    h_nvnCommandBufferCallCommands(&parent.cb, 1, &hc);
+    NVNcommandHandle hp = h_nvnCommandBufferEndRecording(&parent.cb);
+    const NvnCommandOwner *po = nvn_command_owner_acquire(hp);
+    const NvnCommandOwnerInfo *pi = nvn_command_owner_info(po);
+    CHECK(pi->has_scene && pi->scope_count == 2);
+    for (size_t i = 0; i < 2; ++i) {
+        size_t origin = pi->scopes[i].offset - 8;
+        CHECK(nvn_command_scene_at(po, origin + first).owner == a.owner);
+        CHECK(nvn_command_scene_at(po, origin + second).owner == b.owner);
+        CHECK(nvn_command_scene_at(po, origin + third).generation == a.generation);
+        CHECK(!nvn_command_scene_at(po, origin + outside).owner);
+    }
+    // Reusing the recorder cannot alter a queued invocation's incarnation.
+    h_nvnCommandBufferBeginRecording(&child.cb);
+    a.generation++;
+    outer = nvn_scene_begin(&child.cb, a);
+    h_nvnCommandBufferSetScissor(&child.cb, 0, 0, 16, 16);
+    nvn_scene_end(&child.cb, outer);
+    NVNcommandHandle fresh = h_nvnCommandBufferEndRecording(&child.cb);
+    CHECK(nvn_command_scene_at(nvn_command_owner_borrow(fresh), first).generation == a.generation);
+    CHECK(nvn_command_scene_at(po, first).generation == a.generation - 1);
+    h_nvnCommandBufferBeginRecording(&child.cb);
+    NativeSceneInvocation abandoned = nvn_scene_begin(&child.cb, a);
+    h_nvnCommandBufferBeginRecording(&child.cb);
+    NativeSceneInvocation replacement = nvn_scene_begin(&child.cb, b);
+    CHECK(abandoned.index == replacement.index && abandoned.recording != replacement.recording);
+    CHECK(!nvn_scene_end(&child.cb, abandoned));
+    CHECK(recording_meta(CB(&child.cb))->scene_top == replacement.index + 1);
+    CHECK(nvn_scene_end(&child.cb, replacement));
+    (void)h_nvnCommandBufferEndRecording(&child.cb);
+    destroy(&child); destroy(&parent);
+    CHECK(nvn_command_scene_at(po, second).owner == b.owner);
+    nvn_command_owner_release(co); nvn_command_owner_release(po);
+}
 int main(void) {
     uint64_t copies = g_copy_bytes, owners = g_owner_bytes; size_t count = g_ncopies;
-    shared_and_nested(); deferred_is_local(); empty_calls(); pending_texture_lifetime(); copied_texture_lifetime(); abort_and_deep_owners(); asynchronous_retirement();
+    shared_and_nested(); deferred_is_local(); empty_calls(); pending_texture_lifetime(); copied_texture_lifetime(); abort_and_deep_owners(); asynchronous_retirement(); addressed_scene_calls();
     dm_nvn_probe_commands(); dm_nvn_probe_inline_bulk(); dm_nvn_probe_texture_pins();
     CHECK(g_copy_bytes == copies && g_owner_bytes == owners && g_ncopies == count);
     printf("{\"status\":\"pass\",\"probe\":\"command-owner\",\"checks\":%u,\"deep_owner_levels\":4096,\"copied_child_bytes_avoided\":%zu,\"compact_recording_bytes\":%zu,\"copied_recording_bytes\":%zu}\n",

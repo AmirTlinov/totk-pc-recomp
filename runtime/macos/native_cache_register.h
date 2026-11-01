@@ -8,8 +8,8 @@
 
 // The signal fallback and direct reads must describe the same 128-byte lines.
 #define NATIVE_CTR_EL0 UINT32_C(0x8555c005)
-// Main's real-time/aspect veneers and three input adapters occupy this prefix.
-#define NATIVE_MAIN_TEXT_RESERVE 256
+// Main's aspect/input veneers occupy 0..255; scene-owner adapters use 256..383.
+#define NATIVE_MAIN_TEXT_RESERVE 384
 
 static inline bool native_ctr_branch(size_t from, size_t to, uint32_t *word) {
     if ((from | to) & 3) return false;

@@ -1,0 +1,275 @@
+--- a/runtime/loader.c
++++ b/runtime/loader.c
+@@ -1,6 +1,7 @@
+ /* Native ARM64 module loader. Guest images and generated metadata stay local. */
+ #include "runtime.h"
+ #include "native_policy.h"
++extern void native_scene_install(Module *m);
+ #include "totk_ui_lang.h"
+ #include <TargetConditionals.h>
+ #include <dlfcn.h>
+@@ -514,6 +515,7 @@
+  for(unsigned i=0;i<NM;i++)relocate(&modules[i]);
+  for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,"main")) {
+   runtime_game_patches(&modules[i]);native_patch_main(modules[i].base,modules[i].size);
++  native_scene_install(&modules[i]);
+  }
+  for(unsigned i=0;i<NM;i++) {
+   Module *m=&modules[i];size_t end=(m->text_end+0x3fff)&~(size_t)0x3fff;
+--- a/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
++++ b/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+@@ -662,7 +662,11 @@
+ typedef struct {
+     size_t logical_bytes, count, capacity;
+     recording_scope *scopes;
++    NvnSceneScope *scene_scopes;
++    size_t scene_count, scene_capacity, scene_top;
++    uint64_t scene_incarnation;
+ } recording_prefix;
++static _Atomic uint64_t g_scene_incarnation;
+ static recording_prefix *recording_meta(const cmd_t *o) { return o->seg ? (recording_prefix *)o->seg - 1 : NULL; }
+ static void recording_release(cmd_t *o);
+ #define OP_RESERVE 24                             // 段尾永远留够一条 JUMP / END | Always keep enough room at the segment end for one JUMP / END
+@@ -673,7 +677,7 @@
+ NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) {
+     recording_release(CB(c));
+     recording_prefix *r = recording_meta(CB(c));
+-    if (r) { free(r->scopes); free(r); }
++    if (r) { free(r->scopes); free(r->scene_scopes); free(r); }
+     CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0;
+ }
+ NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
+@@ -714,6 +718,44 @@
+     if (fresh) memset(r, 0, sizeof *r);
+     uint8_t *b = (uint8_t *)(r + 1);
+     o->seg = b; o->cur = b + used; o->end = b + cap;
++}
++
++// Called once around the concrete game object's draw action, before it builds
++// any ordinary commands. No per-packet owner discovery is needed.
++NativeSceneInvocation nvn_scene_begin(void *recorder, NativeSceneAddress address) {
++    cmd_t *o = recorder;
++    if (!o || o->magic != MAGIC('C','M','D','B') || !o->recording || !address.generation)
++        return (NativeSceneInvocation){0};
++    cmd_reserve(o, 0);
++    recording_prefix *r = recording_meta(o);
++    if (!r->scene_incarnation) {
++        r->scene_incarnation = atomic_fetch_add_explicit(&g_scene_incarnation, 1, memory_order_relaxed) + 1;
++        if (!r->scene_incarnation) die("scene recording incarnation overflow");
++    }
++    if (r->scene_count == r->scene_capacity) {
++        size_t capacity = r->scene_capacity ? r->scene_capacity * 2 : 64;
++        if (capacity < r->scene_capacity || capacity > SIZE_MAX / sizeof *r->scene_scopes)
++            die("scene invocation storage overflow");
++        NvnSceneScope *next = realloc(r->scene_scopes, capacity * sizeof *next);
++        if (!next) die("scene invocation storage allocation");
++        r->scene_scopes = next; r->scene_capacity = capacity;
++    }
++    size_t token = r->scene_count++;
++    r->scene_scopes[token] = (NvnSceneScope){r->logical_bytes, SIZE_MAX, address, r->scene_top};
++    r->scene_top = token + 1;
++    return (NativeSceneInvocation){r->scene_incarnation, token};
++}
++int nvn_scene_end(void *recorder, NativeSceneInvocation token) {
++    if (!token.recording) return 0;
++    cmd_t *o = recorder;
++    recording_prefix *r = recording_meta(o);
++    if (!o->recording || !r || r->scene_incarnation != token.recording) return 0;
++    if (token.index >= r->scene_count || r->scene_top != token.index + 1 ||
++        r->scene_scopes[token.index].offset > r->logical_bytes)
++        die("scene invocation crossed command recording lifetime");
++    r->scene_scopes[token.index].bytes = r->logical_bytes - r->scene_scopes[token.index].offset;
++    r->scene_top = r->scene_scopes[token.index].parent;
++    return 1;
+ }
+ 
+ // TOTK diagnostics: guest return chain of the current NVN call (frames link through runtime_hle_switch).
+@@ -856,6 +898,31 @@
+     }
+ }
+ const NvnCommandOwnerInfo *nvn_command_owner_info(const NvnCommandOwner *owner) { return owner ? &owner->info : NULL; }
++NativeSceneAddress nvn_command_scene_at(const NvnCommandOwner *owner, size_t offset) {
++    NativeSceneAddress result = {0};
++    while (owner && offset < owner->info.bytes) {
++        const NvnCommandOwnerInfo *info = &owner->info;
++        // Scene actions can nest through callbacks. The most recent containing
++        // action owns the command, while an outer action owns uncovered spans.
++        size_t lo = 0, hi = info->scene_scope_count;
++        while (lo < hi) { size_t m = lo + (hi-lo)/2;
++            if (info->scene_scopes[m].offset <= offset) lo = m+1; else hi = m; }
++        while (lo) {
++            const NvnSceneScope *scope = &info->scene_scopes[lo-1];
++            if (offset - scope->offset < scope->bytes) { result = scope->address; break; }
++            lo = scope->parent;
++        }
++        lo = 0; hi = info->scope_count;
++        while (lo < hi) { size_t m = lo + (hi-lo)/2;
++            if (info->scopes[m].offset <= offset) lo = m+1; else hi = m; }
++        if (!lo) break;
++        const NvnCommandScope *child = &info->scopes[lo-1];
++        if (offset - child->offset >= child->bytes) break;
++        offset = offset - child->offset + 8;
++        owner = child->owner;
++    }
++    return result;
++}
+ const NvnCommandOwner *nvn_command_owner_borrow(uint64_t handle) { return handle ? copy_of(handle)->owner : NULL; }
+ const NvnCommandOwner *nvn_command_owner_acquire(uint64_t handle) {
+     if (!handle) return NULL;
+@@ -879,7 +946,8 @@
+         if (r->scopes[i].copy) copy_unref(r->scopes[i].copy);
+         nvn_command_owner_release(r->scopes[i].scope.owner);
+     }
+-    r->count = r->logical_bytes = 0;
++    r->count = r->logical_bytes = r->scene_count = r->scene_top = 0;
++    r->scene_incarnation = 0;
+ }
+ static size_t record_pins(uint32_t op, const void *a, const tex_t **out) {
+     size_t n = 0;
+@@ -1027,17 +1095,29 @@
+ }
+ static NvnCommandOwner *recording_owner(cmd_t *recorder, uintptr_t control, size_t bytes, int has_def, size_t batch_capacity) {
+     recording_prefix *r = recording_meta(recorder);
++    if (r->scene_top) die("recording ended inside a scene invocation");
+     if (r->count > (SIZE_MAX - sizeof(NvnCommandOwner)) / sizeof(NvnCommandScope)) die("command owner size overflow");
+     size_t owner_bytes = sizeof(NvnCommandOwner) + r->count * sizeof(NvnCommandScope);
++    if (r->scene_count > (SIZE_MAX - owner_bytes) / sizeof(NvnSceneScope))
++        die("scene owner metadata overflow");
++    owner_bytes += r->scene_count * sizeof(NvnSceneScope);
+     if (batch_capacity > (SIZE_MAX - owner_bytes) / sizeof(NvnCommandDrawBatch))
+         die("command owner batch size overflow");
+     NvnCommandOwner *owner = calloc(1, owner_bytes + batch_capacity * sizeof(NvnCommandDrawBatch));
+     if (!owner) die("command owner allocation");
+     NvnCommandScope *scopes = (void *)(owner + 1);
++    int has_scene = r->scene_count != 0;
+     for (size_t i = 0; i < r->count; i++) {
+         scopes[i] = r->scopes[i].scope;
++        has_scene |= scopes[i].owner->info.has_scene;
+         if (scopes[i].offset > bytes || scopes[i].bytes > bytes - scopes[i].offset) die("command owner scope bounds");
+         r->scopes[i].scope.owner = NULL; // Transfer the metadata reference.
++    }
++    NvnSceneScope *scene_scopes = (void *)(scopes + r->count);
++    for (size_t i = 0; i < r->scene_count; ++i) {
++        scene_scopes[i] = r->scene_scopes[i];
++        if (scene_scopes[i].offset > bytes || scene_scopes[i].bytes > bytes - scene_scopes[i].offset)
++            die("unreturned scene invocation");
+     }
+     uint64_t id = atomic_fetch_add_explicit(&g_owner_incarnation, 1, memory_order_relaxed) + 1;
+     if (!id) die("command owner identity overflow");
+@@ -1045,7 +1125,9 @@
+     owner->info = (NvnCommandOwnerInfo){
+         .incarnation = id, .recorder = (uintptr_t)recorder, .control_origin = control,
+         .bytes = bytes, .scope_count = r->count, .scopes = scopes, .has_deferred = has_def,
+-        .draw_batches = (const void *)(scopes + r->count)
++        .draw_batches = (const void *)(scene_scopes + r->scene_count),
++        .scene_scope_count = r->scene_count, .scene_scopes = scene_scopes,
++        .has_scene = has_scene
+     };
+     g_owner_bytes += malloc_size(owner);
+     return owner;
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_command_owner.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_command_owner.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ #include <stddef.h>
+ #include <stdint.h>
++#include "native_scene.h"
+ 
+ typedef struct NvnCommandOwner NvnCommandOwner;
+ typedef struct {
+@@ -17,6 +18,11 @@
+     uint64_t draws, external_states;
+ } NvnCommandDrawBatch;
+ typedef struct {
++    size_t offset, bytes;
++    NativeSceneAddress address;
++    size_t parent; // One-based containing invocation, zero at the root.
++} NvnSceneScope;
++typedef struct {
+     uint64_t incarnation;
+     uintptr_t recorder, control_origin;
+     size_t bytes, scope_count;
+@@ -25,6 +31,9 @@
+     size_t draw_batch_count;
+     const NvnCommandDrawBatch *draw_batches;
+     int draw_batches_complete;
++    size_t scene_scope_count;
++    const NvnSceneScope *scene_scopes;
++    int has_scene;
+ } NvnCommandOwnerInfo;
+ 
+ // Acquire only while the guest handle is live. Metadata and all nested owners
+@@ -36,3 +45,7 @@
+ 
+ // Borrowed while the caller already holds the recording (e.g. queued replay).
+ const NvnCommandOwner *nvn_command_owner_borrow(uint64_t handle);
++
++// Resolve an occurrence through immutable child scopes. The caller already
++// holds the recording. The returned address belongs to its concrete game object.
++NativeSceneAddress nvn_command_scene_at(const NvnCommandOwner *owner, size_t offset);
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -6020,6 +6020,8 @@
+     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
+     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
+     float blend_color[4]; int64_t copy_stride;
++    // Retained state snapshots carry their actual scene invocation through deferral and regrouping.
++    NativeSceneAddress scene_owner;
+ } S;
+ /* The fragment output mask and writable-image flag are properties of the resolved shader variants. Cache them together:
+    both attachment liveness and the store ledger need exactly the same answer. */
+@@ -10989,6 +10991,10 @@
+         case 4: case 7: mp = MTLPrimitiveTypeTriangle; break; case 5: mp = MTLPrimitiveTypeTriangleStrip; break;
+         default: RED_ONCE(19, "图元类型 %d 未实现", prim); g_draw_skip[11]++; return;
+     }
++    if (S.scene_owner.owner && passdump()) PD("owner %llu generation=%llu program=%#llx role=%u variant=%u pass=%llu vs=%.16s fs=%.16s",
++        (unsigned long long)S.scene_owner.owner, (unsigned long long)S.scene_owner.generation,
++        (unsigned long long)S.scene_owner.implementation, S.scene_owner.role, S.scene_owner.variant,
++        (unsigned long long)g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
+     if (g_periodic_ui && (dw ? dw->count > 0 : di->count > 0))
+         ui_record_draw(pr, ps, cur_ds, dw, di, mp);
+     if (g_vis_counting && perdraw_vis_on() && g_enc_has_vis && g_vis && g_vis_n < VIS_SLOTS - 256) {
+@@ -11795,8 +11801,19 @@
+     return 0;
+ }
+ 
++static const NvnCommandOwner *g_scene_recording;
++static const uint8_t *g_scene_recording_base;
+ void mtl_exec_owned(const uint8_t *p, const NvnCommandOwner *owner) {
+-    if (!periodic_gpu_encode_active()) { mtl_exec(p); return; }
++    const NvnCommandOwner *prior_scene = g_scene_recording;
++    const uint8_t *prior_base = g_scene_recording_base;
++    const NvnCommandOwnerInfo *info = nvn_command_owner_info(owner);
++    g_scene_recording = info && info->has_scene ? owner : NULL;
++    g_scene_recording_base = p;
++    if (!periodic_gpu_encode_active()) {
++        mtl_exec(p);
++        g_scene_recording = prior_scene; g_scene_recording_base = prior_base;
++        return;
++    }
+     // A root invocation never inherits a previous owner's generated range.
+     if (g_gpu_draw.active) { pg_restore(); g_gpu_draw.active = 0; }
+     pg_recording_cursor previous = g_pg_recording;
+@@ -11804,6 +11821,7 @@
+     mtl_exec(p);
+     if (g_gpu_draw.active) { pg_restore(); g_gpu_draw.active = 0; }
+     g_pg_recording = previous;
++    g_scene_recording = prior_scene; g_scene_recording_base = prior_base;
+ }
+ void mtl_exec(const uint8_t *p) {
+     static int inited; if (!inited) { inited = 1; state_reset(); }
+@@ -11931,10 +11949,14 @@
+                 break;
+             }
+             case OP_DRAW:
++                S.scene_owner = g_scene_recording ? nvn_command_scene_at(g_scene_recording,
++                    (size_t)(p-g_scene_recording_base)) : (NativeSceneAddress){0};
+                 if (g_pg_recording.owner) pg_recorded_draw(p);
+                 g_exec_next = p + h.size; draw(a, NULL); g_exec_next = NULL;
+                 if (g_pg_recording.owner) g_pg_recording.remaining = 0; break;   // 前瞻起点 | Lookahead start point
+             case OP_DRAW_IDX:
++                S.scene_owner = g_scene_recording ? nvn_command_scene_at(g_scene_recording,
++                    (size_t)(p-g_scene_recording_base)) : (NativeSceneAddress){0};
+                 if (g_pg_recording.owner) pg_recorded_draw(p);
+                 g_exec_next = p + h.size; draw(NULL, a); g_exec_next = NULL;
+                 if (g_pg_recording.owner) g_pg_recording.remaining = 0; break;
