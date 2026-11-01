@@ -128,17 +128,45 @@ static void deferred_is_local(void) {
     uint64_t value = 11;
     h_nvnCommandBufferBeginRecording(&source.cb); binding(&source.cb, &value, 1);
     NVNcommandHandle child = h_nvnCommandBufferEndRecording(&source.cb);
-    CHECK(copy_of(child)->has_def);
+    CHECK(copy_of(child)->has_def && copy_of(child)->deferred_count == 1);
+    const size_t *child_program = copy_of(child)->deferred_offsets;
     h_nvnCommandBufferBeginRecording(&a.cb); h_nvnCommandBufferCallCommands(&a.cb, 1, &child);
-    value = 22; resolve_deferred((void *)(uintptr_t)child, 0);
+    value = 22; resolve_deferred((void *)(uintptr_t)child);
+    CHECK(copy_of(child)->deferred_offsets == child_program);
     h_nvnCommandBufferBeginRecording(&b.cb); h_nvnCommandBufferCallCommands(&b.cb, 1, &child);
     retire(&source);
     NVNcommandHandle ha = h_nvnCommandBufferEndRecording(&a.cb), hb = h_nvnCommandBufferEndRecording(&b.cb);
     CHECK(first_binding(ha)->h[0] == 11 && first_binding(hb)->h[0] == 22);
-    value = 33; resolve_deferred((void *)(uintptr_t)ha, 0);
+    value = 33; resolve_deferred((void *)(uintptr_t)ha);
     CHECK(first_binding(ha)->h[0] == 33 && first_binding(hb)->h[0] == 22);
     CHECK(copy_of(ha)->owner->info.has_deferred && copy_of(ha)->owner->info.scope_count == 1);
     flat(ha); flat(hb); destroy(&source); destroy(&a); destroy(&b);
+}
+static void recorded_uniform_inputs(void) {
+    Recorder source, parent; init(&source); init(&parent);
+    uint8_t memory[64] = {0};
+    h_nvnCommandBufferBeginRecording(&source.cb);
+    *REC(&source.cb, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){0, 1, (uintptr_t)memory, 32};
+    *REC(&source.cb, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){1, 7, (uintptr_t)memory + 16, 48};
+    NVNcommandHandle child = h_nvnCommandBufferEndRecording(&source.cb);
+    h_nvnCommandBufferBeginRecording(&parent.cb);
+    h_nvnCommandBufferCallCommands(&parent.cb, 1, &child);
+    h_nvnCommandBufferCopyCommands(&parent.cb, 1, &child);
+    NVNcommandHandle handle = h_nvnCommandBufferEndRecording(&parent.cb);
+    const NvnCommandOwner *owner = nvn_command_owner_acquire(handle);
+    const NvnCommandOwnerInfo *program = nvn_command_owner_info(owner);
+    CHECK(program->uniform_count == 4);
+    const NvnCommandUniform *ports = program->uniforms;
+    memory[0] = 21; memory[63] = 34;
+    destroy(&source); destroy(&parent);
+    // Parent ports survive source and recorder retirement. Their addresses
+    // still name current inputs rather than frozen parameter values.
+    CHECK(program->uniforms == ports && *(uint8_t *)(uintptr_t)ports[0].lo == 21);
+    CHECK(ports[0].lo == ports[2].lo && ports[1].hi == ports[3].hi);
+    CHECK(ports[0].hi == (uintptr_t)memory + 32);
+    CHECK(ports[1].lo == (uintptr_t)memory + 16 && ports[1].hi == (uintptr_t)memory + 64);
+    CHECK(*(uint8_t *)(uintptr_t)(ports[3].hi - 1) == 34);
+    nvn_command_owner_release(owner);
 }
 static void empty_calls(void) {
     Recorder source, parent; init(&source); init(&parent);
@@ -191,7 +219,7 @@ static void copied_texture_lifetime(void) {
         NVNcommandHandle parent_handle = h_nvnCommandBufferEndRecording(&parent.cb);
         const p_set_rt *rt = (const void *)((const uint8_t *)(uintptr_t)parent_handle + 16);
         CHECK(rt->color[0]->serial == texture.serial);
-        if (deferred) { handle_value = 39; resolve_deferred((const void *)(uintptr_t)parent_handle, 0); }
+        if (deferred) { handle_value = 39; resolve_deferred((const void *)(uintptr_t)parent_handle); }
         flat(parent_handle); destroy(&source); destroy(&parent); collect();
         CHECK(!dm_nvn_pin_has_serial(texture.serial));
     }
@@ -311,7 +339,7 @@ static void addressed_scene_calls(void) {
 }
 int main(void) {
     uint64_t copies = g_copy_bytes, owners = g_owner_bytes; size_t count = g_ncopies;
-    shared_and_nested(); deferred_is_local(); empty_calls(); pending_texture_lifetime(); copied_texture_lifetime(); abort_and_deep_owners(); asynchronous_retirement(); addressed_scene_calls();
+    shared_and_nested(); deferred_is_local(); recorded_uniform_inputs(); empty_calls(); pending_texture_lifetime(); copied_texture_lifetime(); abort_and_deep_owners(); asynchronous_retirement(); addressed_scene_calls();
     dm_nvn_probe_commands(); dm_nvn_probe_inline_bulk(); dm_nvn_probe_texture_pins();
     CHECK(g_copy_bytes == copies && g_owner_bytes == owners && g_ncopies == count);
     printf("{\"status\":\"pass\",\"probe\":\"command-owner\",\"checks\":%u,\"deep_owner_levels\":4096,\"copied_child_bytes_avoided\":%zu,\"compact_recording_bytes\":%zu,\"copied_recording_bytes\":%zu}\n",

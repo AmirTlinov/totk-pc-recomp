@@ -1,0 +1,463 @@
+--- a/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
++++ b/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+@@ -873,6 +873,8 @@
+     NvnCommandOwner *owner;
+     size_t pin_count;
+     const tex_t **pins;
++    size_t deferred_count;
++    const size_t *deferred_offsets;
+ };
+ static _Atomic uint64_t g_copy_bytes, g_owner_bytes, g_owner_incarnation;
+ static copy_prefix *copy_of(NVNcommandHandle h) { return (copy_prefix *)(uintptr_t)h - 1; }
+@@ -1044,7 +1046,7 @@
+         draw_batch_close(builder);
+ }
+ typedef struct {
+-    size_t bytes, pin_count, batch_capacity;
++    size_t bytes, pin_count, batch_capacity, uniform_count, deferred_count;
+     uint32_t last_size, has_def;
+     int bulk_ok, batch_complete;
+ } flatten_plan;
+@@ -1061,6 +1063,9 @@
+             const copy_prefix *child = copy_of(handle);
+             if (child->has_def || !child->owner) die("mutable retained command call");
+             bytes = child->body_bytes; pins = child->pin_count;
++            if (plan.uniform_count > SIZE_MAX - child->owner->info.uniform_count)
++                die("command uniform port count overflow");
++            plan.uniform_count += child->owner->info.uniform_count;
+             if (plan.batch_capacity) {
+                 if (plan.batch_capacity > SIZE_MAX - child->owner->info.draw_batch_count - 1)
+                     die("command draw batch size overflow");
+@@ -1080,7 +1085,22 @@
+             }
+             if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
+                 if (h.size < 8 + offsetof(p_bind_handles, h)) die("short command handle binding");
+-                if (((const p_bind_handles *)(p + 8))->src) plan.has_def = 1;
++                const p_bind_handles *binding = (const void *)(p + 8);
++                if (binding->n < 0 || binding->n > 32 ||
++                    (size_t)binding->n > (h.size - 8 - offsetof(p_bind_handles, h)) / sizeof(uint64_t))
++                    die("invalid command handle binding");
++                if (binding->src) {
++                    plan.has_def = 1;
++                    if (binding->n) ++plan.deferred_count;
++                }
++            }
++            if (h.op == OP_BIND_UBO) {
++                if (h.size < 8 + sizeof(p_bind_buf)) die("short uniform binding");
++                const p_bind_buf *binding = (const void *)(p + 8);
++                if (binding->addr && binding->size && binding->size <= 65536) {
++                    if (binding->addr > UINT64_MAX - binding->size) die("uniform address overflow");
++                    ++plan.uniform_count;
++                }
+             }
+             if (h.op >= OP_COUNT_ || h.size > (64u << 20)) plan.bulk_ok = 0;
+             if (plan.bytes == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) plan.bulk_ok = 0; }
+@@ -1093,7 +1113,7 @@
+         p += h.size;
+     }
+ }
+-static NvnCommandOwner *recording_owner(cmd_t *recorder, uintptr_t control, size_t bytes, int has_def, size_t batch_capacity) {
++static NvnCommandOwner *recording_owner(cmd_t *recorder, uintptr_t control, size_t bytes, int has_def, size_t batch_capacity, size_t uniform_count) {
+     recording_prefix *r = recording_meta(recorder);
+     if (r->scene_top) die("recording ended inside a scene invocation");
+     if (r->count > (SIZE_MAX - sizeof(NvnCommandOwner)) / sizeof(NvnCommandScope)) die("command owner size overflow");
+@@ -1103,7 +1123,10 @@
+     owner_bytes += r->scene_count * sizeof(NvnSceneScope);
+     if (batch_capacity > (SIZE_MAX - owner_bytes) / sizeof(NvnCommandDrawBatch))
+         die("command owner batch size overflow");
+-    NvnCommandOwner *owner = calloc(1, owner_bytes + batch_capacity * sizeof(NvnCommandDrawBatch));
++    owner_bytes += batch_capacity * sizeof(NvnCommandDrawBatch);
++    if (uniform_count > (SIZE_MAX - owner_bytes) / sizeof(NvnCommandUniform))
++        die("command uniform port storage overflow");
++    NvnCommandOwner *owner = calloc(1, owner_bytes + uniform_count * sizeof(NvnCommandUniform));
+     if (!owner) die("command owner allocation");
+     NvnCommandScope *scopes = (void *)(owner + 1);
+     int has_scene = r->scene_count != 0;
+@@ -1127,7 +1150,9 @@
+         .bytes = bytes, .scope_count = r->count, .scopes = scopes, .has_deferred = has_def,
+         .draw_batches = (const void *)(scene_scopes + r->scene_count),
+         .scene_scope_count = r->scene_count, .scene_scopes = scene_scopes,
+-        .has_scene = has_scene
++        .has_scene = has_scene,
++        .uniform_count = uniform_count,
++        .uniforms = (const void *)((const NvnCommandDrawBatch *)(scene_scopes + r->scene_count) + batch_capacity)
+     };
+     g_owner_bytes += malloc_size(owner);
+     return owner;
+@@ -1136,13 +1161,18 @@
+     const uint8_t *p = recorder->seg;
+     flatten_plan plan = measure_recording(p);
+     if (plan.pin_count > (SIZE_MAX - plan.bytes) / sizeof(const tex_t *)) die("command pin size overflow");
+-    uint8_t *out = malloc(plan.bytes + plan.pin_count * sizeof(const tex_t *));
++    size_t allocation = plan.bytes + plan.pin_count * sizeof(const tex_t *);
++    if (plan.deferred_count > (SIZE_MAX - allocation) / sizeof(size_t))
++        die("command deferred input storage overflow");
++    uint8_t *out = malloc(allocation + plan.deferred_count * sizeof(size_t));
+     if (!out) die("command copy allocation");
+     NvnCommandOwner *owner = recording_owner(recorder, control,
+-        plan.bytes - sizeof(copy_prefix), plan.has_def, plan.batch_capacity);
++        plan.bytes - sizeof(copy_prefix), plan.has_def, plan.batch_capacity, plan.uniform_count);
+     draw_batch_builder batches = {.batches = (void *)owner->info.draw_batches,
+                                   .capacity = plan.batch_capacity};
+     const tex_t **pins = (void *)(out + plan.bytes); size_t npins = 0;
++    size_t *deferred = (void *)(out + allocation); size_t ndeferred = 0, nuniforms = 0;
++    NvnCommandUniform *uniforms = (void *)owner->info.uniforms;
+     size_t n = sizeof(copy_prefix);
+     for (;;) {
+         op_hdr h; memcpy(&h, p, sizeof h);
+@@ -1150,20 +1180,33 @@
+         if (h.op == OP_CALL) {
+             uint64_t handle; memcpy(&handle, p + 8, 8); const copy_prefix *child = copy_of(handle);
+             draw_batch_child(&batches, n - sizeof(copy_prefix), &child->owner->info);
++            size_t count = child->owner->info.uniform_count;
++            memcpy(uniforms + nuniforms, child->owner->info.uniforms, count * sizeof *uniforms);
++            nuniforms += count;
+             memcpy(out + n, (const uint8_t *)(uintptr_t)handle + 8, child->body_bytes); n += child->body_bytes;
+             memcpy(pins + npins, child->pins, child->pin_count * sizeof *pins); npins += child->pin_count;
+         } else {
+             draw_batch_record(&batches, n - sizeof(copy_prefix), h);
++            if (h.op == OP_BIND_UBO) {
++                const p_bind_buf *binding = (const void *)(p + 8);
++                if (binding->addr && binding->size && binding->size <= 65536)
++                    uniforms[nuniforms++] = (NvnCommandUniform){binding->addr, binding->addr + binding->size};
++            } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
++                const p_bind_handles *binding = (const void *)(p + 8);
++                if (binding->src && binding->n) deferred[ndeferred++] = n - sizeof(copy_prefix) + 8;
++            }
+             memcpy(out + n, p, h.size); n += h.size;
+             npins += record_pins(h.op, p + 8, pins + npins);
+         }
+         if (h.op == OP_END) {
+-            if (n != plan.bytes || npins != plan.pin_count) die("command copy measurement changed");
++            if (n != plan.bytes || npins != plan.pin_count || nuniforms != plan.uniform_count ||
++                ndeferred != plan.deferred_count) die("command copy measurement changed");
+             copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+             size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
+             c->body_bytes = plan.bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+             c->last_size = c->body_bytes ? plan.last_size : 0;
+             c->refs = 1; c->has_def = plan.has_def; c->pins = pins; c->pin_count = npins;
++            c->deferred_count = ndeferred; c->deferred_offsets = deferred;
+             for (size_t i = 0; i < npins; i++) pin_recording_hold(pins[i], 1);
+             owner->info.draw_batch_count = batches.count;
+             owner->info.draw_batches_complete = plan.batch_complete && !plan.has_def;
+@@ -2096,24 +2139,19 @@
+ static _Atomic int g_def_on = -1;                   // TOTK_DEFERRED_BINDS=0 / runtime flag "deferred 0": keep the record-time handles (A/B)
+ static uint64_t g_def_n, g_def_changed, g_def_logged, g_def_ns;
+ void nvn_set_deferred_binds(int on) { atomic_store(&g_def_on, on); LOG("[flag] deferred = %d", on); }
+-static void resolve_deferred(const uint8_t *p, int depth) {   // read the handles of every deferred bind in a submitted recording
+-    for (;;) {
+-        op_hdr h; memcpy(&h, p, sizeof h);
+-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) die("corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)p, h.op, h.size);
+-        if (h.op == OP_END) return;
+-        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+-        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1); }
+-        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
+-            p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
+-            if (b->src && b->n > 0 && b->n <= 32) {
+-                uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
+-                if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
+-                    if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
+-                    g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
+-                }
+-            }
++static void resolve_deferred(const uint8_t *commands) {
++    // Each occurrence owns its writable parameter slots. The program is built
++    // while recording is finalized; applying it never walks unrelated commands.
++    const copy_prefix *owner = copy_of((uint64_t)(uintptr_t)commands);
++    for (size_t i = 0; i < owner->deferred_count; ++i) {
++        p_bind_handles *binding = (void *)(commands + owner->deferred_offsets[i]);
++        uint64_t current[32]; size_t bytes = sizeof(uint64_t) * (size_t)binding->n;
++        memcpy(current, (const void *)(uintptr_t)binding->src, bytes); g_def_n++;
++        if (memcmp(current, binding->h, bytes)) {
++            if (g_def_logged++ < 6) LOG("[nvn] deferred input stage %d slot %d: %#llx -> %#llx",
++                binding->stage, binding->first, (unsigned long long)binding->h[0], (unsigned long long)current[0]);
++            g_def_changed++; memcpy(binding->h, current, bytes);
+         }
+-        p += h.size;
+     }
+ }
+ // 图像（可写贴图）：句柄 = 贴图池号（GetImageHandle 原样返回；游戏不调 RegisterImage，图像与贴图共用登记）
+@@ -2163,7 +2201,7 @@
+     int negative = getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 1;   /* other numbers are later checks of probe-gfx */
+     for (unsigned k = 0; k < 2; k++) {
+         const uint8_t *p = (const uint8_t *)(uintptr_t)(k ? hc : hd);
+-        if (!negative) resolve_deferred(p, 0);
++        if (!negative) resolve_deferred(p);
+         unsigned seen = 0;
+         for (;;) {
+             op_hdr h; memcpy(&h, p, sizeof h);
+@@ -2448,7 +2486,7 @@
+     if (atomic_load(&g_def_on) < 0) { const char *e = getenv("TOTK_DEFERRED_BINDS"); atomic_store(&g_def_on, !(e && !strcmp(e, "0"))); LOG("[nvn] 延迟绑定：%s", atomic_load(&g_def_on) ? "提交时读句柄" : "录制时读句柄（TOTK_DEFERRED_BINDS=0，旧行为）"); }
+     if (atomic_load(&g_def_on)) {
+         int stats = perf_stats_on(); uint64_t r0 = stats ? now_ns() : 0;
+-        for (int i = 0; i < n; i++) if (copy_of(h[i])->has_def) resolve_deferred((const uint8_t *)h[i], 0);
++        for (int i = 0; i < n; i++) if (copy_of(h[i])->has_def) resolve_deferred((const uint8_t *)h[i]);
+         if (stats) {
+             g_def_ns += now_ns() - r0;
+             if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_command_owner.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_command_owner.h
+@@ -5,6 +5,9 @@
+ #include "native_scene.h"
+ 
+ typedef struct NvnCommandOwner NvnCommandOwner;
++// Compiled read ports. Ranges name this recording's inputs; contents are read
++// at submit, after checking the current pool and outstanding GPU writes.
++typedef struct { uint64_t lo, hi; } NvnCommandUniform;
+ typedef struct {
+     // Parent offset includes its OP_BEGIN; the child range starts just after
+     // the child's OP_BEGIN. Its own scopes use the child's local coordinates.
+@@ -34,6 +37,8 @@
+     size_t scene_scope_count;
+     const NvnSceneScope *scene_scopes;
+     int has_scene;
++    size_t uniform_count;
++    const NvnCommandUniform *uniforms;
+ } NvnCommandOwnerInfo;
+ 
+ // Acquire only while the guest handle is live. Metadata and all nested owners
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -1424,13 +1424,13 @@
+ typedef struct { uint64_t lo, hi; } usnap_rng;
+ typedef struct { usnap_rng *r; int n, cap; } usnap_rngs;
+ static usnap_rngs g_usr;   // replay side (the capture on the game thread uses its own list)
+-static void usnap_collect(usnap_rngs *v, const uint8_t *p, int depth) {
++static void usnap_collect_raw(usnap_rngs *v, const uint8_t *p, int depth) {
+     for (;;) {
+         op_hdr h; memcpy(&h, p, sizeof h);
+         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) MDIE("corrupt recording at %p while copying uniforms (op %u size %u)", (const void *)p, h.op, h.size);
+         if (h.op == OP_END) return;
+         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+-        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth < 16) usnap_collect(v, (const uint8_t *)(uintptr_t)t, depth + 1); }
++        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth < 16) usnap_collect_raw(v, (const uint8_t *)(uintptr_t)t, depth + 1); }
+         else if (h.op == OP_BIND_UBO) {
+             const p_bind_buf *b = (const p_bind_buf *)(p + 8);
+             if (b->addr && b->size && b->size <= 65536) {
+@@ -1440,6 +1440,26 @@
+         }
+         p += h.size;
+     }
++}
++static void usnap_collect_inputs(usnap_rngs *v, uint64_t handle, int owned) {
++    if (!owned) { usnap_collect_raw(v, (const void *)(uintptr_t)handle, 0); return; }
++    const NvnCommandOwnerInfo *program = nvn_command_owner_info(nvn_command_owner_borrow(handle));
++    if (!program) MDIE("uniform inputs have no recording owner");
++    size_t count = program->uniform_count;
++    if (count > INT_MAX - (size_t)v->n) MDIE("uniform input count overflow");
++    int needed = v->n + (int)count;
++    if (needed > v->cap) {
++        size_t capacity = (size_t)needed + (size_t)needed / 2;
++        if (capacity > INT_MAX) capacity = INT_MAX;
++        usnap_rng *ranges = realloc(v->r, capacity * sizeof *ranges);
++        if (!ranges) MDIE("uniform input storage");
++        v->r = ranges; v->cap = (int)capacity;
++    }
++    // This only supplies read ports. Pool ownership, submit-time contents and
++    // incomplete GPU writes are still resolved by the normal snapshot path.
++    _Static_assert(sizeof(usnap_rng) == sizeof(NvnCommandUniform), "uniform range ABI");
++    if (count) memcpy(v->r + v->n, program->uniforms, count * sizeof *v->r);
++    v->n = needed;
+ }
+ static int usnap_cmp(const void *x, const void *y) { const usnap_rng *a = x, *b = y; return a->lo < b->lo ? -1 : a->lo > b->lo; }
+ /* TOTK: sort ranges by start. A frame binds a few thousand uniform ranges; qsort with a compare callback took about 5% of
+@@ -1491,7 +1511,7 @@
+     c->done = c->ns = 0; c->n = 0; c->next = NULL;
+     return c;
+ }
+-void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
++static void *capture_ubos(const uint64_t *h, int n, int owned) {
+     static int on = -1;   // TOTK_UBO_CAPTURE=0 (A/B only): the translation thread copies at the start of the replay instead
+     if (on < 0) { const char *e = getenv("TOTK_UBO_CAPTURE"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("TOTK_UBO_CAPTURE=0：翻译线程模式下 uniform 在回放开始时才拷（对照用）"); }
+     if (!on || !usnap_on()) return NULL;
+@@ -1500,7 +1520,7 @@
+     usnap_cap *c = ucap_take();
+     c->done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // before the bytes: a write completing meanwhile only makes this conservative
+     usnap_rngs v = {c->r, 0, c->rcap};
+-    for (int i = 0; i < n; i++) usnap_collect(&v, (const uint8_t *)(uintptr_t)h[i], 0);
++    for (int i = 0; i < n; i++) usnap_collect_inputs(&v, h[i], owned);
+     c->r = v.r; c->rcap = v.cap;
+     if (v.n) {
+         rng_sort(v.r, v.n);
+@@ -1532,6 +1552,7 @@
+     if (measure) { c->ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; atomic_fetch_add(&g_ucap_ns, c->ns); }
+     return c;
+ }
++void *mtl_sub_capture_ubos(const uint64_t *h, int n) { return capture_ubos(h, n, 1); }
+ static void ucap_free(usnap_cap *c) {
+     if (!c) return;
+     pthread_mutex_lock(&g_ucap_mu);
+@@ -1551,7 +1572,7 @@
+     }
+ }
+ static int g_ucap_probe_now;   // probe-gpu-ubo-snapshot negative control only: judge GPU writes at the replay, not the capture
+-static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap);
++static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap, int owned);
+ /* Helper threads for phase 2 of usnap_take: each claims entries through an atomic cursor and copies them; the replay
+    thread signals them after phase 1 and goes on replaying. usnap_finish waits for them before the entries or the capture
+    are reused / freed (end of the submission; long after they are done in practice). */
+@@ -1593,13 +1614,13 @@
+     usnap_wait_helpers();
+     if (g_usnap_cap) { ucap_free((usnap_cap *)g_usnap_cap); g_usnap_cap = NULL; }
+ }
+-void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {
++static void snapshot_ubos(const uint64_t *h, int n, void *capv, int owned) {
+     usnap_cap *cap = capv;
+     usnap_finish();
+     g_nusnap = 0;
+     if (!usnap_on()) { g_ngw = 0; ucap_free(cap); g_fc_snap_end = g_fc_measure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0; return; }
+     uint64_t t0 = g_fc_measure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+-    usnap_take(h, n, cap);   // keeps cap in g_usnap_cap until the copies are done (usnap_finish)
++    usnap_take(h, n, cap, owned);   // keeps cap in g_usnap_cap until the copies are done (usnap_finish)
+     g_fc_snap_end = g_fc_measure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+     if (g_fc_measure) { g_usnap_ns += g_fc_snap_end - t0; g_usnap_n += (uint64_t)g_nusnap; }
+     if (g_fc_measure && ++g_usnap_subs % 1800 == 0) {
+@@ -1621,8 +1642,13 @@
+         memset(g_fc_t, 0, sizeof g_fc_t); g_fc_n = 0; g_exp_skip_fs_n = 0;
+     }
+ }
+-void mtl_sub_snapshot_ubos(const uint64_t *h, int n) { mtl_sub_snapshot_ubos_cap(h, n, NULL); }
+-static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap) {
++void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *cap) { snapshot_ubos(h, n, cap, 1); }
++// Raw command arrays belong to renderer diagnostics; production uses the
++// recording-owned program through mtl_sub_snapshot_ubos_cap.
++static void mtl_probe_snapshot_ubos(const uint64_t *h, int n) { snapshot_ubos(h, n, NULL, 0); }
++static void mtl_probe_snapshot_ubos_cap(const uint64_t *h, int n, void *cap) { snapshot_ubos(h, n, cap, 0); }
++static void *mtl_probe_capture_ubos(const uint64_t *h, int n) { return capture_ubos(h, n, 0); }
++static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap, int owned) {
+     uint64_t tq0 = g_fc_measure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+     uint64_t done = cap && !g_ucap_probe_now ? cap->done : __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+     int ng = 0; uint64_t gw_maxlen = 0;   // GPU writes not finished at the capture, sorted by start
+@@ -1633,7 +1659,7 @@
+     if (cap) {   // the bindings as captured (merged, inside pools); the merge below works on them as on fresh ones
+         if (cap->n > g_usr.cap) { g_usr.cap = cap->n + 256; g_usr.r = realloc(g_usr.r, g_usr.cap * sizeof *g_usr.r); if (!g_usr.r) MDIE("uniform copy ranges"); }
+         memcpy(g_usr.r, cap->r, sizeof *cap->r * (size_t)cap->n); g_usr.n = cap->n;
+-    } else for (int i = 0; i < n; i++) usnap_collect(&g_usr, (const uint8_t *)(uintptr_t)h[i], 0);
++    } else for (int i = 0; i < n; i++) usnap_collect_inputs(&g_usr, h[i], owned);
+     if (!g_usr.n) return;
+     usnap_rng *u = g_usr.r;
+     if (!cap) rng_sort(u, g_usr.n);
+@@ -14461,7 +14487,7 @@
+     mtl_pool_del(mem); return checked;
+ }
+ 
+-/* TOTK probe: uniform contents as of the submit call (mtl_sub_snapshot_ubos). A submission binds three uniform ranges, two
++/* TOTK probe: uniform contents as of the submit call (mtl_probe_snapshot_ubos). A submission binds three uniform ranges, two
+    close together (merged into one copy) and one far away behind an OP_CALL; after the snapshot the CPU rewrites all of
+    them, as the game's threads do while a submission is replayed. Reads (compute dispatches from the address a draw would
+    bind) and a pointer read (pend_read) must see the bytes of the submit call. A GPU buffer copy into the far range within
+@@ -14490,8 +14516,8 @@
+    the call returns (usnap_take phase 2), so the probe waits for them first; the game never writes that early (the copies
+    are done within ~0.15 ms, earlier than the single-threaded version finished them). */
+ static void usnap_wait_copies(void) { usnap_wait_helpers(); }
+-#define mtl_sub_snapshot_ubos(h, n) (mtl_sub_snapshot_ubos(h, n), usnap_wait_copies())
+-#define mtl_sub_snapshot_ubos_cap(h, n, c) (mtl_sub_snapshot_ubos_cap(h, n, c), usnap_wait_copies())
++#define mtl_probe_snapshot_ubos(h, n) (mtl_probe_snapshot_ubos(h, n), usnap_wait_copies())
++#define mtl_probe_snapshot_ubos_cap(h, n, c) (mtl_probe_snapshot_ubos_cap(h, n, c), usnap_wait_copies())
+ int mtl_probe_ubo_snapshot(void) {
+     mtl_init();
+     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int neg = ne ? atoi(ne) : 0, checked = 0;
+@@ -14516,7 +14542,7 @@
+     op_hdr end = {OP_END, 8};
+ 
+     /* 1. CPU rewrites after the submit call; a GPU copy within the submission */
+-    mtl_sub_begin(); mtl_sub_snapshot_ubos(h1, 1); mtl_exec((const uint8_t *)&end);
++    mtl_sub_begin(); mtl_probe_snapshot_ubos(h1, 1); mtl_exec((const uint8_t *)&end);
+     if (neg != 1) {
+         if (g_nusnap != 2) MDIE("ubo snapshot probe: %d copies, expected 2 (two close ranges merged, one far)", g_nusnap);
+         if (!usnap_find(a0, 96) || usnap_find(a0, 96) != usnap_find(a1, 64) || !usnap_find(a2, 128) || usnap_find(a2, 128) == usnap_find(a0, 96)) MDIE("ubo snapshot probe: copies do not cover the bound ranges");
+@@ -14539,7 +14565,7 @@
+     /* 2. a writable storage buffer of the previous submission, still executing, writes a bound range */
+     memset(mem + 256, 0x11, 96); memset(mem + 512, 0x11, 64);
+     id<MTLSharedEvent> hold = [g_dev newSharedEvent]; hold.signaledValue = 0;
+-    mtl_sub_begin(); mtl_sub_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);
++    mtl_sub_begin(); mtl_probe_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);
+     { void *mb; uint64_t mo, gpu; if (!mtl_gpu_addr(a0, 96, &mb, &mo, &gpu)) MDIE("ubo snapshot probe: range not in the pool");
+       usnap_drop(a0, 96);   // as encode_args does for a writable storage-buffer binding
+       rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+@@ -14550,7 +14576,7 @@
+     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ hold.signaledValue = 1; });   // release it even if something below waited
+     if (neg == 3) g_ngw = 0;
+     uint64_t skip0 = g_usnap_skip_gpu;
+-    mtl_sub_begin(); mtl_sub_snapshot_ubos(h1, 1); mtl_exec((const uint8_t *)&end);
++    mtl_sub_begin(); mtl_probe_snapshot_ubos(h1, 1); mtl_exec((const uint8_t *)&end);
+     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+     if (done >= writer) MDIE("ubo snapshot probe: the held-back submission completed early (done %llu, writer %llu)", (unsigned long long)done, (unsigned long long)writer); checked++;
+     if (neg != 3) {
+@@ -14572,7 +14598,7 @@
+         for (int i = 0; i < 24; i++) q += usp_bind(q, 1, i & 15, bb + (uint64_t)i * 60 * 1024, 64 * 1024);
+         { op_hdr h = {OP_END, 8}; memcpy(q, &h, 8); }
+         const uint64_t hb[1] = {(uint64_t)(uintptr_t)rb};
+-        mtl_sub_begin(); mtl_sub_snapshot_ubos(hb, 1); mtl_exec((const uint8_t *)&end);
++        mtl_sub_begin(); mtl_probe_snapshot_ubos(hb, 1); mtl_exec((const uint8_t *)&end);
+         if (g_nusnap != 2) MDIE("ubo snapshot probe: %d copies of the overlapping ranges, expected 2", g_nusnap); checked++;
+         for (int i = 0; i < g_nusnap; i++) {
+             if (g_usnap[i].hi - g_usnap[i].lo > (1u << 20)) MDIE("ubo snapshot probe: copy %d holds %llu bytes", i, (unsigned long long)(g_usnap[i].hi - g_usnap[i].lo));
+@@ -14592,16 +14618,16 @@
+        capture, writes a bound range: that range is read on the GPU timeline (the capture predates the write). */
+     if (neg != 1) {
+         memset(mem + 256, 0x11, 96); memset(mem + 512, 0x11, 64); memset(mem + 8192, 0x11, 128);
+-        void *cap = neg == 4 ? NULL : mtl_sub_capture_ubos(h1, 1);
++        void *cap = neg == 4 ? NULL : mtl_probe_capture_ubos(h1, 1);
+         memset(mem + 256, 0x44, 96); memset(mem + 512, 0x45, 64);   // the game, before the translation thread gets to it
+-        mtl_sub_begin(); mtl_sub_snapshot_ubos_cap(h1, 1, cap); mtl_exec((const uint8_t *)&end);
++        mtl_sub_begin(); mtl_probe_snapshot_ubos_cap(h1, 1, cap); mtl_exec((const uint8_t *)&end);
+         usp_read(ps, a0, 96, out, 1024); usp_read(ps, a1, 64, out, 1024 + 128);
+         mtl_sub_commit(); mtl_finish();
+         checked += usp_expect(o + 1024, 96, 0x11, "read of a captured range rewritten before the replay");
+         checked += usp_expect(o + 1024 + 128, 64, 0x11, "read of the merged neighbour, captured");
+         memset(mem + 256, 0x11, 96);
+-        cap = mtl_sub_capture_ubos(h1, 1);
+-        mtl_sub_begin(); mtl_sub_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);   // the earlier submission, replayed after the capture
++        cap = mtl_probe_capture_ubos(h1, 1);
++        mtl_sub_begin(); mtl_probe_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);   // the earlier submission, replayed after the capture
+         { void *mb; uint64_t mo, gpu; if (!mtl_gpu_addr(a0, 96, &mb, &mo, &gpu)) MDIE("ubo snapshot probe: range not in the pool");
+           usnap_drop(a0, 96);
+           rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+@@ -14609,7 +14635,7 @@
+           [ce dispatchThreads:MTLSizeMake(96, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; enc_c_end(ce); }
+         mtl_sub_commit(); mtl_finish();   // completed before the replay below starts
+         g_ucap_probe_now = neg == 5;
+-        mtl_sub_begin(); mtl_sub_snapshot_ubos_cap(h1, 1, cap); mtl_exec((const uint8_t *)&end);
++        mtl_sub_begin(); mtl_probe_snapshot_ubos_cap(h1, 1, cap); mtl_exec((const uint8_t *)&end);
+         g_ucap_probe_now = 0;
+         if (neg != 5) { if (usnap_find(a0, 96) || !usnap_find(a2, 128)) MDIE("ubo snapshot probe: the range written after the capture was copied (or the far range was not)"); checked++; }
+         usp_read(ps, a0, 96, out, 1280);
+@@ -14651,7 +14677,7 @@
+                 at+=usp_bind(at,0,0,(uint64_t)(uintptr_t)(many+offset),16);
+             }
+             memcpy(at,&end,8);uint64_t handles[]={(uint64_t)(uintptr_t)cmd};
+-            mtl_sub_begin();mtl_sub_snapshot_ubos(handles,1);mtl_exec((const uint8_t *)&end);
++            mtl_sub_begin();mtl_probe_snapshot_ubos(handles,1);mtl_exec((const uint8_t *)&end);
+             if(g_nusnap!=(int)count)MDIE("snapshot index probe unexpected range count");checked++;
+             memset(many,0xe7,bytes);
+             for(unsigned i=0;i<count;i++) {
+@@ -14679,8 +14705,8 @@
+     atomic_store(&g_usnap_on, 1); g_usnap_drop_off = 0; g_usnap_index_negative=0;
+     mtl_pool_del(mem); return checked;
+ }
+-#undef mtl_sub_snapshot_ubos
+-#undef mtl_sub_snapshot_ubos_cap
++#undef mtl_probe_snapshot_ubos
++#undef mtl_probe_snapshot_ubos_cap
+ 
+ /* TOTK probe: the driver constant segment c0 of a compute shader through the production dispatch (dispatch() ->
+    encode_args). The kernel has the translated shaders' interface (cp_c0 / cp_s0 in argument buffer 0) and, like the
+@@ -15160,7 +15186,7 @@
+         memcpy(mem,colors,16); mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+         p_bind_buf u = {1,0,(uint64_t)(uintptr_t)mem,16}, storage = {1,0,0x1234,16};
+         uint8_t commands[128]; uint8_t *w = lp_rec(commands,OP_BIND_UBO,&u,sizeof u); lp_end(w);
+-        uint64_t handle = (uint64_t)(uintptr_t)commands; mtl_sub_snapshot_ubos(&handle,1);
++        uint64_t handle = (uint64_t)(uintptr_t)commands; mtl_probe_snapshot_ubos(&handle,1);
+         if (!usnap_find(u.addr,16)) MDIE("argument epoch probe missing snapshot");
+         memcpy(mem,colors+4,16); state_op(OP_BIND_UBO,&u); state_op(OP_BIND_SSBO,&storage); args_dirty_all(); g_pass.serial++;
+         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = texture;
+@@ -15185,7 +15211,7 @@
+         // Exercise CBUF's ready-shadow path through real argument encoding.
+         // Pending updates must take precedence over the still-valid snapshot.
+         memcpy(mem,colors,16); mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+-        mtl_sub_snapshot_ubos(&handle,1);
++        mtl_probe_snapshot_ubos(&handle,1);
+         state_op(OP_BIND_UBO,&u); state_op(OP_BIND_SSBO,&storage); g_pass.serial++;
+         rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = texture;
+         rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
