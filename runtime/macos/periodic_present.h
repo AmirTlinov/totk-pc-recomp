@@ -34,16 +34,15 @@ int periodic_present_enabled(void);
 // Convert a guest frame's normal display-link stride into the configured
 // anchor stride. Display ticks left between anchors belong to retained phases.
 unsigned periodic_present_anchor_ticks(PeriodicAnchorCadence *, unsigned display_hz, unsigned fallback_ticks);
-// Capture the canvas once, immediately before the first UI draw. The same
-// canvas remains the post-UI source; anchor capture snapshots it again and the
-// phase pass keeps only pixels changed by UI at their original coordinates.
-int periodic_present_capture_scene(id<MTL4CommandBuffer> command_buffer,
-                                   id<MTLTexture> canvas, uint64_t frame);
+// Share the UI owner's immutable pre-UI image. Publish only after the command
+// buffer containing its copy has entered the queue. Canvas identifies the exact
+// UI program; a previous frame cannot satisfy either input.
+int periodic_present_share_scene(id<MTL4CommandBuffer> command_buffer,
+    id<MTLTexture> canvas, id<MTLTexture> scene, uint64_t frame);
 uint64_t periodic_present_capture_anchor(id<MTL4CommandBuffer> command_buffer,
                                          id<MTLTexture> source, uint64_t frame,
                                          double presentation_time, NativeMousePhase input,
-                                         PeriodicSimulationStamp simulation,
-                                         MTLPixelFormat output_format);
+                                         PeriodicSimulationStamp simulation);
 // Publish snapshots only after their command buffer has been committed. Passing
 // committed=0 releases snapshots encoded into a discarded command buffer.
 void periodic_present_finish_submission(id<MTL4CommandBuffer> command_buffer, int committed);
@@ -53,5 +52,8 @@ id<MTLTexture> periodic_present_encode_phase(id<MTL4CommandBuffer> command_buffe
                                              double presentation_time,
                                              NativeMousePhase input,
                                              PeriodicPresentState *state);
+// Call exactly once from this slot's GPU feedback, before releasing its command
+// allocator. A phase holds both snapshots until the GPU has finished reading.
+void periodic_present_complete_phase(unsigned slot);
 int periodic_present_probe(void);
 #endif

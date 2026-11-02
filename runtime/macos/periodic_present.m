@@ -1,6 +1,7 @@
 #import "periodic_present.h"
 #include "periodic_camera.h"
 #include "periodic_state.h"
+#include "periodic_ui.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -20,7 +21,6 @@ typedef struct {
     float pitch_sin_cos[2];
     float tan_half_fov[2];
     float limit[2];
-    float ui_mask[4];
 } PhaseParameters;
 
 typedef struct {
@@ -32,13 +32,13 @@ typedef struct {
 } PeriodicSceneCapture;
 
 typedef struct {
-    id<MTLTexture> anchor;
     id<MTLTexture> scene;
     NSUInteger width, height;
     uint64_t source_frame, anchor_generation;
     NativeMousePhase anchor_input;
     PeriodicCamera anchor_camera;
     PeriodicAnchorClock clock;
+    PeriodicSceneCapture *capture;
     _Atomic uint64_t last_input_generation;
     _Atomic uint64_t last_phase_bits;
     _Atomic uintptr_t pending_command_buffer;
@@ -54,6 +54,9 @@ static struct {
     id<MTLBuffer> parameters[PHASE_SLOTS];
     id<MTL4ArgumentTable> arguments[PHASE_SLOTS];
     MTL4RenderPassDescriptor *passes[PHASE_SLOTS];
+    _Atomic(PeriodicAnchorSnapshot *) phase_anchors[PHASE_SLOTS];
+    PeriodicUIProgram *phase_ui[PHASE_SLOTS];
+    id<MTLTexture> phase_targets[PHASE_SLOTS];
     id<MTLRenderPipelineState> pipeline;
     id<MTLSamplerState> sampler;
     MTLPixelFormat format;
@@ -159,9 +162,8 @@ static int make_pipeline(MTLPixelFormat format) {
         "vertex V periodic_phase_vertex(uint id [[vertex_id]]) {\n"
         "  float2 uv=float2((id<<1)&2,id&2); V o; o.position=float4(uv*float2(2,-2)+float2(-1,1),0,1); o.uv=uv; return o;\n"
         "}\n"
-        "struct P { float2 yaw_sin_cos; float2 pitch_sin_cos; float2 tan_half_fov; float2 limit; float4 ui_mask; };\n"
-        "fragment float4 periodic_phase_fragment(V in [[stage_in]], texture2d<float> color [[texture(0)]],\n"
-        "  texture2d<float> scene [[texture(1)]],\n"
+        "struct P { float2 yaw_sin_cos; float2 pitch_sin_cos; float2 tan_half_fov; float2 limit; };\n"
+        "fragment float4 periodic_phase_fragment(V in [[stage_in]], texture2d<float> scene [[texture(0)]],\n"
         "  sampler sample [[sampler(0)]], constant P &p [[buffer(0)]]) {\n"
         "  float3 ray=float3((in.uv.x*2.0-1.0)*p.tan_half_fov.x,\n"
         "                    (1.0-in.uv.y*2.0)*p.tan_half_fov.y,1.0);\n"
@@ -173,10 +175,7 @@ static int make_pipeline(MTLPixelFormat format) {
         "                   0.5-ray.y/(2.0*ray.z*p.tan_half_fov.y));\n"
         "  uv=clamp(uv,p.limit,1.0-p.limit);\n"
         "  float4 world=scene.sample(sample,uv);\n"
-        "  float4 base=scene.sample(sample,in.uv),composite=color.sample(sample,in.uv);\n"
-        "  float changed=max(max(abs(composite.r-base.r),abs(composite.g-base.g)),abs(composite.b-base.b));\n"
-        "  float ui=p.ui_mask.x*smoothstep(p.ui_mask.y,p.ui_mask.z,changed);\n"
-        "  return mix(world,composite,ui);\n"
+        "  return world;\n"
         "}\n";
     MTLCompileOptions *options = [MTLCompileOptions new];
     options.mathMode = MTLMathModeSafe;
@@ -209,7 +208,7 @@ void periodic_present_prepare(id<MTLDevice> device, PeriodicPresentResidencyFn r
     NSError *error = nil;
     MTL4ArgumentTableDescriptor *arguments = [MTL4ArgumentTableDescriptor new];
     arguments.maxBufferBindCount = 1;
-    arguments.maxTextureBindCount = 2;
+    arguments.maxTextureBindCount = 1;
     arguments.maxSamplerStateBindCount = 1;
     for (unsigned slot = 0; slot < PHASE_SLOTS; ++slot) {
         presenter.arguments[slot] = [device newArgumentTableWithDescriptor:arguments error:&error];
@@ -238,39 +237,17 @@ unsigned periodic_present_anchor_ticks(PeriodicAnchorCadence *cadence, unsigned 
     return periodic_clock_anchor_stride(cadence, display_hz, presenter.anchor_hz, fallback_ticks);
 }
 
-static int capture_scene_texture(PeriodicSceneCapture *capture, id<MTLTexture> source) {
-    if (capture->scene && capture->scene.width == source.width &&
-        capture->scene.height == source.height && capture->scene.pixelFormat == source.pixelFormat)
-        return 1;
-    capture->scene = nil;
-    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:source.pixelFormat width:source.width height:source.height mipmapped:NO];
-    descriptor.storageMode = MTLStorageModePrivate;
-    descriptor.usage = MTLTextureUsageShaderRead;
-    capture->scene = [presenter.device newTextureWithDescriptor:descriptor];
-    if (!capture->scene) return 0;
-    retain_allocation((id<MTLAllocation>)capture->scene);
-    return 1;
-}
-
-int periodic_present_capture_scene(id<MTL4CommandBuffer> command_buffer,
-                                   id<MTLTexture> canvas, uint64_t frame) {
-    if (!presenter.enabled || !command_buffer || !canvas || frame == UINT64_MAX) return 0;
+int periodic_present_share_scene(id<MTL4CommandBuffer> command_buffer,
+    id<MTLTexture> canvas, id<MTLTexture> scene, uint64_t frame) {
+    if (!presenter.enabled || !command_buffer || !canvas || !scene || frame == UINT64_MAX ||
+        canvas.width != scene.width || canvas.height != scene.height ||
+        canvas.pixelFormat != scene.pixelFormat || canvas == scene) return 0;
     PeriodicSceneCapture *capture = &presenter.captures[frame % CAPTURE_SLOTS];
     uint32_t expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&capture->state, &expected, SLOT_WRITING,
                                                  memory_order_acq_rel, memory_order_acquire)) return 0;
-    atomic_store_explicit(&capture->frame, 0, memory_order_relaxed);
-    if (!capture_scene_texture(capture, canvas)) {
-        atomic_store_explicit(&capture->state, 0, memory_order_release);
-        return 0;
-    }
     capture->source = canvas;
-    id<MTL4ComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-    [encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll
-                     visibilityOptions:MTL4VisibilityOptionDevice];
-    [encoder copyFromTexture:canvas toTexture:capture->scene];
-    [encoder endEncoding];
+    capture->scene = scene;
     atomic_store_explicit(&capture->frame, frame + 1, memory_order_relaxed);
     atomic_store_explicit(&capture->pending_command_buffer,
                           (uintptr_t)(__bridge void *)command_buffer, memory_order_release);
@@ -303,70 +280,58 @@ PeriodicCamera periodic_present_camera(uint64_t anchor_frame) {
     return camera;
 }
 
-static int ensure_anchor(PeriodicAnchorSnapshot *anchor, id<MTLTexture> source) {
-    if (anchor->anchor && anchor->width == source.width && anchor->height == source.height &&
-        anchor->anchor.pixelFormat == source.pixelFormat) return 1;
-    anchor->anchor = nil;
-    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:source.pixelFormat width:source.width height:source.height mipmapped:NO];
-    descriptor.storageMode = MTLStorageModePrivate;
-    descriptor.usage = MTLTextureUsageShaderRead;
-    anchor->anchor = [presenter.device newTextureWithDescriptor:descriptor];
-    if (!anchor->anchor) return 0;
-    retain_allocation((id<MTLAllocation>)anchor->anchor);
-    anchor->width = source.width;
-    anchor->height = source.height;
-    return 1;
-}
-
-static int scene_capture(uint64_t anchor_frame, id<MTLTexture> presented,
-                         id<MTLTexture> *source_out, id<MTLTexture> *scene_out) {
-    for (unsigned behind = 0; behind < 2 && anchor_frame >= behind; ++behind) {
-        uint64_t frame = anchor_frame - behind;
-        PeriodicSceneCapture *capture = &presenter.captures[frame % CAPTURE_SLOTS];
-        if (!slot_read_acquire(&capture->state)) continue;
-        uint64_t tag = atomic_load_explicit(&capture->frame, memory_order_relaxed);
-        id<MTLTexture> source = capture->source;
-        id<MTLTexture> scene = capture->scene;
-        int valid = tag == frame + 1 && source && scene &&
-            source.width == presented.width && source.height == presented.height &&
-            source.width == scene.width && source.height == scene.height &&
-            source.pixelFormat == scene.pixelFormat;
-        if (valid) { *source_out = source; *scene_out = scene; }
-        slot_read_release(&capture->state);
-        if (valid) return 1;
-    }
-    return 0;
+static PeriodicSceneCapture *scene_capture(uint64_t frame, id<MTLTexture> presented,
+                     id<MTLTexture> *source_out, id<MTLTexture> *scene_out) {
+    PeriodicSceneCapture *capture = &presenter.captures[frame % CAPTURE_SLOTS];
+    if (!slot_read_acquire(&capture->state)) return NULL;
+    uint64_t tag = atomic_load_explicit(&capture->frame, memory_order_relaxed);
+    id<MTLTexture> source = capture->source;
+    id<MTLTexture> scene = capture->scene;
+    int valid = tag == frame + 1 && source && scene &&
+        source.width == presented.width && source.height == presented.height &&
+        source.width == scene.width && source.height == scene.height &&
+        source.pixelFormat == scene.pixelFormat;
+    if (valid) { *source_out = source; *scene_out = scene; }
+    slot_read_release(&capture->state);
+    return valid ? capture : NULL;
 }
 
 uint64_t periodic_present_capture_anchor(id<MTL4CommandBuffer> command_buffer,
                                          id<MTLTexture> source, uint64_t frame,
                                          double presentation_time, NativeMousePhase input,
-                                         PeriodicSimulationStamp simulation,
-                                         MTLPixelFormat output_format) {
+                                         PeriodicSimulationStamp simulation) {
     if (!presenter.enabled || !command_buffer || !source || !isfinite(presentation_time) ||
         presentation_time <= 0 || presentation_time >= (double)UINT64_MAX / 1e9) return 0;
     id<MTLTexture> anchor_source = nil, scene = nil;
-    if (!scene_capture(frame, source, &anchor_source, &scene)) anchor_source = source;
+    PeriodicSceneCapture *capture = scene_capture(frame, source, &anchor_source, &scene);
+    if (!capture) return 0;
     PeriodicAnchorSnapshot *anchor = anchor_write_acquire(NULL);
     if (!anchor) return 0;
-    if (!ensure_anchor(anchor, anchor_source)) {
-        atomic_store_explicit(&anchor->state, 0, memory_order_release);
-        return 0;
-    }
     // Build the immutable shader state at the first anchor. A first mouse
     // movement must never compile a pipeline in the display callback.
-    if ((!presenter.pipeline && !make_pipeline(output_format)) ||
-        (presenter.pipeline && presenter.format != output_format)) {
+    if ((!presenter.pipeline && !make_pipeline(anchor_source.pixelFormat)) ||
+        (presenter.pipeline && presenter.format != anchor_source.pixelFormat)) {
         atomic_store_explicit(&anchor->state, 0, memory_order_release);
         return 0;
     }
-    id<MTL4ComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-    [encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll
-                     visibilityOptions:MTL4VisibilityOptionDevice];
-    [encoder copyFromTexture:anchor_source toTexture:anchor->anchor];
-    [encoder endEncoding];
-    anchor->scene = scene ?: anchor->anchor;
+    for (unsigned i = 0; i < PHASE_SLOTS; ++i) {
+        id<MTLTexture> target = presenter.phase_targets[i];
+        if (target && target.width == anchor_source.width && target.height == anchor_source.height &&
+            target.pixelFormat == anchor_source.pixelFormat) continue;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:anchor_source.pixelFormat
+            width:anchor_source.width height:anchor_source.height mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        presenter.phase_targets[i] = [presenter.device newTextureWithDescriptor:d];
+        if (!presenter.phase_targets[i]) {
+            atomic_store_explicit(&anchor->state, 0, memory_order_release); return 0;
+        }
+        retain_allocation(presenter.phase_targets[i]);
+    }
+    anchor->scene = scene;
+    anchor->capture = capture;
+    anchor->width = scene.width;
+    anchor->height = scene.height;
     // The display interval comes from anchor cadence, never from a smoothed
     // measurement that could extend an owner's temporal applicability.
     unsigned anchor_hz = presenter.anchor_hz ? presenter.anchor_hz : 60;
@@ -407,7 +372,7 @@ void periodic_present_finish_submission(id<MTL4CommandBuffer> command_buffer, in
 static int phase_ready(const PeriodicAnchorSnapshot *anchor,
                        double presentation_time, NativeMousePhase input,
                        double *yaw_out, double *pitch_out) {
-    if (!presenter.enabled || !anchor ||
+    if (!presenter.enabled || !anchor || !anchor->capture ||
         input.generation == atomic_load_explicit(&anchor->last_input_generation, memory_order_acquire) ||
         !isfinite(presentation_time) || presentation_time <= 0 ||
         presentation_time >= (double)UINT64_MAX / 1e9) return 0;
@@ -441,7 +406,8 @@ id<MTLTexture> periodic_present_encode_phase(id<MTL4CommandBuffer> command_buffe
                                              NativeMousePhase input,
                                              PeriodicPresentState *state) {
     if (!command_buffer || !destination || !state || slot >= PHASE_SLOTS) return nil;
-    if (!presenter.pipeline || presenter.format != destination.pixelFormat) return nil;
+    if (atomic_load_explicit(&presenter.phase_anchors[slot], memory_order_acquire)) return nil;
+    if (!presenter.pipeline) return nil;
     PeriodicAnchorSnapshot *anchor = anchor_read_acquire(NULL);
     if (!anchor) return nil;
     if (destination.width != anchor->width || destination.height != anchor->height) {
@@ -466,6 +432,26 @@ id<MTLTexture> periodic_present_encode_phase(id<MTL4CommandBuffer> command_buffe
         slot_read_release(&anchor->state);
         return nil;
     }
+    // An Objective-C reference keeps the texture object alive, not its pixels.
+    // The capture producer must also be excluded until this GPU read finishes.
+    PeriodicSceneCapture *capture = anchor->capture;
+    if (capture) {
+        if (!slot_read_acquire(&capture->state)) {
+            slot_read_release(&anchor->state); return nil;
+        }
+        if (atomic_load_explicit(&capture->frame, memory_order_acquire) != anchor->source_frame + 1 ||
+            capture->scene != anchor->scene) {
+            slot_read_release(&capture->state); slot_read_release(&anchor->state); return nil;
+        }
+    }
+    PeriodicUIProgram *ui = periodic_ui_acquire(anchor->source_frame, capture->source);
+    id<MTLTexture> target = presenter.phase_targets[slot];
+    if (!ui || periodic_ui_scene(ui) != anchor->scene || !target ||
+        target.width != anchor->width || target.height != anchor->height ||
+        target.pixelFormat != presenter.format) {
+        if (ui) periodic_ui_release(ui);
+        slot_read_release(&capture->state); slot_read_release(&anchor->state); return nil;
+    }
     PhaseParameters *parameters = presenter.parameters[slot].contents;
     // This diagnostic resamples previously visible rays. It has no geometry
     // for newly exposed pixels and cannot certify a complete temporal state.
@@ -483,17 +469,12 @@ id<MTLTexture> periodic_present_encode_phase(id<MTL4CommandBuffer> command_buffe
     parameters->tan_half_fov[0] = parameters->tan_half_fov[1] * aspect;
     parameters->limit[0] = 0.5f / (float)anchor->width;
     parameters->limit[1] = 0.5f / (float)anchor->height;
-    parameters->ui_mask[0] = anchor->scene != anchor->anchor;
-    parameters->ui_mask[1] = 1.0e-5f;
-    parameters->ui_mask[2] = 1.0e-3f;
-    parameters->ui_mask[3] = 0;
     id<MTL4ArgumentTable> arguments = presenter.arguments[slot];
-    [arguments setTexture:anchor->anchor.gpuResourceID atIndex:0];
-    [arguments setTexture:anchor->scene.gpuResourceID atIndex:1];
+    [arguments setTexture:anchor->scene.gpuResourceID atIndex:0];
     [arguments setSamplerState:presenter.sampler.gpuResourceID atIndex:0];
     [arguments setAddress:presenter.parameters[slot].gpuAddress atIndex:0];
     MTL4RenderPassDescriptor *pass = presenter.passes[slot];
-    pass.colorAttachments[0].texture = destination;
+    pass.colorAttachments[0].texture = target;
     pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTL4RenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
@@ -504,13 +485,28 @@ id<MTLTexture> periodic_present_encode_phase(id<MTL4CommandBuffer> command_buffe
     [encoder setViewport:(MTLViewport){0, 0, anchor->width, anchor->height, 0, 1}];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
+    if (!periodic_ui_encode(ui, command_buffer, target, target, slot)) {
+        periodic_ui_release(ui);
+        slot_read_release(&capture->state); slot_read_release(&anchor->state); return nil;
+    }
+    presenter.phase_ui[slot] = ui;
     atomic_store_explicit(&anchor->last_input_generation, input.generation, memory_order_release);
     atomic_store_explicit(&anchor->last_phase_bits, phase_to_bits(phase), memory_order_release);
     *state = (PeriodicPresentState){.source_frame=anchor->source_frame,
         .anchor_id=anchor->source_frame,
         .state_generation=periodic_phase_publish(), .phase=phase, .time=time};
+    atomic_store_explicit(&presenter.phase_anchors[slot], anchor, memory_order_release);
+    return target;
+}
+
+void periodic_present_complete_phase(unsigned slot) {
+    if (slot >= PHASE_SLOTS) return;
+    PeriodicAnchorSnapshot *anchor = atomic_exchange_explicit(&presenter.phase_anchors[slot],
+        NULL, memory_order_acq_rel);
+    if (!anchor) return;
+    periodic_ui_release(presenter.phase_ui[slot]); presenter.phase_ui[slot] = NULL;
+    if (anchor->capture) slot_read_release(&anchor->capture->state);
     slot_read_release(&anchor->state);
-    return destination;
 }
 
 typedef struct {
@@ -643,8 +639,22 @@ int periodic_present_probe(void) {
         PeriodicCamera camera = periodic_present_camera(41);
         if (fabsf(camera.vertical_fov - 0.9f) > 1e-6f || fabsf(camera.aspect - 2.0f) > 1e-6f) return 1;
 
+        NSString *uiSource = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "vertex float4 ui_v(uint i [[vertex_id]]) {float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};return float4(p[i],0,1); }\n"
+            "fragment float4 ui_f(){return float4(16.0/255.0,32.0/255.0,1,1); }\n";
+        id<MTLLibrary> uiLibrary = [device newLibraryWithSource:uiSource options:nil error:&error];
+        MTLRenderPipelineDescriptor *uiDescriptor = [MTLRenderPipelineDescriptor new];
+        uiDescriptor.vertexFunction = [uiLibrary newFunctionWithName:@"ui_v"];
+        uiDescriptor.fragmentFunction = [uiLibrary newFunctionWithName:@"ui_f"];
+        uiDescriptor.colorAttachments[0].pixelFormat = source.pixelFormat;
+        id<MTLRenderPipelineState> uiPipeline = [device newRenderPipelineStateWithDescriptor:uiDescriptor error:&error];
+        if (!uiPipeline) return 1;
         [scene_cb beginCommandBufferWithAllocator:scene_allocator];
-        if (!periodic_present_capture_scene(scene_cb, source, 41)) return 1;
+        PeriodicUIProgram *ui = periodic_ui_begin(scene_cb, 41, 1, source);
+        PeriodicUIDraw uiDraw = {.pipeline=uiPipeline, .viewport={0,0,32,16,0,1},
+            .scissor={14,6,4,4}, .primitive=MTLPrimitiveTypeTriangle, .count=3, .instances=1};
+        if (!ui || !periodic_ui_append(ui, &uiDraw) ||
+            !periodic_present_share_scene(scene_cb, source, periodic_ui_scene(ui), 41)) return 1;
         [scene_cb endCommandBuffer];
         [residency commit];
         dispatch_semaphore_t scene_done = dispatch_semaphore_create(0);
@@ -664,9 +674,10 @@ int periodic_present_probe(void) {
                           visibilityOptions:MTL4VisibilityOptionDevice];
         [ui_encoder copyFromTexture:composite toTexture:source];
         [ui_encoder endEncoding];
+        if (!periodic_ui_compare(ui, anchor_cb, source)) return 1;
         uint64_t anchor_generation = periodic_present_capture_anchor(anchor_cb, source, 41, 1.0,
             (NativeMousePhase){0,0,1}, (PeriodicSimulationStamp){42, UINT64_C(1000000000),
-                UINT64_C(1000000000) / 60}, destination.pixelFormat);
+                UINT64_C(1000000000) / 60});
         NativeMousePhase phase_input = {.yaw=0.07, .pitch=0, .generation=2};
         if (!anchor_generation || periodic_present_phase_due(1.008, phase_input)) return 1;
         [anchor_cb endCommandBuffer];
@@ -676,6 +687,7 @@ int periodic_present_probe(void) {
         MTL4CommitOptions *anchor_options = [MTL4CommitOptions new];
         [anchor_options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
             anchor_error = feedback.error;
+            periodic_ui_completed(ui, feedback.error != nil);
             dispatch_semaphore_signal(anchor_done);
         }];
         id<MTL4CommandBuffer> anchor_buffers[] = {anchor_cb};
@@ -683,6 +695,9 @@ int periodic_present_probe(void) {
         periodic_present_finish_submission(anchor_cb, 1);
         if (!periodic_present_phase_due(1.008, phase_input)) return 1;
 
+        if (dispatch_semaphore_wait(scene_done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) ||
+            dispatch_semaphore_wait(anchor_done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) ||
+            scene_error || anchor_error) return 1;
         [phase_cb beginCommandBufferWithAllocator:phase_allocator];
         PeriodicPresentState state = {0};
         id<MTLTexture> output = periodic_present_encode_phase(phase_cb, 0, destination, 1.008,
@@ -695,6 +710,11 @@ int periodic_present_probe(void) {
              destinationBytesPerRow:128 destinationBytesPerImage:2048];
             [encoder endEncoding];
         }
+        PeriodicAnchorSnapshot *leased = atomic_load(&presenter.phase_anchors[0]);
+        uint32_t free_anchor = 0, free_scene = 0;
+        if (!leased || !leased->capture ||
+            atomic_compare_exchange_strong(&leased->state, &free_anchor, SLOT_WRITING) ||
+            atomic_compare_exchange_strong(&leased->capture->state, &free_scene, SLOT_WRITING)) return 1;
         [phase_cb endCommandBuffer];
         if (!output || state.source_frame != 41 || state.anchor_id != 41 || state.state_generation <= anchor_generation ||
             !(state.phase > 0 && state.phase < 1)) return 1;
@@ -702,12 +722,15 @@ int periodic_present_probe(void) {
         dispatch_semaphore_t done = dispatch_semaphore_create(0);
         __block NSError *gpu_error = nil;
         MTL4CommitOptions *options = [MTL4CommitOptions new];
-        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) { gpu_error = feedback.error; dispatch_semaphore_signal(done); }];
+        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            gpu_error = feedback.error;
+            periodic_present_complete_phase(0);
+            dispatch_semaphore_signal(done);
+        }];
         [queue commit:buffers count:1 options:options];
-        if (dispatch_semaphore_wait(scene_done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) ||
-            dispatch_semaphore_wait(anchor_done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) ||
-            dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) ||
-            scene_error || anchor_error || gpu_error) return 1;
+        if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) || gpu_error ||
+            atomic_load(&presenter.phase_anchors[0]) || atomic_load(&leased->state) ||
+            atomic_load(&leased->capture->state)) return 1;
         const uint8_t *out = readback.contents;
         unsigned world_pixel = (8 * 32 + 8) * 4, ui_pixel = (8 * 32 + 16) * 4;
         int shifted = out[world_pixel] > pixels[world_pixel];

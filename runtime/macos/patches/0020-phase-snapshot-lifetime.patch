@@ -1,0 +1,330 @@
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+@@ -210,9 +210,19 @@
+     }
+     return enabled;
+ }
+-@interface TotkCommitOptions : MTL4CommitOptions { @public NSMutableArray *handlers; BOOL keepalive_handler; } @end
++@interface TotkCommitOptions : MTL4CommitOptions { @public NSMutableArray *handlers; BOOL keepalive_handler; }
++- (void)armFeedbackHandlers;
++@end
+ @implementation TotkCommitOptions
+-- (void)addFeedbackHandler:(MTL4CommitFeedbackHandler)block { if (!handlers) handlers = [NSMutableArray array]; [handlers addObject:[block copy]]; [super addFeedbackHandler:block]; }
++- (void)addFeedbackHandler:(MTL4CommitFeedbackHandler)block {
++    if (!handlers) handlers = [NSMutableArray array];
++    [handlers addObject:[block copy]];
++}
++- (void)armFeedbackHandlers {
++    // Metal consumes the registered handlers at commit. Retain our immutable
++    // blocks and register them for every use of these slot-owned options.
++    for (MTL4CommitFeedbackHandler block in handlers) [super addFeedbackHandler:block];
++}
+ @end
+ static TotkCommitOptions *g_periodic_present_options[3];
+ static void gpu_budget_check(const char *where);
+@@ -247,15 +257,20 @@
+     pthread_mutex_lock(&g_bg_mu); while (atomic_load(&g_app_inactive)) pthread_cond_wait(&g_bg_cv, &g_bg_mu); pthread_mutex_unlock(&g_bg_mu);
+     MLOG("App 不在前台：GPU 提交暂停了 %.1f s，现在继续", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+ }
++static void q4_prepare_options(TotkCommitOptions *o) {
++    if (o->keepalive_handler) return;
++    o->keepalive_handler = YES;
++    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; if (atomic_fetch_sub(&g_q4_inflight, 1) == 1 && g_ka_idle) dispatch_semaphore_signal(g_ka_idle); }];
++}
+ static void q4_commit_inner(id<MTL4CommandBuffer> cb, TotkCommitOptions *o, int residency_dirty) {
+     bg_gate();
+     if (residency_dirty) res_commit();
+     atomic_fetch_add(&g_q4_inflight, 1);
+-    if (!o->keepalive_handler) {
+-        o->keepalive_handler = YES;
+-        [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; if (atomic_fetch_sub(&g_q4_inflight, 1) == 1 && g_ka_idle) dispatch_semaphore_signal(g_ka_idle); }];
+-    }
+-    if (!nogpu()) { id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return; }
++    q4_prepare_options(o);
++    if (!nogpu()) {
++        [o armFeedbackHandlers];
++        id<MTL4CommandBuffer> buffers[] = {cb}; [g_q4 commit:buffers count:1 options:o]; return;
++    }
+     for (MTL4CommitFeedbackHandler h in o->handlers) h(nil);
+ }
+ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
+@@ -626,8 +641,10 @@
+         [g_periodic_present_options[i] addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+             sysload_note_gpu(feedback.GPUStartTime, feedback.GPUEndTime);
+             if (feedback.error) MLOG("【红】periodic phase command buffer: %s", feedback.error.description.UTF8String);
++            periodic_present_complete_phase((unsigned)slot);
+             present_allocator_release(slot, 0);
+         }];
++        q4_prepare_options(g_periodic_present_options[i]);
+     }
+     MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
+     atd.maxBufferBindCount = 31; atd.maxTextureBindCount = 1;
+@@ -1329,7 +1346,8 @@
+ /* TOTK: render state already set on the current encoder. The replay sets viewport, scissor, cull, winding, fill, depth bias,
+    depth clip, stencil reference and blend color for every draw (about 30,000 encoder calls per frame), nearly all unchanged.
+    The cache belongs to one encoder: it is reset where any render encoder is created (es_reset) and also when a wrapper sees
+-   a different encoder object. */
++   a different encoder object. Standalone presentation/copy encoders bind their
++   state directly and must never reset this replay-owned cache. */
+ static struct { __unsafe_unretained id en; MTLViewport vp; MTLScissorRect sc; int cull, wind, fill, clip; float bias[3], bc[4]; uint32_t sref;
+                 uint8_t has_vp, has_sc, has_bias, has_bc, has_sref; } g_es;
+ static uint64_t g_es_sets, g_es_skips;
+@@ -4733,8 +4751,8 @@
+     return f > 1.001 ? f : 1;
+ }
+ /* The scene is complete: end the pass before the first UI draw and retain the
+-   canvas. MetalFX owns its history copy; the periodic renderer owns a separate
+-   pre-UI copy and snapshots the same canvas again after UI at present time. */
++   canvas. UI owns the immutable pre-UI image shared with phase presentation.
++   MetalFX owns its separate history when that diagnostic is enabled. */
+ static void mfx_snapshot_scene(void) {
+     if (g_enc) rp_end();
+     id<MTLTexture> c = tex_mtl(R.rt.color[0]);
+@@ -4747,13 +4765,13 @@
+         enc_b_end(g_blit); g_blit = nil;
+         mfx_note_scene();
+     }
+-    if (periodic_present_enabled())
+-        rs_scene_capture(g_cb, c, atomic_load_explicit(&g_cur_frame, memory_order_relaxed));
+     if (periodic_ui_enabled() && !g_periodic_ui) {
+         blit_close(); rs_sync();
+         g_periodic_ui_owner = R.rt.color[0]->serial;
+         g_periodic_ui_canvas = c;
+         g_periodic_ui = periodic_ui_begin(g_cb, atomic_load(&g_cur_frame), g_periodic_ui_owner, c);
++        if (periodic_present_enabled() && g_periodic_ui)
++            periodic_present_share_scene(g_cb, c, periodic_ui_scene(g_periodic_ui), atomic_load(&g_cur_frame));
+     }
+     g_mfx.scene_done = 1;
+ }
+@@ -9796,7 +9814,7 @@
+     if (!dst || !bloomq_make_pipeline(dst.pixelFormat)) return 0;
+     rp_end();
+     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+-    blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset(); if (!en) return 0;
++    blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; if (!en) return 0;
+     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [en setArgumentTable:g_bloomq_args atStages:MTLRenderStageFragment];
+     [g_bloomq_args setTexture:src.gpuResourceID atIndex:0]; [g_bloomq_args setSamplerState:g_bloomq_samp.gpuResourceID atIndex:0];
+     float *p = g_bloomq_const[g_bloomq_i].contents; p[0] = g_bloomq.threshold; p[1] = g_bloomq.coeff_g; p[2] = g_bloomq.coeff_b; p[3] = src.width; p[4] = src.height; [g_bloomq_args setAddress:g_bloomq_const[g_bloomq_i].gpuAddress atIndex:0];
+@@ -12045,7 +12063,7 @@
+ static struct { uint64_t frame; char path[1024]; } g_shotq[SHOTQ_MAX]; static int g_nshotq;
+ static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
+ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int fps_overlay);
+-static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i);
++static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i, int diagnostics);
+ // 整窗截图要的游戏画面（前端 window_shot，不再对挂着显示节拍的 Metal 图层做 drawViewHierarchy）：下一次上屏时，出图线程把同一帧
+ // 按上屏同一套编码（present_encode）画进一张与交换链同尺寸的离屏贴图，GPU 做完后在完成回调里交出 CGImage（回调不阻塞上屏）。g_shotq_mu 护
+ // Game picture needed by the whole-window screenshot (front end window_shot; no longer does drawViewHierarchy on a Metal layer with the display link attached): at the next present, the present thread draws the same frame
+@@ -12333,7 +12351,7 @@
+                 id<MTLCommandBuffer> cb = q_cb();
+                 MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                 rp.colorAttachments[0].texture = o; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+-                id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
++                id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+                 [en setRenderPipelineState:ps]; [en setFragmentTexture:v atIndex:0]; [en setFragmentSamplerState:sp atIndex:0];
+                 [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; cb_commit(cb); cb_wait(cb);
+                 char path[1024]; snprintf(path, sizeof path, g_td_path, (int)((ser + sl * 100000) * 100 + lv));
+@@ -12373,7 +12391,7 @@
+         id<MTLCommandBuffer> cb = q_cb();
+         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+         rp.colorAttachments[0].texture = o; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+-        id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
++        id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+         [en setRenderPipelineState:ps]; [en setFragmentTexture:v atIndex:0]; [en setFragmentSamplerState:sp atIndex:0];
+         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; cb_commit(cb); cb_wait(cb);
+         char path[1024]; snprintf(path, sizeof path, g_td_path, (int)(ser * 100 + lv));
+@@ -12639,7 +12657,7 @@
+     rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
+     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+-    id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
++    id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+     [en setViewport:vp];
+     [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:src atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+     float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+@@ -12662,7 +12680,7 @@
+     [en endEncoding];
+     return 1;
+ }
+-static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i) {
++static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], int uv_i, int diagnostics) {
+     NSUInteger cx = 0, cy = 0, cw = src.width, ch = src.height;
+     if (crop && (crop[2] || crop[3])) {
+         if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
+@@ -12671,12 +12689,13 @@
+         }
+         cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3];
+     }
+-    present_pipeline(dst.pixelFormat);
++    if (diagnostics) present_pipeline(dst.pixelFormat);
++    else if (!g_blit_pso || g_blit_fmt != dst.pixelFormat) return 0;
+     double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
+     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
+     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01 || present_stretch()) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
+     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
+-    id<MTLTexture> up = output_upscale(cb, src, cx, cy, cw, ch, vp, uv_i);   // TOTK 2K output: MetalFX to the viewport, drawn 1:1 below
++    id<MTLTexture> up = diagnostics ? output_upscale(cb, src, cx, cy, cw, ch, vp, uv_i) : nil;   // TOTK 2K output: MetalFX to the viewport, drawn 1:1 below
+     id<MTLTexture> pic = up ? up : src;
+     if (up) { cx = 0; cy = 0; cw = up.width; ch = up.height; }
+     MTL4RenderPassDescriptor *rp = g_present_pass[uv_i];
+@@ -12684,7 +12703,7 @@
+     rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+-    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
++    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+     if (!en) { MLOG("【红】M4 出图渲染编码器创建失败"); return 0; }
+     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+     id<MTL4ArgumentTable> args = g_present_args[uv_i];
+@@ -12698,21 +12717,21 @@
+     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+     MTLViewport ovp; float fuv[8];
+-    if (fps_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // argument-table bindings are captured per draw, so rebinding here leaves the game picture's draw intact
++    if (diagnostics && fps_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // argument-table bindings are captured per draw, so rebinding here leaves the game picture's draw intact
+         memcpy(g_fps_uv[uv_i].contents, fuv, sizeof fuv);
+         [args setTexture:g_fps_tex[uv_i].gpuResourceID atIndex:0];
+         [args setAddress:g_fps_uv[uv_i].gpuAddress atIndex:0];
+         [en setViewport:ovp];
+         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+     }
+-    if (shader_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // bottom-left: automatic shader collection
++    if (diagnostics && shader_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // bottom-left: automatic shader collection
+         memcpy(g_shd_uv[uv_i].contents, fuv, sizeof fuv);
+         [args setTexture:g_shd_tex[uv_i].gpuResourceID atIndex:0];
+         [args setAddress:g_shd_uv[uv_i].gpuAddress atIndex:0];
+         [en setViewport:ovp];
+         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+     }
+-    if (load_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // bottom-right: CPU cores and GPU load
++    if (diagnostics && load_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // bottom-right: CPU cores and GPU load
+         memcpy(g_load_uv[uv_i].contents, fuv, sizeof fuv);
+         [args setTexture:g_load_tex[uv_i].gpuResourceID atIndex:0];
+         [args setAddress:g_load_uv[uv_i].gpuAddress atIndex:0];
+@@ -13130,11 +13149,10 @@
+     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
+     if (interp < 0 && periodic_present_enabled()) {
+         uint64_t generation = periodic_present_capture_anchor(cb, src, frame,
+-            target_ts > 0 ? target_ts : CACurrentMediaTime(), phase_input, simulation,
+-            dr.texture.pixelFormat);
++            target_ts > 0 ? target_ts : CACurrentMediaTime(), phase_input, simulation);
+         if (generation) native_frame.state_generation = generation;
+     }
+-    if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i)) { [cb endCommandBuffer]; periodic_present_finish_submission(cb, 0); present_allocator_release(alloc_i, 0); [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
++    if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i, 1)) { [cb endCommandBuffer]; periodic_present_finish_submission(cb, 0); present_allocator_release(alloc_i, 0); [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
+     id<MTLBuffer> grab_buf = nil; size_t grab_w = dr.texture.width, grab_h = dr.texture.height;
+     if (grab) {
+         grab_buf = grab_w && grab_h ? [g_dev newBufferWithLength:grab_w * grab_h * 4 options:MTLResourceStorageModeShared] : nil;
+@@ -13289,12 +13307,25 @@
+     PeriodicPresentState state = {0};
+     id<MTLTexture> picture = periodic_present_encode_phase(cb, (unsigned)alloc_i,
+         drawable.texture, target, input, &state);
+-    if (!picture)
+-        MDIE("periodic phase encode failed after readiness was established");
++    if (!picture) {
++        // Readiness is a hint. A newer anchor or a busy capture may supersede
++        // it before this display callback acquires the snapshot leases.
++        [cb endCommandBuffer];
++        present_allocator_release(alloc_i, 0);
++        [g_q4 signalDrawable:drawable];
++        return 0;
++    }
++    if (!present_encode_m4(cb, picture, drawable.texture, NULL, alloc_i, 0)) {
++        [cb endCommandBuffer];
++        periodic_present_complete_phase((unsigned)alloc_i);
++        present_allocator_release(alloc_i, 0);
++        [g_q4 signalDrawable:drawable];
++        return 0;
++    }
+     [cb endCommandBuffer];
+     q4_commit_resident(cb, g_periodic_present_options[alloc_i]);
+     g_present_n++;
+-    fps_overlay_note_gen(++g_gen_shown, CACurrentMediaTime());
++    // Camera-only diagnostics do not increase the rendered-state FPS overlay.
+     [g_q4 signalDrawable:drawable];
+     NativeFrame native_frame = native_phase_capture(state.source_frame, state.anchor_id,
+         state.state_generation, state.phase, (unsigned)picture.width, (unsigned)picture.height,
+@@ -15090,6 +15121,36 @@
+     if(generated_available){PeriodicGPUEncodeStats gpu_after=periodic_gpu_encode_stats();
+         if(gpu_after.executed_draws-gpu_before.executed_draws!=2 || gpu_after.executed_ranges-gpu_before.executed_ranges!=2)
+             MDIE("mixed draw probe did not execute both generated ranges");checked++;
++    }
++    // Presentation can run between any two replay operations. Its direct state
++    // bindings must not change the replay encoder or argument-address cache.
++    __typeof__(g_es) replay_state = g_es;
++    __typeof__(g_arg_addresses) replay_addresses = g_arg_addresses;
++    MTLTextureDescriptor *present_td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16 mipmapped:NO];
++    present_td.storageMode=MTLStorageModePrivate;present_td.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++    id<MTLTexture> present_source=[g_dev newTextureWithDescriptor:present_td];
++    id<MTLTexture> present_target=[g_dev newTextureWithDescriptor:present_td];
++    id<MTL4CommandAllocator> present_allocator=[g_dev newCommandAllocator];
++    id<MTL4CommandBuffer> present_cb=[g_dev newCommandBuffer];
++    [present_cb beginCommandBufferWithAllocator:present_allocator];
++    if (!present_encode_m4(present_cb,present_source,present_target,NULL,0,1)) MDIE("presentation state isolation encode");
++    [present_cb endCommandBuffer]; // No commit: this checks CPU ownership, not pixels.
++    if (memcmp(&replay_state,&g_es,sizeof g_es) || memcmp(&replay_addresses,&g_arg_addresses,sizeof g_arg_addresses))
++        MDIE("presentation changed the replay-owned encoder state");
++    checked++;
++    // Exercise the reusable production feedback wrapper beyond its first use.
++    TotkCommitOptions *reused_options=[TotkCommitOptions new];
++    dispatch_semaphore_t feedback_done=dispatch_semaphore_create(0);
++    [reused_options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
++        if (feedback.error) MDIE("reused presentation feedback error");
++        dispatch_semaphore_signal(feedback_done);
++    }];
++    for (unsigned reuse=0;reuse<6;++reuse) {
++        [present_allocator reset];[present_cb beginCommandBufferWithAllocator:present_allocator];[present_cb endCommandBuffer];
++        q4_commit_resident(present_cb,reused_options);
++        if (dispatch_semaphore_wait(feedback_done,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC)))
++            MDIE("presentation feedback lost on reuse %u",reuse);
++        checked++;
+     }
+     if (rs_enabled() && !g_rs_passes) MDIE("render stream probe never exercised the worker; use threshold 1");
+     if (rs_enabled()) MLOG("render stream probe: %llu passes, %llu packets completed", (unsigned long long)g_rs_passes, (unsigned long long)g_rs_packets);
+--- a/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
++++ b/third_party/d2r_gfx/gfx/nvn/nvn_render_stream.h
+@@ -26,7 +26,6 @@
+     RS_BEGIN,   /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
+     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
+     RS_GPU_RANGE, /* immutable chunk ticket and a range of generated commands */
+-    RS_SCENE,   /* outside a pass: u[0] = command buffer, u[1] = retained canvas, u[2] = frame */
+ };
+ enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue before sleeping on the semaphore. During a replay A never pauses
+                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
+@@ -59,7 +58,7 @@
+                      const nvn_encode_packet *p) {
+     const uint64_t *u = p->u; id<MTL4RenderCommandEncoder> e = *enc;
+     if (g_rs_probe_negative && (p->op == RS_DRAW || p->op == RS_INSTANCED || p->op == RS_INDEXED || p->op == RS_GPU_RANGE)) return;
+-    if (p->op != RS_BEGIN && p->op != RS_SCENE && !e) MDIE("render stream packet %llu without an encoder", (unsigned long long)p->op);
++    if (p->op != RS_BEGIN && !e) MDIE("render stream packet %llu without an encoder", (unsigned long long)p->op);
+     switch (p->op) {
+         case RS_BEGIN: {
+             if (e) MDIE("render stream: pass begun while the previous one is open");
+@@ -80,13 +79,6 @@
+             if (u[0] == 2) [e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageBlit | MTLStageDispatch visibilityOptions:(MTL4VisibilityOptions)u[1]];   /* TOTK_BARRIER_NARROW: later vertex stages do not wait */
+             else if (u[0]) [e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[1]];
+             [e endEncoding]; *enc = nil; break;
+-        case RS_SCENE: {
+-            if (e) MDIE("render stream: scene capture inside a pass");
+-            id<MTL4CommandBuffer> cb = (__bridge id<MTL4CommandBuffer>)(void *)(uintptr_t)u[0];
+-            id<MTLTexture> canvas = (__bridge id<MTLTexture>)(void *)(uintptr_t)u[1];
+-            (void)periodic_present_capture_scene(cb, canvas, u[2]);
+-            if (u[1]) CFRelease((CFTypeRef)(uintptr_t)u[1]);
+-            break; }
+         case RS_GPU_RANGE: {
+             PeriodicGPUChunkTicket ticket = {(PeriodicGPUChunk *)(uintptr_t)u[0], u[1]};
+             if (!periodic_gpu_encode_execute(ticket, e, (uint32_t)u[2], (uint32_t)u[3]))
+@@ -220,14 +212,6 @@
+     rs_put((nvn_encode_packet){.op=RS_END, .u={(uint64_t)bar_end, vis}}, 1);
+     g_rs_active = 0;
+ }
+-static void rs_scene_capture(id<MTL4CommandBuffer> cb, id<MTLTexture> canvas, uint64_t frame) {
+-    if (!g_rs_created) {
+-        (void)periodic_present_capture_scene(cb, canvas, frame);
+-        return;
+-    }
+-    rs_put((nvn_encode_packet){.op=RS_SCENE, .u={(uint64_t)(uintptr_t)(__bridge void *)cb,
+-        (uint64_t)(uintptr_t)CFBridgingRetain(canvas), frame}}, 1);
+-}
+ /* End of a submission: B drained; a statistics line every 1800 submissions. */
+ static void rs_sub_end(void) {
+     if (!g_rs_created) return;

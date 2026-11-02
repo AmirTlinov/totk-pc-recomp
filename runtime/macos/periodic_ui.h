@@ -26,6 +26,9 @@ int periodic_ui_enabled(void);
 // The input canvas contains the completed scene before its first UI draw.
 PeriodicUIProgram *periodic_ui_begin(id<MTL4CommandBuffer> command_buffer,
     uint64_t frame, uint64_t canvas_owner, id<MTLTexture> canvas);
+// Borrow the immutable pre-UI scene already captured by this program. The
+// receiving owner must retain it; no additional full-resolution copy is needed.
+id<MTLTexture> periodic_ui_scene(const PeriodicUIProgram *program);
 void periodic_ui_reject(PeriodicUIProgram *program, const char *reason);
 int periodic_ui_recording(const PeriodicUIProgram *program);
 // Addresses returned here refer exclusively to this program's immutable copies.
@@ -42,7 +45,7 @@ int periodic_ui_compare(PeriodicUIProgram *program, id<MTL4CommandBuffer> comman
 // Call from this submission's GPU feedback; it releases submission ownership.
 void periodic_ui_completed(PeriodicUIProgram *program, int gpu_error);
 // Acquiring a program does not certify the world scene used as its background.
-PeriodicUIProgram *periodic_ui_acquire(uint64_t frame, uint64_t canvas_owner);
+PeriodicUIProgram *periodic_ui_acquire(uint64_t frame, id<MTLTexture> canvas);
 void periodic_ui_release(PeriodicUIProgram *program);
 // The caller keeps its acquired program and both textures alive through GPU
 // feedback, registers the textures for residency, and owns this slot exclusively

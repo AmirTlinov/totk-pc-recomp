@@ -19,6 +19,7 @@ enum { UI_RECORDING, UI_REJECTED, UI_SUBMITTED, UI_READY };
 @property(nonatomic, strong) NSMutableArray<id<MTLTexture>> *copiedTextures;
 @property(nonatomic, strong) id<MTLTexture> base;
 @property(nonatomic, strong) id<MTLTexture> result;
+@property(nonatomic, strong) id<MTLTexture> canvas;
 @property(nonatomic, strong) id<MTLBuffer> mismatch;
 @property(nonatomic, strong) id<MTLBuffer> parameters;
 @property(nonatomic) NSUInteger parameterOffset;
@@ -43,7 +44,11 @@ struct PeriodicUIProgram {
     struct PeriodicUIProgram *retired_next;
 };
 
-static _Atomic(PeriodicUIProgram *) published;
+// GPU completion can run ahead of the display callback. Keep the bounded set
+// of in-flight frame owners, so a later completion does not hide an anchor's UI.
+// An acquired program remains owned even after its publication slot is reused.
+enum { UI_PUBLICATIONS = 4 };
+static _Atomic(PeriodicUIProgram *) published[UI_PUBLICATIONS];
 static _Atomic(PeriodicUIProgram *) retired;
 static _Atomic unsigned readers;
 
@@ -78,6 +83,7 @@ int periodic_ui_enabled(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *value = getenv("TOTK_PERIODIC_UI");
+        if (!value) value = getenv("TOTK_PERIODIC_PHASE");
         enabled = value && !strcmp(value, "1");
     });
     return enabled;
@@ -85,6 +91,9 @@ int periodic_ui_enabled(void) {
 
 static PeriodicUIResources *resources(PeriodicUIProgram *p) {
     return (__bridge PeriodicUIResources *)p->resources;
+}
+id<MTLTexture> periodic_ui_scene(const PeriodicUIProgram *p) {
+    return p ? ((__bridge PeriodicUIResources *)p->resources).base : nil;
 }
 
 void periodic_ui_hold(PeriodicUIProgram *p, id object, int resident) {
@@ -155,6 +164,7 @@ PeriodicUIProgram *periodic_ui_begin(id<MTL4CommandBuffer> cb, uint64_t frame,
     PeriodicUIResources *r = [PeriodicUIResources new];
     p->resources = (void *)CFBridgingRetain(r);
     r.device = canvas.device;
+    r.canvas = canvas;
     r.objects = [NSMutableArray array];
     r.sourceTextures = [NSMutableArray array];
     r.copiedTextures = [NSMutableArray array];
@@ -234,6 +244,10 @@ uint64_t periodic_ui_texture(PeriodicUIProgram *p, id<MTLTexture> texture) {
 
 int periodic_ui_append(PeriodicUIProgram *p, const PeriodicUIDraw *draw) {
     if (!periodic_ui_recording(p) || !draw || !draw->pipeline || !draw->count || !draw->instances) return 0;
+    if (draw->cull > MTLCullModeBack || draw->winding > MTLWindingCounterClockwise ||
+        draw->fill > MTLTriangleFillModeLines || draw->clip > MTLDepthClipModeClamp) {
+        periodic_ui_reject(p, "unresolved UI raster state"); return 0;
+    }
     if (p->count == p->capacity) {
         size_t capacity = p->capacity ? p->capacity * 2 : 128;
         if (capacity < p->capacity || capacity > SIZE_MAX / sizeof *p->draws) {
@@ -344,10 +358,11 @@ void periodic_ui_completed(PeriodicUIProgram *p, int gpu_error) {
         // must not replace the published successor. The reader guard also
         // protects this comparison before either callback holds a reference.
         atomic_fetch_add(&readers, 1);
-        PeriodicUIProgram *old = atomic_load(&published);
+        _Atomic(PeriodicUIProgram *) *slot = &published[p->frame % UI_PUBLICATIONS];
+        PeriodicUIProgram *old = atomic_load(slot);
         int installed = 0;
         while (!old || old->frame < p->frame) {
-            if (atomic_compare_exchange_weak(&published, &old, p)) { installed = 1; break; }
+            if (atomic_compare_exchange_weak(slot, &old, p)) { installed = 1; break; }
         }
         if (installed) retire(old);
         else periodic_ui_release(p);
@@ -357,10 +372,10 @@ void periodic_ui_completed(PeriodicUIProgram *p, int gpu_error) {
     periodic_ui_release(p);
 }
 
-PeriodicUIProgram *periodic_ui_acquire(uint64_t frame, uint64_t canvas_owner) {
+PeriodicUIProgram *periodic_ui_acquire(uint64_t frame, id<MTLTexture> canvas) {
     atomic_fetch_add(&readers, 1);
-    PeriodicUIProgram *p = atomic_load(&published);
-    if (p && p->frame == frame && p->canvas_owner == canvas_owner && atomic_load(&p->state) == UI_READY)
+    PeriodicUIProgram *p = atomic_load(&published[frame % UI_PUBLICATIONS]);
+    if (p && p->frame == frame && resources(p).canvas == canvas && atomic_load(&p->state) == UI_READY)
         atomic_fetch_add(&p->references, 1);
     else p = NULL;
     atomic_fetch_sub(&readers, 1);
