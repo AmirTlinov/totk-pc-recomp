@@ -15,13 +15,14 @@ struct PeriodicDependency {
     struct PeriodicDependency *next;
     PeriodicOwnerGraph *graph;
     uint64_t identity, generation;
+    uint64_t validation_visit, validation_version;
     OwnerBinding *users;
 };
 struct OwnerBinding {
     PeriodicParticipation *owner;
     PeriodicDependency *dependency;
     OwnerBinding *next, **previous;
-    uint64_t entry_version;
+    uint64_t entry_version, cycle_version, exit_version;
     unsigned returned;
 };
 struct PeriodicParticipation {
@@ -66,6 +67,8 @@ static void capture_entry(PeriodicParticipation *o) {
     o->cycle_entry = o->entry;
     for (size_t i = 0; i < o->program->port_count; ++i) {
         o->bindings[i].entry_version = o->bindings[i].dependency->generation;
+        o->bindings[i].cycle_version = o->bindings[i].entry_version;
+        o->bindings[i].exit_version = o->bindings[i].entry_version;
         o->bindings[i].returned = 0;
     }
 }
@@ -242,8 +245,10 @@ int periodic_owner_begin(PeriodicParticipation *o, PeriodicOwnerInvocation *i) {
     if (!o || !i || o->status != PERIODIC_OWNER_READY || !versions_match(o)) return 0;
     const PeriodicOwnerAction *a = &o->program->actions[o->next_action];
     if (a->entry_phase != o->entry.phase || a->role != o->entry.role) return 0;
-    for (size_t p = a->first_port; p < (size_t)a->first_port + a->port_count; ++p)
+    for (size_t p = a->first_port; p < (size_t)a->first_port + a->port_count; ++p) {
         o->bindings[p].returned = 0;
+        o->bindings[p].exit_version = o->bindings[p].entry_version;
+    }
     o->closed = 0;
     o->status = PERIODIC_OWNER_OPEN;
     *i = (PeriodicOwnerInvocation){o, ++o->invocation, o->revision, o->entry}; return 1;
@@ -255,22 +260,62 @@ int periodic_owner_return(PeriodicParticipation *o, const PeriodicOwnerInvocatio
     if (port < a->first_port || port - a->first_port >= a->port_count) return 0;
     OwnerBinding *b = &o->bindings[port];
     if (b->dependency != d || !d || d->generation != generation || b->entry_version != generation) return 0;
+    if (b->returned) return b->exit_version == generation;
     b->returned = 1; return 1;
+}
+int periodic_owner_write_return(PeriodicParticipation *o, const PeriodicOwnerInvocation *i,
+    size_t port, PeriodicDependency *d, uint64_t entry, uint64_t exit) {
+    if (!owns(o, i) || port >= o->program->port_count || !exit || exit < entry ||
+        !(o->program->ports[port].access & PERIODIC_OWNER_WRITE)) return 0;
+    const PeriodicOwnerAction *a = &o->program->actions[o->next_action];
+    if (port < a->first_port || port - a->first_port >= a->port_count) return 0;
+    OwnerBinding *b = &o->bindings[port];
+    if (b->dependency != d || !d || d->generation != entry || b->entry_version != entry) return 0;
+    // Repeating a receipt is idempotent; replacing an already returned result
+    // would let two incompatible exits discharge the same obligation.
+    if (b->returned) return b->exit_version == exit;
+    b->exit_version = exit; b->returned = 1; return 1;
 }
 int periodic_owner_complete(PeriodicParticipation *o, const PeriodicOwnerInvocation *i) {
     if (!owns(o, i) || !versions_match(o)) return 0;
     const PeriodicOwnerAction *a = &o->program->actions[o->next_action];
     for (size_t p = a->first_port; p < (size_t)a->first_port + a->port_count; ++p)
         if (!o->bindings[p].returned) return 0;
+    // Aliased write ports must agree before any output becomes visible. The
+    // graph is owner-thread serialized; its visit stamp avoids a pairwise scan.
+    uint64_t visit = ++o->program->graph->traversal;
+    for (size_t p = a->first_port; p < (size_t)a->first_port + a->port_count; ++p) {
+        if (!(o->program->ports[p].access & PERIODIC_OWNER_WRITE)) continue;
+        OwnerBinding *b = &o->bindings[p];
+        PeriodicDependency *d = b->dependency;
+        if (d->validation_visit == visit && d->validation_version != b->exit_version) return 0;
+        d->validation_visit = visit; d->validation_version = b->exit_version;
+    }
+    PeriodicParticipation *affected = NULL;
+    for (size_t p = a->first_port; p < (size_t)a->first_port + a->port_count; ++p) {
+        OwnerBinding *b = &o->bindings[p];
+        if (!(o->program->ports[p].access & PERIODIC_OWNER_WRITE) ||
+            b->exit_version == b->dependency->generation) continue;
+        b->dependency->generation = b->exit_version;
+        for (OwnerBinding *r = b->dependency->users; r; r = r->next) {
+            if (r->owner == o) r->entry_version = b->exit_version;
+            else enqueue(&affected, r->owner, visit);
+        }
+    }
     o->entry.phase = a->exit_phase;
     o->next_action = (o->next_action + 1) % o->program->action_count;
     o->entry.role = o->program->actions[o->next_action].role;
     o->status = PERIODIC_OWNER_READY;
     if (same_entry(o->entry, o->cycle_entry)) {
         int returned = 1;
-        for (size_t p = 0; p < o->program->port_count; ++p) returned &= o->bindings[p].returned;
+        for (size_t p = 0; p < o->program->port_count; ++p)
+            returned &= o->bindings[p].returned &&
+                o->bindings[p].dependency->generation == o->bindings[p].cycle_version;
         o->closed = returned;
     }
+    // A causal path through another writer can return to this participation.
+    // Only the direct self-edge is omitted; a feedback contact still revises it.
+    revise_cone(affected, visit);
     return 1;
 }
 void periodic_owner_abort(PeriodicParticipation *o, const PeriodicOwnerInvocation *i) {
@@ -291,7 +336,7 @@ typedef struct {
     PeriodicCausalEntry entry, cycle_entry;
     uint64_t status, closed;
 } Checkpoint;
-typedef struct { uint64_t identity, generation, entry_version, returned; } SavedBinding;
+typedef struct { uint64_t identity, generation, entry_version, cycle_version, exit_version, returned; } SavedBinding;
 size_t periodic_owner_checkpoint_size(const PeriodicParticipation *o) {
     if (!o || o->program->action_count > (SIZE_MAX - sizeof(Checkpoint)) / sizeof(PeriodicOwnerAction)) return 0;
     size_t size = sizeof(Checkpoint) + o->program->action_count * sizeof(PeriodicOwnerAction);
@@ -301,7 +346,7 @@ size_t periodic_owner_checkpoint_size(const PeriodicParticipation *o) {
 }
 int periodic_owner_checkpoint(const PeriodicParticipation *o, void *bytes, size_t size) {
     if (!o || !bytes || !size || o->status == PERIODIC_OWNER_OPEN || !bound(o) || size != periodic_owner_checkpoint_size(o)) return 0;
-    Checkpoint h = {.magic=UINT64_C(0x504f574e45523031), .implementation=o->program->implementation,
+    Checkpoint h = {.magic=UINT64_C(0x504f574e45523032), .implementation=o->program->implementation,
         .action_count=o->program->action_count, .port_count=o->program->port_count,
         .next_action=o->next_action, .entry=o->entry, .cycle_entry=o->cycle_entry,
         .status=o->status, .closed=o->closed};
@@ -310,7 +355,8 @@ int periodic_owner_checkpoint(const PeriodicParticipation *o, void *bytes, size_
     if (h.port_count) memcpy(p, o->program->ports, h.port_count * sizeof(PeriodicOwnerPort)); p += h.port_count * sizeof(PeriodicOwnerPort);
     for (size_t j = 0; j < h.port_count; ++j) {
         const OwnerBinding *b = &o->bindings[j];
-        SavedBinding s = {b->dependency->identity, b->dependency->generation, b->entry_version, b->returned};
+        SavedBinding s = {b->dependency->identity, b->dependency->generation, b->entry_version,
+            b->cycle_version, b->exit_version, b->returned};
         memcpy(p, &s, sizeof s); p += sizeof s;
     }
     return 1;
@@ -318,7 +364,7 @@ int periodic_owner_checkpoint(const PeriodicParticipation *o, void *bytes, size_
 int periodic_owner_restore(PeriodicParticipation *o, const void *bytes, size_t size) {
     if (!o || !bytes || !size || o->status == PERIODIC_OWNER_OPEN || !bound(o) || size != periodic_owner_checkpoint_size(o)) return 0;
     Checkpoint h; const unsigned char *p = bytes; memcpy(&h, p, sizeof h); p += sizeof h;
-    if (h.magic != UINT64_C(0x504f574e45523031) || h.implementation != o->program->implementation ||
+    if (h.magic != UINT64_C(0x504f574e45523032) || h.implementation != o->program->implementation ||
         h.action_count != o->program->action_count || h.port_count != o->program->port_count ||
         h.next_action >= h.action_count || h.status == PERIODIC_OWNER_OPEN || h.status > PERIODIC_OWNER_REVISED ||
         h.entry.owner != o->entry.owner || h.entry.generation != o->entry.generation ||
@@ -347,7 +393,7 @@ int periodic_owner_restore(PeriodicParticipation *o, const void *bytes, size_t s
         SavedBinding s; memcpy(&s, p, sizeof s); p += sizeof s;
         if (s.identity != o->bindings[j].dependency->identity || s.generation != o->bindings[j].dependency->generation ||
             s.returned > 1 || (h.status == PERIODIC_OWNER_READY && s.entry_version != s.generation) ||
-            (h.closed && !s.returned)) return 0;
+            (h.closed && (!s.returned || s.cycle_version != s.generation))) return 0;
     }
     if (h.closed && !same_entry(h.entry, h.cycle_entry)) return 0;
     periodic_owner_contact(o); // Previous process-local receipts stay invalid.
@@ -355,7 +401,10 @@ int periodic_owner_restore(PeriodicParticipation *o, const void *bytes, size_t s
     o->status = (PeriodicOwnerStatus)h.status; o->closed = (unsigned)h.closed;
     for (size_t j = 0; j < h.port_count; ++j) {
         SavedBinding s; memcpy(&s, bindings, sizeof s); bindings += sizeof s;
-        o->bindings[j].entry_version = s.entry_version; o->bindings[j].returned = (unsigned)s.returned;
+        o->bindings[j].entry_version = s.entry_version;
+        o->bindings[j].cycle_version = s.cycle_version;
+        o->bindings[j].exit_version = s.exit_version;
+        o->bindings[j].returned = (unsigned)s.returned;
     }
     return 1;
 }

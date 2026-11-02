@@ -76,6 +76,12 @@ int periodic_owner_revalidate(PeriodicParticipation *owner, uint64_t parameter_g
 int periodic_owner_begin(PeriodicParticipation *owner, PeriodicOwnerInvocation *invocation);
 int periodic_owner_return(PeriodicParticipation *owner, const PeriodicOwnerInvocation *invocation,
     size_t port, PeriodicDependency *dependency, uint64_t generation);
+// Stage this action's write. The dependency remains at its entry version until
+// complete atomically publishes every output. A successful action may produce
+// new versions without claiming a return to its exact causal entry.
+int periodic_owner_write_return(PeriodicParticipation *owner,
+    const PeriodicOwnerInvocation *invocation, size_t port,
+    PeriodicDependency *dependency, uint64_t entry_generation, uint64_t exit_generation);
 int periodic_owner_complete(PeriodicParticipation *owner, const PeriodicOwnerInvocation *invocation);
 void periodic_owner_abort(PeriodicParticipation *owner, const PeriodicOwnerInvocation *invocation);
 int periodic_owner_closed(const PeriodicParticipation *owner);

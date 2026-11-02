@@ -19,7 +19,67 @@ static void complete(PeriodicParticipation *p, PeriodicDependency *read, uint64_
     assert(periodic_owner_complete(p, &i));
     assert(!periodic_owner_complete(p, &i));
 }
+static void produced_versions(void) {
+    PeriodicOwnerGraph *g = periodic_owner_graph_create(); assert(g);
+    const PeriodicOwnerAction step = {0, 0, 1, 0, 2};
+    const PeriodicOwnerPort ports[] = {{1, PERIODIC_OWNER_READ}, {2, PERIODIC_OWNER_WRITE}};
+    const PeriodicOwnerProgram *program = periodic_owner_program(g, 999, &step, 1, ports, 2);
+    PeriodicDependency *input = periodic_owner_dependency(g, 1, 1);
+    PeriodicDependency *image = periodic_owner_dependency(g, 2, 1);
+    PeriodicDependency *output = periodic_owner_dependency(g, 3, 1);
+    PeriodicParticipation *writer = periodic_owner_create(g, program, (PeriodicCausalEntry){1,1,1,0,1});
+    PeriodicParticipation *reader = periodic_owner_create(g, program, (PeriodicCausalEntry){2,1,1,0,1});
+    assert(periodic_owner_bind(writer, 0, input)); assert(periodic_owner_bind(writer, 1, image));
+    assert(periodic_owner_bind(reader, 0, image)); assert(periodic_owner_bind(reader, 1, output));
+    assert(periodic_owner_revalidate(writer, 1)); assert(periodic_owner_revalidate(reader, 1));
+    PeriodicOwnerInvocation w = begin(writer), r = begin(reader);
+    assert(!periodic_owner_write_return(writer, &w, 0, input, 1, 2));
+    assert(!periodic_owner_write_return(reader, &w, 1, output, 1, 2));
+    assert(periodic_owner_write_return(writer, &w, 1, image, 1, 2));
+    assert(!periodic_owner_write_return(writer, &w, 1, image, 1, 3));
+    assert(!periodic_owner_return(writer, &w, 1, image, 1));
+    assert(!periodic_owner_complete(writer, &w));
+    // Staging an output does not expose it before all input returns arrive.
+    assert(periodic_owner_return(reader, &r, 0, image, 1));
+    assert(periodic_owner_return(writer, &w, 0, input, 1));
+    assert(periodic_owner_complete(writer, &w));
+    assert(periodic_owner_state(writer).status == PERIODIC_OWNER_READY);
+    assert(!periodic_owner_closed(writer));
+    assert(periodic_owner_state(reader).status == PERIODIC_OWNER_REVISED);
+    assert(!periodic_owner_complete(reader, &r));
+    // The same program executes another output generation without recompilation
+    // or a self-contact, and checkpointing must not turn it into exact closure.
+    size_t size = periodic_owner_checkpoint_size(writer); void *saved = malloc(size); assert(saved);
+    assert(periodic_owner_checkpoint(writer, saved, size));
+    assert(periodic_owner_restore(writer, saved, size)); assert(!periodic_owner_closed(writer));
+    free(saved);
+    w = begin(writer);
+    assert(periodic_owner_return(writer, &w, 0, input, 1));
+    assert(periodic_owner_write_return(writer, &w, 1, image, 2, 3));
+    periodic_owner_abort(writer, &w);
+    assert(periodic_owner_dependency(g, 2, 2) == image);
+    assert(periodic_owner_revalidate(writer, 1));
+    w = begin(writer);
+    assert(periodic_owner_return(writer, &w, 0, input, 1));
+    assert(periodic_owner_write_return(writer, &w, 1, image, 2, 3));
+    assert(periodic_owner_complete(writer, &w));
+    assert(periodic_owner_dependency(g, 2, 3) == image);
+    assert(!periodic_owner_closed(writer));
+    const PeriodicOwnerPort aliases[] = {{1, PERIODIC_OWNER_WRITE}, {2, PERIODIC_OWNER_WRITE}};
+    const PeriodicOwnerProgram *aliased = periodic_owner_program(g, 998, &step, 1, aliases, 2);
+    PeriodicParticipation *both = periodic_owner_create(g, aliased, (PeriodicCausalEntry){3,1,1,0,1});
+    assert(periodic_owner_bind(both, 0, output)); assert(periodic_owner_bind(both, 1, output));
+    assert(periodic_owner_revalidate(both, 1));
+    PeriodicOwnerInvocation pair = begin(both);
+    assert(periodic_owner_write_return(both, &pair, 0, output, 1, 2));
+    assert(periodic_owner_write_return(both, &pair, 1, output, 1, 3));
+    assert(!periodic_owner_complete(both, &pair));
+    assert(periodic_owner_dependency(g, 3, 1) == output);
+    periodic_owner_abort(both, &pair);
+    periodic_owner_graph_destroy(g);
+}
 int main(void) {
+    produced_versions();
     PeriodicOwnerGraph *g = periodic_owner_graph_create(); assert(g);
     const PeriodicOwnerAction cycle[] = {{10, 20, 7, 0, 2}, {20, 30, 7, 0, 2}, {30, 10, 7, 0, 2}};
     const PeriodicOwnerPort ports[] = {{41, PERIODIC_OWNER_READ}, {42, PERIODIC_OWNER_WRITE}};
